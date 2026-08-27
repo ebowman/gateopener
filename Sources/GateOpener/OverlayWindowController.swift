@@ -15,7 +15,7 @@ import GateOpenerCore
 /// controller instead owns a plain `NSPanel` with exactly the behavior this
 /// app needs and nothing more.
 ///
-/// The panel is created LAZILY, on the first `show()` call — never in
+/// The panel is created LAZILY, on the first presentation — never in
 /// `init` — so a run that never shows an overlay (e.g. a headless
 /// self-test) never touches window-server machinery at all. This mirrors
 /// `NotificationPresenter`'s lazy resolution of `UNUserNotificationCenter`.
@@ -110,7 +110,16 @@ final class OverlayWindowController {
     ///
     /// Silently degrades (logs a notice and returns) if there is no screen
     /// at all to position against — e.g. a headless CI/self-test process.
-    func show() {
+    ///
+    /// PRIVATE by design: `handle(_:)` is the sole driver of presentation
+    /// (see the type doc comment and gateopener-9kk.6/9kk.9). Unlike
+    /// `hide()`, there is no safe-to-call-externally version of `show()`
+    /// worth building — showing has real preconditions (screen resolution,
+    /// positioning) that only make sense as part of the state-machine-driven
+    /// flow, and no future feature needs an out-of-band "show a new panel"
+    /// entry point the way `hide()`'s user-initiated dismiss is needed. See
+    /// `hide()`'s doc comment for the asymmetric decision on that method.
+    private func show() {
         guard let screen = NSScreen.main ?? NSScreen.screens.first else {
             Self.logger.notice("no screen available; skipping overlay presentation")
             return
@@ -130,8 +139,26 @@ final class OverlayWindowController {
 
     /// Hides the panel. No-op if the panel was never created or is already
     /// hidden.
+    ///
+    /// SAFE TO CALL EXTERNALLY (gateopener-9kk.9), unlike `show()`: before
+    /// ordering the panel out, this cancels any pending `.succeeded`/
+    /// `.failed` hold-then-fade sequence and clears `isResolveFadePending`
+    /// (see `cancelPendingResolve()`), and resets `alphaValue` back to 1 so
+    /// a later internal `show()` never re-displays a panel stuck mid-fade or
+    /// at alpha 0. Without this cleanup, an external `hide()` call made
+    /// while a resolve-fade was pending would leave `isResolveFadePending`
+    /// stuck `true`, causing `handleIdleOrNeedsSetup()`'s guard to silently
+    /// ignore a subsequent `.idle`/`.needsSetup` and permanently strand the
+    /// overlay's internal bookkeeping (see gateopener-9kk.9 for the original
+    /// hazard writeup). This makes `hide()` a genuinely safe dismiss
+    /// primitive — anticipating gateopener-12h's interactive "View door"
+    /// panel, which will want a real user-initiated dismiss — while `show()`
+    /// stays private; see its doc comment for why that split is not
+    /// symmetric.
     func hide() {
+        cancelPendingResolve()
         panel?.orderOut(nil)
+        panel?.alphaValue = 1
         (currentContent() as? OverlayShowHideResponding)?.overlayDidHide()
     }
 
@@ -339,7 +366,20 @@ final class OverlayWindowController {
         }
 
         hide()
-        // Reset BEFORE the next possible show() — see doc comment above.
+        // These three now DUPLICATE what hide() itself does (it calls
+        // cancelPendingResolve() and resets alpha, so external callers
+        // can't strand this state — see hide()'s doc comment). Kept as
+        // belt-and-braces: every write sets the identical value, so they
+        // are idempotent, and keeping them makes this method correct on
+        // its own terms rather than dependent on hide()'s internals.
+        //
+        // LOAD-BEARING ORDERING, do not "tidy" this: hide() cancels
+        // pendingResolveTask — which is THIS task, still executing. That
+        // is harmless only because the single `Task.isCancelled` check
+        // above runs BEFORE this point and nothing after it reads
+        // cancellation state. Adding another isCancelled check below
+        // hide() would silently reintroduce the stranding bug, and no
+        // test currently covers it (see gateopener-9kk.11).
         panel.alphaValue = 1
         isResolveFadePending = false
         pendingResolveTask = nil
