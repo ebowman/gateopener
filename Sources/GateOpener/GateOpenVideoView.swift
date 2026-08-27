@@ -70,8 +70,12 @@ final class GateOpenVideoView: NSView, OverlayShowHideResponding {
 
         super.init(frame: frame)
 
+        // Layer-BACKED, not layer-hosting: set `wantsLayer` and add the
+        // player layer to the layer AppKit provides. Assigning `self.layer`
+        // ourselves would opt into layer-HOSTING mode, where AppKit stops
+        // managing the layer tree's geometry and `layout()` is not called
+        // to keep `playerLayer.frame` tracking `bounds`.
         wantsLayer = true
-        self.layer = CALayer()
         self.layer?.addSublayer(layer)
         layer.frame = bounds
 

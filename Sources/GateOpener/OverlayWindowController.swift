@@ -442,6 +442,15 @@ final class OverlayWindowController {
         created.ignoresMouseEvents = ignoresMouseEvents
 
         let contentView = NSView(frame: NSRect(origin: .zero, size: Self.panelSize))
+        // LOAD-BEARING: the panel is borderless, non-opaque and clear-backed,
+        // and its content (GateOpenVideoView) draws entirely through an
+        // AVPlayerLayer. Without a layer-backed content view there is no
+        // layer tree for that AVPlayerLayer to composite into, so the panel
+        // appears on screen — isVisible true, alpha 1 — while rendering
+        // nothing at all. That is exactly the "the panel shows but I never
+        // see the video" bug (gateopener-9kk.12): every check confirmed the
+        // panel and none confirmed the pixels.
+        contentView.wantsLayer = true
         // Accessibility (bead gateopener-9kk.7): this panel is pure,
         // non-interactive decoration — it duplicates information already
         // available from the menu-bar icon and its tooltip, never accepts
