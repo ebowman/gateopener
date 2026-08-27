@@ -58,6 +58,67 @@ This protocol applies when ending a Beads implementation workflow. It is subordi
 <!-- END BEADS INTEGRATION -->
 
 
+## Reference Implementation: ../comelit (Python)
+
+**There is a prior, working Python implementation of this system at `/Users/ebowman/src/comelit`.
+Consult it before designing or implementing any Comelit-facing feature.** This Swift app is a
+re-implementation of a subset of it; much of the protocol knowledge here was won the hard way
+there, through live reverse-engineering against real hardware.
+
+It is a FastAPI + vanilla-JS webapp (`app.py`, `static/index.html`) over a `comelit/` package:
+
+| Area | File | What it covers |
+|---|---|---|
+| OAuth2 + PKCE login, token cache & refresh | `comelit/auth.py` | The auth flow this app's `ComelitAPI`/`TokenManager` mirror |
+| Endpoint discovery, open-gate | `comelit/client.py` | REST shapes, endpoint filtering |
+| **Live door-camera video over WebRTC** | `comelit/video.py`, `comelit/webrtc_page.html` | The hardest part of the whole system — see below |
+| HTTP surface | `app.py` | `/api/endpoints`, `/api/open/{gate}`, `/api/video/stream` (MJPEG) |
+| Tests | `tests/` | `test_auth`, `test_client`, `test_video`, `test_ui`, `test_app` |
+
+### The video pipeline was extremely hard to get working — read the notes before touching it
+
+Door-camera video is NOT a simple WebRTC client. An `aiortc` implementation completed signaling,
+ICE, and DTLS successfully and still received **zero RTP video packets**. The door station
+appears to fingerprint the WebRTC stack and only sends real media to a genuine libwebrtc
+implementation. The working solution drives a **headless Chromium via Playwright** as a real
+libwebrtc client, then scrapes frames from a `<canvas>` as JPEGs and serves them as MJPEG.
+
+Load-bearing details, all discovered empirically:
+
+- Signaling is a **single round trip, no trickle ICE**: `PUT
+  /servicerest/devicecom/endpoint/<ENDPOINT_ID>/rtc/offer` with `{"sessionId": uuid4, "offer": <full
+  SDP with all candidates inline>}` → `{"answer": <SDP>}`. Wait for `iceGatheringState === 'complete'`
+  before sending.
+- `addTransceiver('audio', recvonly)` **before** `('video', recvonly)` — the door's answer generation
+  is sensitive to m-line order.
+- Chromium needs `--force-webrtc-ip-handling-policy=default`, or mDNS `.local` ICE candidates make
+  `rtc/offer` return HTTP 500.
+- The door streams for only **~28–30s per session**, then stops; a new session needs a fresh cloud
+  round trip.
+- The bearer token is deliberately kept in Python and never handed to the browser page.
+
+### `bd memories` in ../comelit is the real archive
+
+`/Users/ebowman/src/comelit` has its own beads database with **~28 memories**, many documenting
+video dead ends in detail — and several are explicit *corrections superseding earlier theories*.
+When researching a Comelit behavior, run `bd memories <keyword>` **in that repo** and prefer the
+latest correction over any earlier claim. Start here:
+
+```bash
+cd ../comelit && bd memories video
+```
+
+Key ones: `comelit-video-solved-2026-08-25-the-door` (the fingerprinting conclusion),
+`comelit-video-libwebrtc-fingerprint-theory-confirmed-on-2026`,
+`comelit-door-video-liveness-the-door-siwl-sends` (the ~30s limit),
+`comelit-video-black-screen-dies-at-30s-bug` (STUN hostname resolution in headless Chromium),
+`comelit-video-protocol-captured-live-signaling-is-one`, and the several
+`comelit-video-*-disproven`/`-correction-*` entries recording what does NOT work.
+
+**Do not re-derive any of this by experiment.** If a Comelit question looks like it needs live
+testing against the hardware, check `../comelit`'s memories first — it has very likely already
+been tested there, and repeating a failed approach costs hours.
+
 ## Build & Test
 
 _Add your build and test commands here_
