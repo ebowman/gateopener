@@ -27,6 +27,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var observable: GateControllerObservable!
     private var statusItemController: StatusItemController!
     private var notificationPresenter: NotificationPresenter!
+    /// Confirmation-overlay HUD (bead gateopener-9kk.6), driven solely via
+    /// `OverlayWindowController.handle(_:)` chained onto `controller.
+    /// onStateChange` below — never `show()`/`hide()` directly from here.
+    /// Retained as a stored property (mirrors `notificationPresenter`
+    /// immediately above): without a strong reference the panel would be
+    /// deallocated and never appear.
+    private var overlayWindowController: OverlayWindowController!
     private var hasAutoOpenedSettings = false
     /// Set only under `GATEOPENER_MOCK=1`, so the self-test path can read
     /// call counts directly without `GateController` needing to expose its
@@ -86,6 +93,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         self.notificationPresenter = notificationPresenter
 
+        // Confirmation-overlay HUD (bead gateopener-9kk.6). MUST be
+        // constructed with the app's SHARED `appSettings` instance (the same
+        // one just captured above from `makeGateController`), not a fresh
+        // `AppSettings()` — a second instance could read a different
+        // `UserDefaults` suite than the one the Settings window writes to
+        // (this genuinely differs under `GATEOPENER_MOCK=1`, which uses a
+        // throwaway suite), which would make the Settings toggle appear
+        // broken. `ignoresMouseEvents` is left at its default (`true`).
+        let overlayWindowController = OverlayWindowController(appSettings: appSettings)
+        self.overlayWindowController = overlayWindowController
+
         // Global hotkey (bead gateopener-iif.2): mirrors
         // `StatusItemController.handleLeftClick()` exactly — if the app
         // still needs first-time setup, open Settings instead of firing a
@@ -137,6 +155,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             observableStateChange?(state)
             self?.statusItemController.render(for: state)
             notificationPresenter.handle(state)
+            overlayWindowController.handle(state)
 
             switch state {
             case .opening:
