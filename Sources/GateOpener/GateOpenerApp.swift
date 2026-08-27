@@ -38,6 +38,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var eventLog: EventLog!
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Must happen before any window is shown (the Settings window can
+        // auto-open below on `.needsSetup`) so the Edit menu exists the
+        // first time a text field becomes first responder. See
+        // MainMenu.swift for the root-cause explanation (bead
+        // gateopener-iif.1): without this, Cmd-V/C/X/A/Z are unbound in
+        // every text field because AppKit never installs a main menu for
+        // an `.accessory`/`LSUIElement` app on its own.
+        MainMenu.install()
+
         let controller = Self.makeGateController(mockOut: &mockGateOpeningForSelfTest)
         let observable = GateControllerObservable(controller: controller)
         self.observable = observable
@@ -137,6 +146,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         var menuRequestedCount = 0
         statusItemController.onMenuRequestedForSelfTest = { menuRequestedCount += 1 }
 
+        // Bead gateopener-iif.1: prove `MainMenu.install()` actually
+        // produced a usable Edit menu, since AppKit does not install one
+        // automatically for an `.accessory`/`LSUIElement` app. Checked
+        // directly against `NSApp.mainMenu` (the real production object),
+        // not a re-built copy.
+        let mainMenu = NSApp.mainMenu
+        let mainMenuPresent = mainMenu != nil
+        let editMenu = mainMenu?.items.first { $0.submenu?.title == "Edit" }?.submenu
+        let editMenuPresent = editMenu != nil
+        func editMenuHasItem(keyEquivalent: String, action: Selector) -> Bool {
+            editMenu?.items.contains { $0.keyEquivalent == keyEquivalent && $0.action == action } ?? false
+        }
+        let hasPasteItem = editMenuHasItem(keyEquivalent: "v", action: #selector(NSText.paste(_:)))
+        let hasCopyItem = editMenuHasItem(keyEquivalent: "c", action: #selector(NSText.copy(_:)))
+        let hasSelectAllItem = editMenuHasItem(keyEquivalent: "a", action: #selector(NSText.selectAll(_:)))
+
+        print("SELFTEST mainMenu present: \(mainMenuPresent)")
+        print("SELFTEST edit menu present: \(editMenuPresent)")
+        print("SELFTEST edit menu paste item: \(hasPasteItem)")
+        print("SELFTEST edit menu copy item: \(hasCopyItem)")
+        print("SELFTEST edit menu select all item: \(hasSelectAllItem)")
+
         Task { @MainActor in
             statusItemController.simulateClickForSelfTest(rightClick: true)
             try? await Task.sleep(for: .milliseconds(200))
@@ -164,7 +195,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             print("SELFTEST eventLog recorded open attempt: \(logRecordedAttempt)")
             print("SELFTEST eventLog recorded open success: \(logRecordedSuccess)")
             if menuRequestedCount == 1 && afterRightClick == 0 && afterLeftClick == 1
-                && logRecordedAttempt && logRecordedSuccess {
+                && logRecordedAttempt && logRecordedSuccess
+                && mainMenuPresent && editMenuPresent
+                && hasPasteItem && hasCopyItem && hasSelectAllItem {
                 print("SELFTEST PASS")
                 exit(0)
             } else {
