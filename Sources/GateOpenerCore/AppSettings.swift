@@ -23,11 +23,12 @@ public final class AppSettings: @unchecked Sendable {
         static let selectedEndpointId = "ie.boboco.GateOpener.selectedEndpointId"
         static let selectedEndpointName = "ie.boboco.GateOpener.selectedEndpointName"
         static let lastDiscoveryDate = "ie.boboco.GateOpener.lastDiscoveryDate"
+        static let shortcutPreference = "ie.boboco.GateOpener.shortcutPreference"
 
         /// All keys owned by `AppSettings`. Used by `reset()` so unrelated
         /// UserDefaults keys (e.g. from other parts of the app, or the test
         /// suite) are never touched.
-        static let all = [aptId, selectedEndpointId, selectedEndpointName, lastDiscoveryDate]
+        static let all = [aptId, selectedEndpointId, selectedEndpointName, lastDiscoveryDate, shortcutPreference]
     }
 
     private let defaults: UserDefaults
@@ -70,6 +71,27 @@ public final class AppSettings: @unchecked Sendable {
     public var lastDiscoveryDate: Date? {
         get { defaults.object(forKey: Keys.lastDiscoveryDate) as? Date }
         set { defaults.set(newValue, forKey: Keys.lastDiscoveryDate) }
+    }
+
+    /// The user's global-hotkey preference: unset (use the default chord),
+    /// explicitly disabled (no hotkey), or a specific custom chord.
+    ///
+    /// This is NOT a secret — it is a key code and modifier bitmask, not a
+    /// credential — so it belongs in UserDefaults like the rest of this
+    /// file, never in the Keychain. Stored as JSON-encoded `Data` since
+    /// `ShortcutPreference` is an enum with an associated value, which
+    /// `UserDefaults` cannot store as a native property-list type directly.
+    /// A missing or corrupt/unrecognized stored value decodes to `.unset`
+    /// (see `ShortcutPreference.init(from:)`) rather than crashing.
+    public var shortcutPreference: ShortcutPreference {
+        get {
+            guard let data = defaults.data(forKey: Keys.shortcutPreference) else { return .unset }
+            return (try? JSONDecoder().decode(ShortcutPreference.self, from: data)) ?? .unset
+        }
+        set {
+            guard let data = try? JSONEncoder().encode(newValue) else { return }
+            defaults.set(data, forKey: Keys.shortcutPreference)
+        }
     }
 
     /// True if and only if a non-empty `selectedEndpointId` is present.
