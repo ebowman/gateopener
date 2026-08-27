@@ -25,16 +25,23 @@ struct GateOpenerMain {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var observable: GateControllerObservable!
     private var statusItemController: StatusItemController!
+    private var notificationPresenter: NotificationPresenter!
     private var hasAutoOpenedSettings = false
     /// Set only under `GATEOPENER_MOCK=1`, so the self-test path can read
     /// call counts directly without `GateController` needing to expose its
     /// private `gateClient` dependency.
     private var mockGateOpeningForSelfTest: MockGateOpening?
+    /// The app's shared `EventLog` (bead gateopener-4ub.10). Kept as a
+    /// property (not just a local in `applicationDidFinishLaunching`) so
+    /// `runSelfTestAndExit()` can assert real entries were recorded by a
+    /// simulated open attempt.
+    private var eventLog: EventLog!
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let controller = Self.makeGateController(mockOut: &mockGateOpeningForSelfTest)
         let observable = GateControllerObservable(controller: controller)
         self.observable = observable
+        GateControllerObservable.appShared = observable
 
         let statusItemController = StatusItemController(observable: observable)
         self.statusItemController = statusItemController
@@ -51,9 +58,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // `GateControllerObservable` is created first, so its subscription
         // is already installed — wrap it rather than clobber it.
         let observableStateChange = controller.onStateChange
+        let notificationPresenter = NotificationPresenter { [weak controller] in
+            Task { await controller?.openGate() }
+        }
+        self.notificationPresenter = notificationPresenter
+
+        // The app's single `EventLog` instance (bead gateopener-4ub.10).
+        // Reachable by the Settings UI via `GateControllerObservable.eventLog`
+        // (set once, immediately below) so `SettingsView`'s log section can
+        // render real entries instead of the placeholder left by bead .9.
+        let eventLog = EventLog()
+        self.eventLog = eventLog
+        observable.eventLog = eventLog
+
+        // Records `.opening` -> `.succeeded`/`.failed` transitions. This is
+        // the seam available from the app layer: `GateState` itself only
+        // carries a short human-readable failure `message`, not a
+        // per-attempt count or HTTP status code (those live inside
+        // `GateClient.open`'s internal retry loop in `GateOpenerCore`,
+        // which this bead does not restructure) — so every open here is
+        // logged as a single attempt (1 of 1), and every failure is logged
+        // via the closed `OpenFailureReason.unknown` case rather than a
+        // real HTTP status, since no status is observable from here. See
+        // the bead .10 report for the full list of event kinds this does
+        // and does not cover.
+        var lastLoggedStateWasOpening = false
         controller.onStateChange = { [weak self] state in
             observableStateChange?(state)
             self?.statusItemController.render(for: state)
+            notificationPresenter.handle(state)
+
+            switch state {
+            case .opening:
+                lastLoggedStateWasOpening = true
+                eventLog.logOpenAttempt(attempt: 1, of: 1)
+            case .succeeded:
+                if lastLoggedStateWasOpening {
+                    eventLog.logOpenSucceeded()
+                }
+                lastLoggedStateWasOpening = false
+            case .failed:
+                if lastLoggedStateWasOpening {
+                    eventLog.logOpenFailed(attempt: 1, of: 1, reason: .unknown)
+                }
+                lastLoggedStateWasOpening = false
+            case .needsSetup, .idle:
+                lastLoggedStateWasOpening = false
+            }
         }
 
         if case .needsSetup = controller.state, !hasAutoOpenedSettings {
@@ -95,10 +146,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             try? await Task.sleep(for: .milliseconds(700))
             let afterLeftClick = await mock.openCallCount
 
+            // Prove EventLog actually records real events (bead
+            // gateopener-4ub.10 defect 1): the left click above drove a
+            // real `.opening` -> `.succeeded` transition through
+            // `controller.onStateChange`, which must have appended a
+            // "open attempted" entry and an "open succeeded" entry to the
+            // app's shared EventLog.
+            let logText = self.eventLog.formattedText()
+            let logEntryCount = self.eventLog.snapshot().count
+            let logRecordedAttempt = logText.contains("open attempted")
+            let logRecordedSuccess = logText.contains("open succeeded")
+
             print("SELFTEST menu-shown count after right-click: \(menuRequestedCount)")
             print("SELFTEST openCallCount after right-click: \(afterRightClick)")
             print("SELFTEST openCallCount after left-click: \(afterLeftClick)")
-            if menuRequestedCount == 1 && afterRightClick == 0 && afterLeftClick == 1 {
+            print("SELFTEST eventLog entry count: \(logEntryCount)")
+            print("SELFTEST eventLog recorded open attempt: \(logRecordedAttempt)")
+            print("SELFTEST eventLog recorded open success: \(logRecordedSuccess)")
+            if menuRequestedCount == 1 && afterRightClick == 0 && afterLeftClick == 1
+                && logRecordedAttempt && logRecordedSuccess {
                 print("SELFTEST PASS")
                 exit(0)
             } else {
@@ -135,9 +201,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     ///   counts directly. Left `nil` in real (non-mock) mode.
     private static func makeGateController(mockOut: inout MockGateOpening?) -> GateController {
         let isMock = ProcessInfo.processInfo.environment["GATEOPENER_MOCK"] == "1"
-        let appSettings = AppSettings()
 
         if isMock {
+            // Mock mode MUST NOT construct `AppSettings()` (i.e.
+            // `UserDefaults.standard`) here. `.standard`'s resolved domain
+            // depends on how the binary is launched:
+            //   - No bundle identifier (plain SwiftPM executable, as under
+            //     `swift run` / `.build/debug/GateOpener`): `.standard`
+            //     falls back to the EXECUTABLE-NAME domain `GateOpener`.
+            //   - Once packaged as a real .app with
+            //     `CFBundleIdentifier = ie.boboco.GateOpener` (see bead
+            //     .11), `.standard` resolves to the OPERATOR'S REAL
+            //     `ie.boboco.GateOpener` domain.
+            // Either way this branch is about to WRITE a fake mock
+            // endpoint id/name into whatever `.standard` resolves to. If
+            // that were the real domain, a mock/self-test run would
+            // silently overwrite the operator's live gate selection and
+            // the app would look configured while the gate never opens.
+            // So mock mode always gets its own throwaway suite, wiped at
+            // startup so runs don't accumulate stale state, and NEVER
+            // falls back to `.standard` on failure — a silent fallback
+            // here would reintroduce exactly the bug this guards against.
+            let mockSuiteName = "ie.boboco.GateOpener.mock"
+            guard let mockDefaults = UserDefaults(suiteName: mockSuiteName) else {
+                fatalError("GateOpener mock mode could not create throwaway UserDefaults suite '\(mockSuiteName)'; refusing to fall back to .standard, which could pollute real settings.")
+            }
+            mockDefaults.removePersistentDomain(forName: mockSuiteName)
+            let appSettings = AppSettings(defaults: mockDefaults)
+
             // See MockGateOpening.swift: records calls instead of hitting
             // the network, so left/right-click discrimination can be
             // verified without ever opening the real gate.
@@ -153,6 +244,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             )
         }
 
+        let appSettings = AppSettings()
         let credentialStore = KeychainCredentialStore()
         let api = ComelitAPI()
         let tokenManager = TokenManager(api: api, credentialStore: credentialStore)

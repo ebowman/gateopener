@@ -17,6 +17,18 @@ import GateOpenerCore
 @MainActor
 @Observable
 final class GateControllerObservable {
+    /// The app's single `GateControllerObservable` instance, set once by
+    /// `AppDelegate` immediately after construction
+    /// (`Sources/GateOpener/GateOpenerApp.swift`).
+    ///
+    /// Exists so `SettingsWindowController` (bead gateopener-4ub.9) can
+    /// reach the shared observable without changing `showShared()`'s
+    /// existing zero-argument signature — that signature has two call
+    /// sites in `StatusItemController.swift`, a file bead .9 does not own
+    /// and must not edit. `nil` only in the (untested-in-practice) window
+    /// before `AppDelegate.applicationDidFinishLaunching` runs.
+    static var appShared: GateControllerObservable?
+
     /// The controller this adapter wraps. Exposed so callers can invoke
     /// `openGate()`, `performFirstTimeSetup(...)`, etc. directly.
     let controller: GateController
@@ -25,6 +37,14 @@ final class GateControllerObservable {
     /// `onStateChange`. `@Observable` makes reads of this property from
     /// SwiftUI views trigger re-render on change.
     private(set) var state: GateState
+
+    /// The app's shared `EventLog` (bead gateopener-4ub.10), set once by
+    /// `AppDelegate` immediately after constructing this observable. `nil`
+    /// only in the same brief pre-launch window `appShared` itself can be
+    /// `nil` in. Exposed here (rather than only via `appShared`) so
+    /// `SettingsView`'s log section can read it directly off the
+    /// `@Bindable var observable` it already holds.
+    var eventLog: EventLog?
 
     init(controller: GateController) {
         self.controller = controller
