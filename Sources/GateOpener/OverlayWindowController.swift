@@ -167,16 +167,39 @@ final class OverlayWindowController {
     /// Gated on `AppSettings.showOpenConfirmationOverlay`, read FRESH on
     /// every call (not cached at init) so toggling the setting in Settings
     /// takes effect immediately without an app relaunch. When the setting is
-    /// `false` this is a total no-op: no panel is ever created (this method
-    /// returns before touching `panel`/`resolvePanel()` at all), and any
-    /// previously-scheduled fade is left alone rather than force-cancelled —
-    /// there is nothing to cancel, since a panel is only ever created inside
-    /// this same gate.
+    /// `false` AND no panel currently exists, this is a total no-op: no
+    /// panel is ever created (the guard below returns before touching
+    /// `panel`/`resolvePanel()` at all).
+    ///
+    /// EDGE CASE (bead gateopener-9kk.7): the setting can flip to `false`
+    /// WHILE a panel is already on screen — e.g. `.opening` arrived when the
+    /// setting was still `true` and showed the panel, the user then
+    /// unchecks the Settings toggle, and only THEN does the next state
+    /// (`.succeeded`/`.failed`/`.idle`) arrive with the setting now `false`.
+    /// A blanket `guard appSettings.showOpenConfirmationOverlay else {
+    /// return }` at the very top would return before ever reaching
+    /// `handleResolved`/`handleIdleOrNeedsSetup`, permanently stranding the
+    /// visible panel on screen — no future state transition would ever be
+    /// allowed to hide it. DECISION: the currently-visible panel must be
+    /// allowed to finish its natural course (hold, fade, hide) even after
+    /// the setting flips off; only the decision to SHOW a NEW panel
+    /// (`.opening` → `handleOpening()`) is gated on the live setting value.
+    /// So the guard below only blocks `.opening`, and only when no panel
+    /// exists yet; `.succeeded`/`.failed`/`.idle`/`.needsSetup` are always
+    /// allowed to reach their handlers, which are themselves already no-ops
+    /// once there is nothing left to hide (`guard panel != nil`).
     func handle(_ state: GateState) {
-        guard appSettings.showOpenConfirmationOverlay else { return }
+        let showOverlay = appSettings.showOpenConfirmationOverlay
 
         switch state {
         case .opening:
+            // Only block bringing up a brand-new panel. If a panel already
+            // exists (e.g. a fast re-open racing a toggle-off — see the
+            // edge-case doc above), let it proceed exactly like the setting
+            // was never touched; this mirrors reentrancy rule (a) elsewhere
+            // in this type, which does not special-case a mid-flight
+            // panel's origin.
+            guard showOverlay || panel != nil else { return }
             handleOpening()
         case .succeeded:
             handleResolved(holdDuration: Self.succeededHoldDuration)
@@ -286,19 +309,33 @@ final class OverlayWindowController {
             return
         }
 
-        await withCheckedContinuation { continuation in
-            NSAnimationContext.runAnimationGroup { context in
-                context.duration = Self.fadeDuration
-                panel.animator().alphaValue = 0
-            } completionHandler: {
-                continuation.resume()
+        // Reduce Motion (bead gateopener-9kk.7): read FRESH here, not
+        // cached at init, for the same reason `GateOpenVideoView
+        // .overlayWillShow()` does — a user who flips the system setting
+        // mid-run must see the new behavior on the very next resolve, no
+        // relaunch required. When on, skip the animated alpha fade
+        // entirely and go straight to a plain `orderOut` (via `hide()`
+        // below): `NSAnimationContext`'s alpha animation IS the motion this
+        // accessibility setting exists to suppress. The overlay itself
+        // still appears (per `GateOpenVideoView`'s Reduce Motion path) and
+        // still disappears at the same hold-duration-driven moment — only
+        // the fade transition itself is skipped.
+        if !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+            await withCheckedContinuation { continuation in
+                NSAnimationContext.runAnimationGroup { context in
+                    context.duration = Self.fadeDuration
+                    panel.animator().alphaValue = 0
+                } completionHandler: {
+                    continuation.resume()
+                }
             }
-        }
 
-        guard !Task.isCancelled else {
-            // Superseded mid-animation by a new .opening — see doc comment
-            // above. The superseding call already owns alpha/visibility.
-            return
+            guard !Task.isCancelled else {
+                // Superseded mid-animation by a new .opening — see doc
+                // comment above. The superseding call already owns
+                // alpha/visibility.
+                return
+            }
         }
 
         hide()
@@ -365,6 +402,17 @@ final class OverlayWindowController {
         created.ignoresMouseEvents = ignoresMouseEvents
 
         let contentView = NSView(frame: NSRect(origin: .zero, size: Self.panelSize))
+        // Accessibility (bead gateopener-9kk.7): this panel is pure,
+        // non-interactive decoration — it duplicates information already
+        // available from the menu-bar icon and its tooltip, never accepts
+        // clicks (see `ignoresMouseEvents` above), and can never become key/
+        // main (see `OverlayPanel.canBecomeKey`/`canBecomeMain` below), so
+        // it is already unreachable by keyboard. Marking the content view
+        // `isAccessibilityElement(false)` additionally keeps VoiceOver from
+        // announcing/focusing it at all, rather than presenting a
+        // focusable-but-inert element that duplicates the menu-bar icon's
+        // own accessible description.
+        contentView.setAccessibilityElement(false)
         created.contentView = contentView
 
         let installedContent = pendingContent ?? Self.makeDefaultContent()

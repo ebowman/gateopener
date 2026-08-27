@@ -40,6 +40,10 @@ struct SettingsView: View {
 
             Divider()
 
+            ShowOpenOverlaySectionView()
+
+            Divider()
+
             if isSignedIn {
                 SignedInView(observable: observable)
             } else {
@@ -120,6 +124,52 @@ private struct LaunchAtLoginSectionView: View {
         // this is what makes the toggle never lie about its state.
         refreshFromSystem()
         isUpdating = false
+    }
+}
+
+// MARK: - Show open confirmation overlay
+
+/// "Show overlay when opening the gate" toggle (bead gateopener-9kk.7),
+/// backed directly by `AppSettings.showOpenConfirmationOverlay`.
+///
+/// Much simpler than `LaunchAtLoginSectionView` above: there is no external
+/// system authority to reconcile against (unlike `SMAppService.mainApp`),
+/// no async write, and no failure mode — `UserDefaults` writes are
+/// synchronous and effectively cannot fail — so a plain `Binding` computed
+/// directly over `AppSettings` is the right, minimal idiom here. Reads and
+/// writes go straight through `AppSettings(defaults: .standard)`,
+/// constructed fresh on each access — the SAME pattern already used for
+/// display-only reads elsewhere in this file (see `AccountSectionView
+/// .displaySelectedGateName` and `GatePickerView`'s picker binding above).
+///
+/// This is safe for a real launch (`AppSettings()`'s `.standard` suite is
+/// exactly what `AppDelegate` also constructs and hands to
+/// `OverlayWindowController`), but — like those other call sites — carries
+/// the same known mock-mode caveat: under `GATEOPENER_MOCK=1`,
+/// `AppDelegate` builds its shared `appSettings`/`OverlayWindowController`
+/// over a THROWAWAY `UserDefaults` suite (see the doc comment above the
+/// `OverlayWindowController(appSettings:)` call site in
+/// `GateOpenerApp.swift`), which this view has no access to — there is no
+/// public accessor for that shared instance on `GateController`/
+/// `GateControllerObservable` (unlike `shortcutPreference`, which got a
+/// dedicated routed read/write path). So under mock mode this toggle reads
+/// and writes `.standard`, not the mock suite the running app actually
+/// consults, and would appear to have no effect. Harmless for the
+/// self-test (which never opens Settings) but flagged here for the human
+/// checklist, exactly as the existing comments in this file already do for
+/// `displaySelectedGateName`/`GatePickerView`.
+private struct ShowOpenOverlaySectionView: View {
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Toggle("Show overlay when opening the gate", isOn: showOverlayBinding)
+        }
+    }
+
+    private var showOverlayBinding: Binding<Bool> {
+        Binding(
+            get: { AppSettings().showOpenConfirmationOverlay },
+            set: { AppSettings().showOpenConfirmationOverlay = $0 }
+        )
     }
 }
 

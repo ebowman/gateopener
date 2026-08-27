@@ -111,8 +111,28 @@ final class GateOpenVideoView: NSView, OverlayShowHideResponding {
 
     /// Restarts playback from the beginning every time the overlay is
     /// shown, so a second open never resumes mid-animation from wherever
-    /// the previous playthrough left off.
+    /// the previous playthrough left off — UNLESS Reduce Motion is on, in
+    /// which case no motion plays at all.
+    ///
+    /// `NSWorkspace.shared.accessibilityDisplayShouldReduceMotion` is read
+    /// HERE, at show-time, rather than cached at `init`/construction time,
+    /// so a user who flips the system setting while the app is already
+    /// running gets the new behavior on the very next open — no relaunch
+    /// required (bead gateopener-9kk.7).
+    ///
+    /// Reduce Motion means less motion, NOT less information: the overlay
+    /// must still appear and still communicate "the gate opened". So
+    /// instead of skipping playback, this seeks to the END of the clip and
+    /// pauses there — the same held final frame `holdFinalFrame()` lands on
+    /// after a normal playthrough, showing the gate fully open, which is
+    /// the single most informative static frame available. It does NOT
+    /// simply skip calling `play()` from frame zero, which would show the
+    /// LEAST informative frame (gate still closed).
     func overlayWillShow() {
+        if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+            seekToFinalFrameAndPause()
+            return
+        }
         player.seek(to: .zero)
         player.play()
     }
@@ -139,5 +159,28 @@ final class GateOpenVideoView: NSView, OverlayShowHideResponding {
     /// the pause takes effect.
     private func holdFinalFrame() {
         player.pause()
+    }
+
+    /// Reduce Motion path: pauses playback and seeks directly to the last
+    /// frame of the clip WITHOUT ever calling `play()`, so no animation is
+    /// ever presented to the layer — not even a single decoded frame of
+    /// motion in between. `player.currentItem?.duration` is read fresh each
+    /// call (never cached) since it is only reliably available once the
+    /// item has loaded; `.indefinite`/invalid durations (e.g. a not-yet-
+    /// ready item) are guarded against by falling back to `.zero`, which
+    /// still shows the first frame rather than crashing or seeking
+    /// nowhere — an acceptable degrade for an edge case that should not
+    /// occur with the small, bundled, already-local asset this view always
+    /// loads.
+    private func seekToFinalFrameAndPause() {
+        player.pause()
+        let duration = player.currentItem?.duration
+        let target: CMTime
+        if let duration, duration.isNumeric, duration.isValid {
+            target = duration
+        } else {
+            target = .zero
+        }
+        player.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero)
     }
 }
