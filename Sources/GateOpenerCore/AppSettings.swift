@@ -24,11 +24,15 @@ public final class AppSettings: @unchecked Sendable {
         static let selectedEndpointName = "ie.boboco.GateOpener.selectedEndpointName"
         static let lastDiscoveryDate = "ie.boboco.GateOpener.lastDiscoveryDate"
         static let shortcutPreference = "ie.boboco.GateOpener.shortcutPreference"
+        static let showOpenConfirmationOverlay = "ie.boboco.GateOpener.showOpenConfirmationOverlay"
 
         /// All keys owned by `AppSettings`. Used by `reset()` so unrelated
         /// UserDefaults keys (e.g. from other parts of the app, or the test
         /// suite) are never touched.
-        static let all = [aptId, selectedEndpointId, selectedEndpointName, lastDiscoveryDate, shortcutPreference]
+        static let all = [
+            aptId, selectedEndpointId, selectedEndpointName, lastDiscoveryDate, shortcutPreference,
+            showOpenConfirmationOverlay,
+        ]
     }
 
     private let defaults: UserDefaults
@@ -92,6 +96,28 @@ public final class AppSettings: @unchecked Sendable {
             guard let data = try? JSONEncoder().encode(newValue) else { return }
             defaults.set(data, forKey: Keys.shortcutPreference)
         }
+    }
+
+    /// Whether the canned "gate opened" confirmation overlay/animation is
+    /// shown after a successful open. Defaults to `true` — the overlay is
+    /// the whole point of the feature.
+    ///
+    /// This is distinct from (and must not be confused with) a later,
+    /// separate preference for auto-playing the live door camera on open
+    /// (expected name: `autoShowDoorVideoOnOpen`). This property governs
+    /// only the canned confirmation animation.
+    public var showOpenConfirmationOverlay: Bool {
+        get {
+            // UserDefaults.bool(forKey:) returns `false` for an absent key,
+            // which would silently default this feature OFF — the opposite
+            // of the intended default. So an absent key must be treated as
+            // `true` explicitly; do not "simplify" this back to
+            // `defaults.bool(forKey:)`.
+            defaults.object(forKey: Keys.showOpenConfirmationOverlay) == nil
+                ? true
+                : defaults.bool(forKey: Keys.showOpenConfirmationOverlay)
+        }
+        set { defaults.set(newValue, forKey: Keys.showOpenConfirmationOverlay) }
     }
 
     /// True if and only if a non-empty `selectedEndpointId` is present.
