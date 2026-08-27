@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "gateopener",
+  "project_id": "e66719a0-0da9-4ab9-a271-6ea2cd25908d"
+}
