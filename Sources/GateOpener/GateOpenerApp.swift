@@ -36,6 +36,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// `runSelfTestAndExit()` can assert real entries were recorded by a
     /// simulated open attempt.
     private var eventLog: EventLog!
+    /// The app's global hotkey (bead gateopener-iif.2). Kept as a property
+    /// so it can be unregistered on termination (`applicationWillTerminate`)
+    /// and so `runSelfTestAndExit()` can invoke its handler directly. `nil`
+    /// only before `applicationDidFinishLaunching` has run.
+    private var globalHotkey: GlobalHotkey!
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Must happen before any window is shown (the Settings window can
@@ -71,6 +76,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             Task { await controller?.openGate() }
         }
         self.notificationPresenter = notificationPresenter
+
+        // Global hotkey (bead gateopener-iif.2): mirrors
+        // `StatusItemController.handleLeftClick()` exactly — if the app
+        // still needs first-time setup, open Settings instead of firing a
+        // doomed open; otherwise reuse the SAME `openGate()` call a
+        // left-click makes (already idempotent against double-fires, so no
+        // additional `.opening` guard is needed here beyond what
+        // `openGate()` itself provides).
+        let globalHotkey = GlobalHotkey { [weak controller] in
+            guard let controller else { return }
+            if case .needsSetup = controller.state {
+                SettingsWindowController.showShared()
+                return
+            }
+            Task {
+                await controller.openGate()
+            }
+        }
+        globalHotkey.install()
+        self.globalHotkey = globalHotkey
+        observable.globalHotkey = globalHotkey
 
         // The app's single `EventLog` instance (bead gateopener-4ub.10).
         // Reachable by the Settings UI via `GateControllerObservable.eventLog`
@@ -194,10 +220,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             print("SELFTEST eventLog entry count: \(logEntryCount)")
             print("SELFTEST eventLog recorded open attempt: \(logRecordedAttempt)")
             print("SELFTEST eventLog recorded open success: \(logRecordedSuccess)")
+
+            // Bead gateopener-iif.2: prove the global hotkey's HANDLER (the
+            // exact closure `AppDelegate` wired into `GlobalHotkey.init`,
+            // invoked directly — never a synthesized system-wide keystroke,
+            // which could be delivered to whatever app is actually
+            // frontmost) calls `openGate()` exactly once when state is not
+            // `.needsSetup`.
+            let hotkeyRegistered = self.globalHotkey.isRegistered
+            let hotkeyRegistrationError = self.globalHotkey.lastRegistrationError
+            let beforeHotkey = await mock.openCallCount
+            self.globalHotkey.invokeHandlerForSelfTest()
+            try? await Task.sleep(for: .milliseconds(700))
+            let afterHotkey = await mock.openCallCount
+            let hotkeyOpenCallCount = afterHotkey - beforeHotkey
+
+            print("SELFTEST hotkey registered: \(hotkeyRegistered)")
+            print("SELFTEST hotkey registration error: \(hotkeyRegistrationError ?? "none")")
+            print("SELFTEST hotkey openCallCount: \(hotkeyOpenCallCount)")
+
+            // Mirror the left-click `.needsSetup` behaviour: drive the
+            // REAL controller to `.needsSetup` via the same public
+            // `signOut()` API `SettingsView`'s "Sign Out" button calls, then
+            // invoke the hotkey handler again and assert it produced ZERO
+            // additional open calls (it must open Settings instead of
+            // firing a doomed open — see `GlobalHotkey`'s wiring in
+            // `applicationDidFinishLaunching`).
+            self.observable.controller.signOut()
+            try? await Task.sleep(for: .milliseconds(50))
+            let stateIsNeedsSetup = self.observable.controller.state == .needsSetup
+            let beforeHotkeyNeedsSetup = await mock.openCallCount
+            self.globalHotkey.invokeHandlerForSelfTest()
+            try? await Task.sleep(for: .milliseconds(200))
+            let afterHotkeyNeedsSetup = await mock.openCallCount
+            let hotkeyNeedsSetupOpenCallCount = afterHotkeyNeedsSetup - beforeHotkeyNeedsSetup
+
+            print("SELFTEST controller state is .needsSetup after signOut: \(stateIsNeedsSetup)")
+            print("SELFTEST hotkey openCallCount while .needsSetup: \(hotkeyNeedsSetupOpenCallCount)")
+
             if menuRequestedCount == 1 && afterRightClick == 0 && afterLeftClick == 1
                 && logRecordedAttempt && logRecordedSuccess
                 && mainMenuPresent && editMenuPresent
-                && hasPasteItem && hasCopyItem && hasSelectAllItem {
+                && hasPasteItem && hasCopyItem && hasSelectAllItem
+                && hotkeyRegistered && hotkeyRegistrationError == nil
+                && hotkeyOpenCallCount == 1
+                && stateIsNeedsSetup && hotkeyNeedsSetupOpenCallCount == 0 {
                 print("SELFTEST PASS")
                 exit(0)
             } else {
@@ -211,6 +278,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Closing the Settings window (the only window this app ever
         // shows) must never quit the app — it lives in the status item.
         false
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        // Bead gateopener-iif.2: unregister the global hotkey on quit so a
+        // stale Carbon registration can never linger after the app exits
+        // (which would otherwise make the combination unusable — or worse,
+        // silently non-functional — until next reboot/registration owner
+        // change).
+        globalHotkey?.uninstall()
     }
 
     private func presentStatusItemUnavailableAlertAndExit() {

@@ -46,6 +46,13 @@ final class GateControllerObservable {
     /// `@Bindable var observable` it already holds.
     var eventLog: EventLog?
 
+    /// The app's global hotkey (bead gateopener-iif.2), set once by
+    /// `AppDelegate` immediately after installing it — same lifecycle
+    /// caveat as `eventLog` above. Exposed so `SettingsView` can display
+    /// the current shortcut and surface a registration-failure message
+    /// without a separate access path.
+    var globalHotkey: GlobalHotkey?
+
     init(controller: GateController) {
         self.controller = controller
         self.state = controller.state

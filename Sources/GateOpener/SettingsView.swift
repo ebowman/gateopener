@@ -36,6 +36,10 @@ struct SettingsView: View {
 
             Divider()
 
+            GlobalHotkeySectionView(observable: observable)
+
+            Divider()
+
             if isSignedIn {
                 SignedInView(observable: observable)
             } else {
@@ -116,6 +120,43 @@ private struct LaunchAtLoginSectionView: View {
         // this is what makes the toggle never lie about its state.
         refreshFromSystem()
         isUpdating = false
+    }
+}
+
+// MARK: - Global hotkey
+
+/// Read-only display of the global hotkey (bead gateopener-iif.2): shows
+/// the current chord and, if registration failed (e.g. another app already
+/// owns the combination), a visible warning rather than a silent no-op.
+///
+/// Deliberately read-only for this bead — a full shortcut-recorder UI
+/// (letting the operator pick their own chord) is a reasonable follow-up
+/// but is out of scope here; what matters for this bead is that the
+/// operator can always SEE what the shortcut is and whether it is actually
+/// working, never a silently-hardcoded, invisible binding.
+private struct GlobalHotkeySectionView: View {
+    let observable: GateControllerObservable
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Keyboard Shortcut").font(.headline)
+
+            HStack {
+                Text("Open Gate:")
+                Text(GlobalHotkey.displayString)
+                    .font(.system(.body, design: .monospaced))
+            }
+
+            if let error = observable.globalHotkey?.lastRegistrationError {
+                Text(error)
+                    .foregroundStyle(.red)
+                    .font(.callout)
+            } else if observable.globalHotkey?.isRegistered != true {
+                Text("Shortcut not yet registered.")
+                    .foregroundStyle(.secondary)
+                    .font(.callout)
+            }
+        }
     }
 }
 
