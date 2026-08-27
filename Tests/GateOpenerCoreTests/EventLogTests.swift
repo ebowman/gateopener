@@ -68,6 +68,28 @@ import Testing
     }
 }
 
+/// The boundary case a naive range guard gets wrong.
+///
+/// `Double(Int.max)` rounds UP to 9223372036854775808.0 (== `Int.max + 1`),
+/// which is NOT representable as an `Int`. A `guard expiresIn <= Double(Int.max)`
+/// therefore ADMITS it and the following `Int(expiresIn)` traps. This test
+/// crashes the suite against that implementation and passes against
+/// `Int(exactly:)`.
+///
+/// `Double(Int.min)` is exactly representable, so it is NOT "unknown" — it
+/// converts cleanly. Asserting otherwise would be wrong.
+@Test func logTokenRefreshedHandlesIntBoundaryValues() {
+    let log = EventLog()
+
+    log.logTokenRefreshed(expiresIn: Double(Int.max))   // must not trap
+    log.logTokenRefreshed(expiresIn: Double(Int.min))   // exactly representable
+
+    let entries = log.snapshot()
+    #expect(entries.count == 2)
+    #expect(entries[0].message == "refreshed token (expires in unknowns)")
+    #expect(entries[1].message == "refreshed token (expires in \(Int.min)s)")
+}
+
 @Test func logLoginPerformedRecordsExpectedMessage() {
     let log = EventLog()
     log.logLoginPerformed()

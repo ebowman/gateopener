@@ -161,11 +161,16 @@ public final class EventLog: @unchecked Sendable {
     /// rounded integer seconds.
     private func formattedExpiresIn(_ expiresIn: TimeInterval) -> String {
         guard expiresIn.isFinite else { return "unknown" }
-        // `Int(Double)` traps if the value doesn't fit in `Int`'s range;
-        // guard explicitly rather than relying on `isFinite` alone, since
-        // a huge-but-finite Double (e.g. 1e300) is still not representable.
-        guard expiresIn >= Double(Int.min), expiresIn <= Double(Int.max) else { return "unknown" }
-        return String(Int(expiresIn))
+        // `Int(Double)` traps if the value doesn't fit in `Int`'s range, so
+        // convert with `Int(exactly:)` and let a nil result mean "unknown".
+        //
+        // Do NOT reintroduce a range comparison here. The obvious-looking
+        // `expiresIn <= Double(Int.max)` is WRONG: `Double(Int.max)` rounds
+        // UP to 9223372036854775808.0 (== Int.max + 1), which is not
+        // representable as an Int, so `<=` admits it and the conversion then
+        // traps. `Int(exactly:)` has no such boundary to get wrong.
+        guard let seconds = Int(exactly: expiresIn.rounded()) else { return "unknown" }
+        return String(seconds)
     }
 
     /// Records that a full username/password login was performed. Takes no
