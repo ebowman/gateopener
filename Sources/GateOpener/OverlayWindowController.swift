@@ -1,4 +1,5 @@
 import AppKit
+import AVFoundation
 import os
 
 /// Shows a small, borderless HUD panel in the top-right corner of the
@@ -71,6 +72,18 @@ final class OverlayWindowController {
 
     private var pendingContent: NSView?
 
+    /// The content view currently on screen, if any.
+    ///
+    /// Prefers what the panel actually has installed, falling back to
+    /// `pendingContent` for the case where `setContent(_:)` was called
+    /// before the panel was lazily created. Both orders must resolve
+    /// correctly: `show()` uses this to deliver `OverlayShowHideResponding`
+    /// hooks, so returning nil here would silently mean video playback
+    /// never starts.
+    private func currentContent() -> NSView? {
+        panel?.currentContentView ?? pendingContent
+    }
+
     /// Shows the panel, creating it on first call. Safe to call repeatedly:
     /// at most one panel is ever created, so a second call reuses the
     /// existing one rather than stacking another on screen.
@@ -96,12 +109,15 @@ final class OverlayWindowController {
         // whatever app the user is currently typing into, which is exactly
         // what this entire type exists to prevent.
         resolvedPanel.orderFrontRegardless()
+
+        (currentContent() as? OverlayShowHideResponding)?.overlayWillShow()
     }
 
     /// Hides the panel. No-op if the panel was never created or is already
     /// hidden.
     func hide() {
         panel?.orderOut(nil)
+        (currentContent() as? OverlayShowHideResponding)?.overlayDidHide()
     }
 
     // MARK: - Private
@@ -157,7 +173,7 @@ final class OverlayWindowController {
         let contentView = NSView(frame: NSRect(origin: .zero, size: Self.panelSize))
         created.contentView = contentView
 
-        let installedContent = pendingContent ?? Self.makePlaceholderContent()
+        let installedContent = pendingContent ?? Self.makeDefaultContent()
         created.installContent(installedContent)
 
         panel = created
@@ -174,9 +190,20 @@ final class OverlayWindowController {
         panel.setFrame(NSRect(origin: origin, size: size), display: false)
     }
 
-    /// Placeholder content for this bead: a rounded, semi-transparent dark
-    /// HUD backing with no live data. A future feature replaces this by
-    /// calling `setContent(_:)` — see that method's doc comment.
+    /// Default content: the bundled gate-open video (see
+    /// `GateOpenVideoView`). Falls back to the plain HUD placeholder when
+    /// the video asset cannot be located — see
+    /// `GateOpenVideoView.makeIfAvailable()` for why that happens (chiefly:
+    /// an unbundled process, where `Bundle.main` has no `Resources`
+    /// directory at all) and why it must never crash.
+    private static func makeDefaultContent() -> NSView {
+        GateOpenVideoView.makeIfAvailable(size: panelSize) ?? makePlaceholderContent()
+    }
+
+    /// Placeholder content: a rounded, semi-transparent dark HUD backing
+    /// with no live data. Used both as this bead's degrade path (see
+    /// `makeDefaultContent()`) and available to any future feature via
+    /// `setContent(_:)` — see that method's doc comment.
     private static func makePlaceholderContent() -> NSView {
         let effectView = NSVisualEffectView(frame: NSRect(origin: .zero, size: panelSize))
         effectView.material = .hudWindow
@@ -219,7 +246,34 @@ private final class OverlayPanel: NSPanel {
         view.frame = host.bounds
         view.autoresizingMask = [.width, .height]
         host.addSubview(view)
+        currentContentView = view
     }
+
+    /// Tracks whatever view was most recently installed via
+    /// `installContent(_:)`, so `OverlayWindowController.show()`/`hide()`
+    /// can look it up (via `currentContent()`) to deliver
+    /// `OverlayShowHideResponding` lifecycle hooks without keeping their own
+    /// separate reference.
+    private(set) var currentContentView: NSView?
+}
+
+/// Optional lifecycle hook for content installed via
+/// `OverlayWindowController.setContent(_:)`. See that method's doc comment
+/// for the swappability seam this protocol participates in.
+///
+/// Content that does not need to know about `show()`/`hide()` (e.g. a
+/// static placeholder) simply does not conform; the controller only invokes
+/// these methods when the currently-installed content does.
+@MainActor
+protocol OverlayShowHideResponding: AnyObject {
+    /// Called from `OverlayWindowController.show()`, after the panel has
+    /// been ordered front, every time `show()` runs (not just the first
+    /// time the panel is created).
+    func overlayWillShow()
+
+    /// Called from `OverlayWindowController.hide()`, after the panel has
+    /// been ordered out.
+    func overlayDidHide()
 }
 
 extension OverlayWindowController {
