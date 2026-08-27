@@ -93,6 +93,50 @@ struct AppSettingsTests {
         #expect(defaults.string(forKey: unrelatedKey) == "keep-me")
     }
 
+    @Test func showOpenConfirmationOverlayDefaultsToTrueWhenUnset() {
+        let (defaults, cleanup) = makeSuite()
+        defer { cleanup() }
+
+        let settings = AppSettings(defaults: defaults)
+
+        #expect(settings.showOpenConfirmationOverlay)
+    }
+
+    @Test func showOpenConfirmationOverlaySetFalseReadsFalseOnSameInstance() {
+        let (defaults, cleanup) = makeSuite()
+        defer { cleanup() }
+
+        let settings = AppSettings(defaults: defaults)
+        settings.showOpenConfirmationOverlay = false
+
+        #expect(!settings.showOpenConfirmationOverlay)
+    }
+
+    @Test func showOpenConfirmationOverlaySetFalsePersistsAcrossNewInstance() {
+        let (defaults, cleanup) = makeSuite()
+        defer { cleanup() }
+
+        let settingsA = AppSettings(defaults: defaults)
+        settingsA.showOpenConfirmationOverlay = false
+
+        let settingsB = AppSettings(defaults: defaults)
+        #expect(!settingsB.showOpenConfirmationOverlay)
+    }
+
+    @Test func showOpenConfirmationOverlaySetTruePersists() {
+        let (defaults, cleanup) = makeSuite()
+        defer { cleanup() }
+
+        let settings = AppSettings(defaults: defaults)
+        settings.showOpenConfirmationOverlay = false
+        settings.showOpenConfirmationOverlay = true
+
+        #expect(settings.showOpenConfirmationOverlay)
+
+        let settingsB = AppSettings(defaults: defaults)
+        #expect(settingsB.showOpenConfirmationOverlay)
+    }
+
     @Test func twoInstancesOverSameSuiteSeeEachOthersWrites() {
         let (defaults, cleanup) = makeSuite()
         defer { cleanup() }
