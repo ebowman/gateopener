@@ -25,7 +25,12 @@ final class MockTokenIssuing: TokenIssuing, @unchecked Sendable {
     /// When non-nil, `login` suspends on this gate before returning its
     /// scripted result. Signal the gate (via `openLoginGate()`) to let it
     /// proceed. Used to make the concurrency-coalescing test deterministic.
-    private var loginGateContinuation: CheckedContinuation<Void, Never>?
+    /// All continuations currently waiting on the gate. This MUST be a
+    /// collection, not a single slot: two concurrent `login` calls both
+    /// suspend here, and a single slot would let the second overwrite (and
+    /// permanently orphan) the first — turning a coalescing regression into
+    /// a hang instead of a clean assertion failure.
+    private var loginGateContinuations: [CheckedContinuation<Void, Never>] = []
     private var loginGateEnabled = false
     private var loginGateOpen = false
 
@@ -53,13 +58,15 @@ final class MockTokenIssuing: TokenIssuing, @unchecked Sendable {
     /// Release any (current or future) call to `login` that is waiting on
     /// the gate.
     func openLoginGate() {
-        let continuation: CheckedContinuation<Void, Never>? = withLock {
-            let continuation = loginGateContinuation
-            loginGateContinuation = nil
+        let continuations: [CheckedContinuation<Void, Never>] = withLock {
+            let waiting = loginGateContinuations
+            loginGateContinuations = []
             loginGateOpen = true
-            return continuation
+            return waiting
         }
-        continuation?.resume()
+        for continuation in continuations {
+            continuation.resume()
+        }
     }
 
     func login(username: String, password: String) async throws -> TokenSet {
@@ -74,7 +81,7 @@ final class MockTokenIssuing: TokenIssuing, @unchecked Sendable {
                     if loginGateOpen {
                         return true
                     } else {
-                        loginGateContinuation = continuation
+                        loginGateContinuations.append(continuation)
                         return false
                     }
                 }
