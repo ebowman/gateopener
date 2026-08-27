@@ -344,6 +344,135 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             print("SELFTEST after forced registration failure chord unchanged: \(afterFailureChord == beforeFailureChord)")
             print("SELFTEST after forced registration failure error reported: \(afterFailureError != nil)")
 
+            // Bead gateopener-3vq.4: prove persistence survives a simulated
+            // fresh launch. Uses its own throwaway `UserDefaults(suiteName:)`
+            // (UUID-unique, never `.standard`/the real
+            // `ie.boboco.GateOpener` domain — see the bead's test-hygiene
+            // requirement) and constructs BRAND NEW `AppSettings`/
+            // `GateController`/`GlobalHotkey` instances per scenario to
+            // simulate "app relaunches" rather than reusing `self.
+            // globalHotkey` (which already carries state from the
+            // assertions above) — this is what makes these assertions
+            // actually exercise the launch-time read-persisted-then-apply
+            // path (`AppDelegate.applicationDidFinishLaunching`'s `globalHotkey.
+            // apply(appSettings.shortcutPreference)` call) rather than
+            // re-testing `apply(_:)` in isolation, which the block above
+            // already covers.
+            let persistenceSuiteName = "ie.boboco.GateOpener.selftest.\(UUID().uuidString)"
+            guard let persistenceDefaults = UserDefaults(suiteName: persistenceSuiteName) else {
+                print("SELFTEST FAIL: could not create throwaway UserDefaults suite for persistence self-test")
+                exit(1)
+            }
+            defer { persistenceDefaults.removePersistentDomain(forName: persistenceSuiteName) }
+
+            /// Simulates one full "app relaunch": a fresh `AppSettings` over
+            /// the SAME throwaway suite (so previously-written keys are
+            /// still there, exactly like a real relaunch reading the same
+            /// UserDefaults domain) and a fresh `GlobalHotkey` with
+            /// `apply(_:)` invoked on the freshly-read persisted preference
+            /// — the exact sequence `AppDelegate` performs at launch.
+            @MainActor
+            func simulateFreshLaunch() -> (settings: AppSettings, hotkey: GlobalHotkey) {
+                let settings = AppSettings(defaults: persistenceDefaults)
+                let hotkey = GlobalHotkey { }
+                hotkey.apply(settings.shortcutPreference)
+                return (settings, hotkey)
+            }
+
+            // 1) A saved .custom chord is registered on a fresh start.
+            let savedCustomChord = KeyboardShortcut(keyCode: 4, modifiers: KeyboardShortcut.cmdKey | KeyboardShortcut.shiftKey | KeyboardShortcut.controlKey)
+            AppSettings(defaults: persistenceDefaults).shortcutPreference = .custom(savedCustomChord)
+            let freshCustom = simulateFreshLaunch()
+            let freshCustomIsRegistered = freshCustom.hotkey.isRegistered
+            let freshCustomChordMatches = freshCustom.hotkey.currentChord == savedCustomChord
+            let freshCustomHasNoError = freshCustom.hotkey.lastRegistrationError == nil
+            let freshCustomIsNotDisabled = freshCustom.hotkey.isDisabled == false
+            print("SELFTEST fresh start with saved .custom chord isRegistered: \(freshCustomIsRegistered)")
+            print("SELFTEST fresh start with saved .custom chord matches saved chord: \(freshCustomChordMatches)")
+            print("SELFTEST fresh start with saved .custom chord has no error: \(freshCustomHasNoError)")
+
+            // 2) A saved .disabled results in NO registration AND no error
+            // message — and is presented as DELIBERATE (isDisabled == true),
+            // never as a failure.
+            AppSettings(defaults: persistenceDefaults).shortcutPreference = .disabled
+            let freshDisabled = simulateFreshLaunch()
+            let freshDisabledIsRegistered = freshDisabled.hotkey.isRegistered
+            let freshDisabledIsDisabled = freshDisabled.hotkey.isDisabled
+            let freshDisabledHasNoError = freshDisabled.hotkey.lastRegistrationError == nil
+            let freshDisabledHasNoChord = freshDisabled.hotkey.currentChord == nil
+            print("SELFTEST fresh start with saved .disabled isRegistered false: \(freshDisabledIsRegistered == false)")
+            print("SELFTEST fresh start with saved .disabled isDisabled true: \(freshDisabledIsDisabled)")
+            print("SELFTEST fresh start with saved .disabled has no error: \(freshDisabledHasNoError)")
+            print("SELFTEST fresh start with saved .disabled has no chord: \(freshDisabledHasNoChord)")
+
+            // 3) .unset registers the default.
+            AppSettings(defaults: persistenceDefaults).shortcutPreference = .unset
+            let freshUnset = simulateFreshLaunch()
+            let freshUnsetIsRegistered = freshUnset.hotkey.isRegistered
+            let freshUnsetChordIsDefault = freshUnset.hotkey.currentChord == KeyboardShortcut.defaultChord
+            let freshUnsetIsNotDisabled = freshUnset.hotkey.isDisabled == false
+            print("SELFTEST fresh start with saved .unset isRegistered: \(freshUnsetIsRegistered)")
+            print("SELFTEST fresh start with saved .unset registered the default chord: \(freshUnsetChordIsDefault)")
+
+            // 4) The round-trip through AppSettings preserves each of the
+            // three states distinctly (re-reading, not just re-applying —
+            // proves the PERSISTED VALUE itself, not just its live effect,
+            // survived).
+            let rereadSettings = AppSettings(defaults: persistenceDefaults)
+            let roundTripUnsetPreserved = rereadSettings.shortcutPreference == .unset
+            AppSettings(defaults: persistenceDefaults).shortcutPreference = .disabled
+            let roundTripDisabledPreserved = AppSettings(defaults: persistenceDefaults).shortcutPreference == .disabled
+            AppSettings(defaults: persistenceDefaults).shortcutPreference = .custom(savedCustomChord)
+            let roundTripCustomPreserved = AppSettings(defaults: persistenceDefaults).shortcutPreference == .custom(savedCustomChord)
+            print("SELFTEST round trip preserves .unset: \(roundTripUnsetPreserved)")
+            print("SELFTEST round trip preserves .disabled: \(roundTripDisabledPreserved)")
+            print("SELFTEST round trip preserves .custom: \(roundTripCustomPreserved)")
+
+            // 5) GateController.setShortcutPreference(_:) is the single
+            // write path used by the app layer (GateControllerObservable) —
+            // prove it actually reaches AppSettings.shortcutPreference, and
+            // that GateController.shortcutPreference reads back the same
+            // value, using a throwaway controller built exactly like
+            // `AppDelegate`'s mock-mode wiring.
+            let controllerSettings = AppSettings(defaults: persistenceDefaults)
+            let routingController = GateController(
+                gateClient: MockGateOpening(),
+                tokenManager: MockTokenResolving(),
+                credentialStore: MockCredentialStore(),
+                appSettings: controllerSettings
+            )
+            routingController.setShortcutPreference(.custom(savedCustomChord))
+            let controllerRoutingPersisted = controllerSettings.shortcutPreference == .custom(savedCustomChord)
+            let controllerRoutingReadBack = routingController.shortcutPreference == .custom(savedCustomChord)
+            print("SELFTEST GateController.setShortcutPreference persists to AppSettings: \(controllerRoutingPersisted)")
+            print("SELFTEST GateController.shortcutPreference reads back the same value: \(controllerRoutingReadBack)")
+
+            // 6) "Reset to Default" (SettingsView.swift) must save .unset,
+            // NOT .custom(KeyboardShortcut.defaultChord) — the two are NOT
+            // interchangeable: .unset means "follow the default, whatever it
+            // becomes"; .custom(default) means "I deliberately chose this
+            // chord". Route .unset through the SAME single write path
+            // (GateController.setShortcutPreference) that SettingsView uses,
+            // and assert BOTH that it round-trips as .unset AND that it is
+            // NOT EQUAL to .custom(defaultChord) — the second half is what
+            // makes this non-vacuous, since .custom(defaultChord) would also
+            // round-trip fine and silently pass a plain equality check.
+            routingController.setShortcutPreference(.unset)
+            let resetRoutingReadBack = routingController.shortcutPreference == .unset
+            let resetRoutingPersisted = controllerSettings.shortcutPreference == .unset
+            let resetRoutingIsNotCustomDefault = routingController.shortcutPreference != .custom(KeyboardShortcut.defaultChord)
+            print("SELFTEST GateController.setShortcutPreference(.unset) reads back as .unset: \(resetRoutingReadBack)")
+            print("SELFTEST GateController.setShortcutPreference(.unset) persists as .unset: \(resetRoutingPersisted)")
+            print("SELFTEST GateController.setShortcutPreference(.unset) is NOT .custom(defaultChord): \(resetRoutingIsNotCustomDefault)")
+
+            let persistenceRoundTripPassed = freshCustomIsRegistered && freshCustomChordMatches && freshCustomHasNoError && freshCustomIsNotDisabled
+                && freshDisabledIsRegistered == false && freshDisabledIsDisabled && freshDisabledHasNoError && freshDisabledHasNoChord
+                && freshUnsetIsRegistered && freshUnsetChordIsDefault && freshUnsetIsNotDisabled
+                && roundTripUnsetPreserved && roundTripDisabledPreserved && roundTripCustomPreserved
+                && controllerRoutingPersisted && controllerRoutingReadBack
+                && resetRoutingReadBack && resetRoutingPersisted && resetRoutingIsNotCustomDefault
+            print("SELFTEST shortcut persistence round trip all passed: \(persistenceRoundTripPassed)")
+
             // Bead gateopener-3vq.3: exercise the recorder's PURE logic
             // (`RecorderKeystrokeClassification.classify`,
             // `RecorderModifierMapping.coreModifiers`, and
@@ -518,6 +647,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 && validCustomIsRegistered && validCustomChordMatches
                 && invalidChordIsValid == false && invalidCustomIsRegistered && invalidCustomFellBackToDefault
                 && afterFailureIsRegistered && afterFailureChord == beforeFailureChord && afterFailureError != nil
+                && persistenceRoundTripPassed
                 && recorderPureLogicPassed {
                 print("SELFTEST PASS")
                 exit(0)

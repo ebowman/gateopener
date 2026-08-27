@@ -182,3 +182,36 @@ struct KeyboardShortcutTests {
         }
     }
 }
+
+// MARK: - Reset-to-Default semantics
+
+/// "Reset to Default" must restore `.unset`, NOT `.custom(defaultChord)`.
+///
+/// `.unset` means "follow the default chord, whatever it becomes";
+/// `.custom(defaultChord)` means "I deliberately chose this chord". If the two
+/// collapse, a future change of the default silently fails to reach anyone who
+/// pressed Reset. Asserting only that the value round-trips would NOT catch
+/// that — `.custom(defaultChord)` round-trips perfectly well — so this asserts
+/// the DISTINCTION.
+@Test func resetPreferenceIsUnsetAndNotCustomDefault() {
+    #expect(shortcutResetPreference == .unset)
+    #expect(shortcutResetPreference != .custom(KeyboardShortcut.defaultChord))
+}
+
+/// The two must also stay distinguishable across a persistence round-trip,
+/// since that is where a collapse would actually bite.
+@Test func resetPreferenceStaysDistinctFromCustomDefaultAcrossPersistence() {
+    let suiteName = "ie.boboco.GateOpener.tests.\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suiteName)!
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+
+    let settings = AppSettings(defaults: defaults)
+
+    settings.shortcutPreference = shortcutResetPreference
+    #expect(settings.shortcutPreference == .unset)
+    #expect(settings.shortcutPreference != .custom(KeyboardShortcut.defaultChord))
+
+    settings.shortcutPreference = .custom(KeyboardShortcut.defaultChord)
+    #expect(settings.shortcutPreference == .custom(KeyboardShortcut.defaultChord))
+    #expect(settings.shortcutPreference != .unset)
+}

@@ -183,3 +183,17 @@ public enum ShortcutPreference: Codable, Equatable, Sendable {
         }
     }
 }
+
+/// The preference that "Reset to Default" restores.
+///
+/// This is `.unset`, NOT `.custom(KeyboardShortcut.defaultChord)`, and the
+/// distinction is load-bearing: `.unset` means "follow the default chord,
+/// whatever it becomes", while `.custom(defaultChord)` means "I deliberately
+/// chose this particular chord". If they collapse, a future change of the
+/// default silently fails to reach anyone who pressed Reset.
+///
+/// It lives here as a named constant, rather than inline in the Settings
+/// button, so the semantic can be asserted by a test without reaching into
+/// a private SwiftUI view.
+public let shortcutResetPreference: ShortcutPreference = .unset
+

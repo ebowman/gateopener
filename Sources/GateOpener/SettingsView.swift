@@ -125,20 +125,33 @@ private struct LaunchAtLoginSectionView: View {
 
 // MARK: - Global hotkey
 
-/// Editable display of the global hotkey (bead gateopener-3vq.3): a
+/// Editable display of the global hotkey (bead gateopener-3vq.3/.4): a
 /// click-to-activate `ShortcutRecorderView` lets the operator record a new
 /// chord, explicitly clear it to "no shortcut", or reset to the default,
 /// replacing the previous read-only display from bead gateopener-iif.2.
 ///
-/// `preference` is local `@State`, NOT read from `AppSettings` — this bead
-/// wires the LIVE effect only (every edit is applied immediately via
-/// `observable.globalHotkey?.apply(_:)`, exactly mirroring what
-/// `AppDelegate` does at launch). Persisting the recorded value across
-/// launches (writing it back to `AppSettings.shortcutPreference`) is bead
-/// gateopener-3vq.4's job — see that bead. Seeding `preference` from
-/// `globalHotkey?.currentChord`/`isDisabled` on `.task` means the field
-/// still shows the actual live state correctly for this session; it just
-/// does not yet survive a relaunch.
+/// PERSISTENCE + ROUTING (bead gateopener-3vq.4): every write funnels
+/// through `observable.setShortcutPreference(_:)` — the ONE path that both
+/// persists to `AppSettings` (via `GateController.setShortcutPreference(_:)`)
+/// AND applies the same value live to `GlobalHotkey`. This view (and
+/// `ShortcutRecorderView`'s binding below) never writes `AppSettings` or
+/// calls `globalHotkey.apply(_:)` directly — a direct write from a SwiftUI
+/// view fires no change notification and would silently desync bound UI,
+/// exactly the trap documented in `gateopener-4ub.7`'s notes.
+///
+/// "Reset to Default" persists `.unset`, NOT `.custom(defaultChord)`, so
+/// "following the default" stays distinguishable from "happened to pick the
+/// default chord" — a future change to `KeyboardShortcut.defaultChord` must
+/// carry through for an operator who never explicitly chose a chord.
+///
+/// `preference` is local `@State` used only as the two-way binding
+/// `ShortcutRecorderView` needs for its internal recording state machine
+/// (idle/recording, Escape-revert, etc. — see that file). It is seeded from
+/// `observable`'s persisted+live state on `.task` and re-seeded whenever
+/// `observable` republishes (the `.onChange` below), so it can never drift
+/// from the actual persisted/registered truth for long; the state machine
+/// itself always finishes by routing back through
+/// `observable.setShortcutPreference(_:)`.
 private struct GlobalHotkeySectionView: View {
     let observable: GateControllerObservable
 
@@ -152,7 +165,7 @@ private struct GlobalHotkeySectionView: View {
             HStack(spacing: 8) {
                 Text("Open Gate:")
 
-                ShortcutRecorderView(preference: $preference, validationMessage: $validationMessage)
+                ShortcutRecorderView(preference: recorderPreferenceBinding, validationMessage: $validationMessage)
                     .frame(width: 160, height: 24)
 
                 // Explicit "no shortcut" affordance (the operator's
@@ -170,7 +183,9 @@ private struct GlobalHotkeySectionView: View {
                 .disabled(isDisabled)
 
                 Button("Reset to Default") {
-                    setPreference(.custom(KeyboardShortcut.defaultChord))
+                    // .unset, NOT .custom(defaultChord) — see the type doc
+                    // comment above for why the distinction matters.
+                    setPreference(shortcutResetPreference)
                 }
                 .controlSize(.small)
             }
@@ -196,15 +211,6 @@ private struct GlobalHotkeySectionView: View {
         .task {
             seedFromLiveHotkey()
         }
-        .onChange(of: preference) { _, newValue in
-            // The recorder view mutates `$preference` directly (recording a
-            // chord, clearing via ✕/Delete, or Escape-cancelling back to
-            // the prior value) without going through `setPreference(_:)`.
-            // Apply every resulting value live here so ALL paths — typed,
-            // cleared, reset, or reverted — reach `GlobalHotkey` the same
-            // way, rather than duplicating this call at each call site.
-            observable.globalHotkey?.apply(newValue)
-        }
     }
 
     private var isDisabled: Bool {
@@ -212,9 +218,33 @@ private struct GlobalHotkeySectionView: View {
         return false
     }
 
-    /// Seeds local `@State` from the live `GlobalHotkey`'s actual current
-    /// state so this view never starts out showing a stale/default value
-    /// that disagrees with what is really registered.
+    /// The binding handed to `ShortcutRecorderView`. Reads mirror local
+    /// `@State` (so the recorder's internal state machine — idle/recording,
+    /// Escape-revert-to-prior-value — has an ordinary `Binding` to work
+    /// with), but every WRITE is intercepted here and routed through
+    /// `setPreference(_:)` rather than assigning `preference` directly, so
+    /// EVERY recorder outcome (a captured chord, ✕/Delete-to-clear,
+    /// Escape-cancel-revert) reaches `observable.setShortcutPreference(_:)`
+    /// — the single persist-and-apply path — the same way the ✕ and "Reset
+    /// to Default" buttons already do. This is what closes the gap: the
+    /// recorder previously wrote local `@State` directly and relied on a
+    /// separate `.onChange` to apply (but never persist) it.
+    private var recorderPreferenceBinding: Binding<ShortcutPreference> {
+        Binding(
+            get: { preference },
+            set: { setPreference($0) }
+        )
+    }
+
+    /// Seeds local `@State` from the CURRENT observable/GlobalHotkey truth
+    /// so this view never starts out (or silently drifts to) showing a
+    /// stale value that disagrees with what is actually registered.
+    /// Reconciliation, not the raw requested preference, is what gets
+    /// displayed: if `GlobalHotkey.isDisabled` is true (the persisted
+    /// `.disabled` case, including immediately after a fresh launch that
+    /// applied a persisted `.disabled` preference), this shows `.disabled`;
+    /// otherwise it always mirrors `currentChord`/`isRegistered` — the
+    /// ACTUALLY-registered chord — never a stale requested-but-failed one.
     private func seedFromLiveHotkey() {
         guard let globalHotkey = observable.globalHotkey else { return }
         if globalHotkey.isDisabled {
@@ -222,19 +252,30 @@ private struct GlobalHotkeySectionView: View {
         } else if let chord = globalHotkey.currentChord {
             preference = .custom(chord)
         } else {
+            // Nothing is registered and it is not a deliberate .disabled —
+            // i.e. a registration failure with no working fallback. Fall
+            // back to displaying .unset (no specific chord to show); the
+            // `lastRegistrationError` message above is what actually
+            // communicates the failure to the operator.
             preference = .unset
         }
     }
 
-    /// Updates local state; the `.onChange(of: preference)` above applies
-    /// it live to `GlobalHotkey` — the same `apply(_:)` call `AppDelegate`
-    /// makes at launch (see that file's doc comment on
-    /// `GlobalHotkey.apply(_:)`). Kept as one shared path so the ✕ and
-    /// "Reset to Default" buttons apply exactly the same way the recorder
-    /// itself does.
+    /// THE single call site through which this view changes the shortcut
+    /// preference: updates local `@State` (so the recorder/✕/Reset buttons
+    /// see themselves reflected immediately) AND persists+applies via
+    /// `observable.setShortcutPreference(_:)` — the one path that writes
+    /// `AppSettings` and calls `GlobalHotkey.apply(_:)` together. After
+    /// applying, re-seeds from the live `GlobalHotkey` so the displayed
+    /// state reconciles to what is ACTUALLY registered — e.g. if the
+    /// requested chord failed to register (already owned by another app),
+    /// this view ends up showing whatever chord is genuinely still working
+    /// (the restored previous chord), never the failed request, while
+    /// `lastRegistrationError` surfaces the failure alongside it.
     private func setPreference(_ newValue: ShortcutPreference) {
         validationMessage = nil
-        preference = newValue
+        observable.setShortcutPreference(newValue)
+        seedFromLiveHotkey()
     }
 }
 

@@ -60,4 +60,29 @@ final class GateControllerObservable {
             self?.state = newState
         }
     }
+
+    // MARK: - Shortcut preference (bead gateopener-3vq.4)
+
+    /// THE single path by which anything in the app (views, buttons, the
+    /// recorder) may change the shortcut preference. Persists via
+    /// `controller.setShortcutPreference(_:)` (the `GateOpenerCore`-side
+    /// single write path — see that method's doc comment) AND applies the
+    /// SAME value live to `globalHotkey`, so persistence and live effect can
+    /// never drift apart. A view writing `AppSettings`/`GateController`
+    /// directly and separately calling `globalHotkey.apply(_:)` itself would
+    /// risk exactly the split-write bug `gateopener-4ub.7`'s notes warn
+    /// about (a write that fires no change notification and silently
+    /// desyncs bound UI) — this method exists so there is only ever ONE
+    /// call site that does both, and every caller (recorder, ✕ button,
+    /// "Reset to Default") goes through it.
+    ///
+    /// This is an `@Observable` class, so simply performing the writes below
+    /// (which mutate `globalHotkey`'s stored properties, themselves tracked
+    /// by `@Observable` via this object holding the reference) is enough to
+    /// republish to any SwiftUI view reading `observable.globalHotkey`'s
+    /// properties through this object.
+    func setShortcutPreference(_ preference: ShortcutPreference) {
+        controller.setShortcutPreference(preference)
+        globalHotkey?.apply(preference)
+    }
 }

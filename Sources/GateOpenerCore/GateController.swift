@@ -402,6 +402,33 @@ public final class GateController {
         }
     }
 
+    // MARK: - Shortcut preference
+
+    /// The persisted global-hotkey preference (bead gateopener-3vq.4).
+    /// Read-only mirror of `appSettings.shortcutPreference`, exposed so the
+    /// app layer (`GateControllerObservable`) can read the durable value —
+    /// e.g. at launch — without `AppSettings` itself needing to be exposed
+    /// for direct writes. This getter carries no side effect: it does not
+    /// touch the live Carbon registration.
+    public var shortcutPreference: ShortcutPreference {
+        appSettings.shortcutPreference
+    }
+
+    /// Persists a new shortcut preference. This is the ONLY path by which
+    /// the UI may change `AppSettings.shortcutPreference` — mirrors
+    /// `selectGate(_:)` above: routed through the controller rather than
+    /// letting a view write `AppSettings` directly, so the value can never
+    /// be changed without going through one auditable place. Does NOT
+    /// itself touch the live Carbon registration (that is a Carbon/AppKit
+    /// concern living in the app layer's `GlobalHotkey`, which
+    /// `GateOpenerCore` must never import — see this file's HARD
+    /// CONSTRAINT). The app layer (`GateControllerObservable`) is
+    /// responsible for calling this AND applying the same value to
+    /// `GlobalHotkey` so persistence and live effect never drift apart.
+    public func setShortcutPreference(_ preference: ShortcutPreference) {
+        appSettings.shortcutPreference = preference
+    }
+
     // MARK: - Sign out
 
     /// Clears keychain credentials AND tokens, clears `AppSettings`, and
