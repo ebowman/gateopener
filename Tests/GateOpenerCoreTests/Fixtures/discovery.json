@@ -1,0 +1,126 @@
+[
+  {
+    "capabilities": [
+      "FaceRecognitionController",
+      "ConfigurationController"
+    ],
+    "description": "Apartment connected via Comelit Group S.p.a.",
+    "displayCategories": [
+      "APARTMENT"
+    ],
+    "endpointId": "_DA_00000000-1111-2222-3333-444444444444_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee-00001_VIP#AP#SB000001",
+    "friendlyName": "SB000001",
+    "manufacturerName": "Comelit Group S.p.a.",
+    "options": {
+      "roomHint": "root"
+    }
+  },
+  {
+    "capabilities": [
+      "DoorbellEventSource",
+      "RTCSessionController"
+    ],
+    "description": "Camera connected via Comelit Group S.p.a.",
+    "displayCategories": [
+      "CAMERA"
+    ],
+    "endpointId": "_DA_00000000-1111-2222-3333-444444444444_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee-00001_VIP#EN#SB100001",
+    "friendlyName": "Entry",
+    "manufacturerName": "Comelit Group S.p.a.",
+    "options": {
+      "roomHint": "root"
+    }
+  },
+  {
+    "capabilities": [
+      "DoorbellEventSource"
+    ],
+    "description": "Doorbell connected via Comelit Group S.p.a.",
+    "displayCategories": [
+      "DOORBELL"
+    ],
+    "endpointId": "_DA_00000000-1111-2222-3333-444444444444_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee-00001_VIP#FR#resident",
+    "friendlyName": "resident",
+    "manufacturerName": "Comelit Group S.p.a.",
+    "options": {
+      "roomHint": "root"
+    }
+  },
+  {
+    "capabilities": [
+      "DoorbellEventSource"
+    ],
+    "description": "Doorbell connected via Comelit Group S.p.a.",
+    "displayCategories": [
+      "DOORBELL"
+    ],
+    "endpointId": "_DA_00000000-1111-2222-3333-444444444444_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee-00001_VIP#FR#unknown",
+    "friendlyName": "Unknown",
+    "manufacturerName": "Comelit Group S.p.a.",
+    "options": {
+      "roomHint": "root"
+    }
+  },
+  {
+    "capabilities": [
+      "DoorbellEventSource",
+      "RTCSessionController"
+    ],
+    "description": "Intercom connected via Comelit Group S.p.a.",
+    "displayCategories": [
+      "INTERCOM"
+    ],
+    "endpointId": "_DA_00000000-1111-2222-3333-444444444444_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee-00001_VIP#IC#SBINT001.AUTO",
+    "friendlyName": "Intercom 1",
+    "manufacturerName": "Comelit Group S.p.a.",
+    "options": {
+      "roomHint": "root"
+    }
+  },
+  {
+    "capabilities": [
+      "PowerController"
+    ],
+    "description": "Lock generic connected via Comelit Group S.p.a.",
+    "displayCategories": [
+      "LOCK_GENERIC"
+    ],
+    "endpointId": "_DA_00000000-1111-2222-3333-444444444444_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee-00001_VIP#OD#SB100001.1",
+    "friendlyName": "Entrance lock",
+    "manufacturerName": "Comelit Group S.p.a.",
+    "options": {
+      "roomHint": "root"
+    }
+  },
+  {
+    "capabilities": [
+      "PowerController"
+    ],
+    "description": "Vip actuator connected via Comelit Group S.p.a.",
+    "displayCategories": [
+      "VIP_ACTUATOR"
+    ],
+    "endpointId": "_DA_00000000-1111-2222-3333-444444444444_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee-00001_VIP#OD#SBIO0255.0",
+    "friendlyName": "Generic Actuator",
+    "manufacturerName": "Comelit Group S.p.a.",
+    "options": {
+      "roomHint": "root"
+    }
+  },
+  {
+    "capabilities": [
+      "DoorbellEventSource",
+      "RTCSessionController"
+    ],
+    "description": "Switchboard connected via Comelit Group S.p.a.",
+    "displayCategories": [
+      "SWITCHBOARD"
+    ],
+    "endpointId": "_DA_00000000-1111-2222-3333-444444444444_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee-00001_VIP#SW#SBCPS007",
+    "friendlyName": "Secondary switchboard",
+    "manufacturerName": "Comelit Group S.p.a.",
+    "options": {
+      "roomHint": "root"
+    }
+  }
+]

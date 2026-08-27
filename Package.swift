@@ -21,7 +21,8 @@ let package = Package(
         ),
         .testTarget(
             name: "GateOpenerCoreTests",
-            dependencies: ["GateOpenerCore"]
+            dependencies: ["GateOpenerCore"],
+            resources: [.process("Fixtures")]
         )
     ]
 )
