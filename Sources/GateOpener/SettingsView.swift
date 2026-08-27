@@ -32,6 +32,10 @@ struct SettingsView: View {
                 .font(.title2)
                 .bold()
 
+            LaunchAtLoginSectionView()
+
+            Divider()
+
             if isSignedIn {
                 SignedInView(observable: observable)
             } else {
@@ -45,6 +49,73 @@ struct SettingsView: View {
         .padding(20)
         .frame(minWidth: 420, idealWidth: 460)
         .fixedSize(horizontal: false, vertical: true)
+    }
+}
+
+// MARK: - Launch at Login
+
+/// "Launch at Login" toggle (bead gateopener-4ub.11), backed by
+/// `SMAppService.mainApp` via the `LaunchAtLogin` helper.
+///
+/// Deliberately does NOT keep a persisted/cached boolean of its own: the
+/// toggle's `@State` is only ever a mirror of `LaunchAtLogin.isEnabled`
+/// (the true `SMAppService.mainApp.status`), refreshed on `.task` (view
+/// appears) and again after every write attempt — so it can never show
+/// "on" while the system actually has it registered "off" or vice versa.
+private struct LaunchAtLoginSectionView: View {
+    @State private var isEnabled = false
+    @State private var isUpdating = false
+    @State private var errorMessage: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Toggle("Launch at Login", isOn: launchAtLoginBinding)
+                .disabled(isUpdating)
+
+            if let errorMessage {
+                Text(errorMessage)
+                    .foregroundStyle(.red)
+                    .font(.callout)
+            }
+        }
+        .task {
+            refreshFromSystem()
+        }
+    }
+
+    /// A binding that optimistically reflects the requested value in the
+    /// UI, then immediately reconciles `isEnabled` back to the TRUE
+    /// post-write status — including on failure, where it reverts to
+    /// whatever `SMAppService.mainApp.status` actually reports rather than
+    /// trusting the toggle gesture. The toggle never "lies".
+    private var launchAtLoginBinding: Binding<Bool> {
+        Binding(
+            get: { isEnabled },
+            set: { newValue in
+                setEnabled(newValue)
+            }
+        )
+    }
+
+    private func refreshFromSystem() {
+        isEnabled = LaunchAtLogin.isEnabled
+    }
+
+    private func setEnabled(_ newValue: Bool) {
+        errorMessage = nil
+        isUpdating = true
+        do {
+            try LaunchAtLogin.setEnabled(newValue)
+        } catch {
+            // `LaunchAtLogin.setEnabled` is a typed `throws(LaunchAtLoginError)`,
+            // so `error` here is always a `LaunchAtLoginError` carrying a
+            // short, human-readable message — never a raw `Error`.
+            errorMessage = error.message
+        }
+        // Reconcile to the REAL status regardless of success or failure —
+        // this is what makes the toggle never lie about its state.
+        refreshFromSystem()
+        isUpdating = false
     }
 }
 

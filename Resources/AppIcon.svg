@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- GateOpener app icon: a simple gate/lock glyph.
+       Generated deterministically by scripts/generate-icon.sh — see that
+       script for the rendering pipeline (rsvg-convert -> sips -> iconutil).
+       Edit this file, not the generated .icns, to change the icon. -->
+
+  <!-- Background: rounded square, macOS-style -->
+  <rect x="0" y="0" width="1024" height="1024" rx="224" ry="224" fill="#2B3A55"/>
+
+  <!-- Gate posts -->
+  <rect x="180" y="260" width="70" height="560" rx="14" fill="#E8EDF4"/>
+  <rect x="774" y="260" width="70" height="560" rx="14" fill="#E8EDF4"/>
+
+  <!-- Gate top bar -->
+  <rect x="180" y="260" width="664" height="60" rx="14" fill="#E8EDF4"/>
+
+  <!-- Gate bars (vertical slats) -->
+  <rect x="300" y="340" width="36" height="440" rx="10" fill="#B9C6D9"/>
+  <rect x="410" y="340" width="36" height="440" rx="10" fill="#B9C6D9"/>
+  <rect x="520" y="340" width="36" height="440" rx="10" fill="#B9C6D9"/>
+  <rect x="630" y="340" width="36" height="440" rx="10" fill="#B9C6D9"/>
+  <rect x="686" y="340" width="36" height="440" rx="10" fill="#B9C6D9"/>
+
+  <!-- Lock body, centered, on top of the gate to read clearly at small sizes -->
+  <g transform="translate(512, 560)">
+    <rect x="-120" y="-20" width="240" height="200" rx="36" fill="#F4A623" stroke="#C97F0B" stroke-width="10"/>
+    <path d="M -70 -20 L -70 -110 A 70 70 0 0 1 70 -110 L 70 -20"
+          fill="none" stroke="#F4A623" stroke-width="42" stroke-linecap="round"/>
+    <path d="M -70 -20 L -70 -110 A 70 70 0 0 1 70 -110 L 70 -20"
+          fill="none" stroke="#C97F0B" stroke-width="10" stroke-linecap="round"/>
+    <circle cx="0" cy="60" r="26" fill="#7A4E08"/>
+    <rect x="-14" y="60" width="28" height="60" rx="10" fill="#7A4E08"/>
+  </g>
+</svg>
