@@ -141,15 +141,21 @@ private struct GlobalHotkeySectionView: View {
         VStack(alignment: .leading, spacing: 6) {
             Text("Keyboard Shortcut").font(.headline)
 
-            HStack {
-                Text("Open Gate:")
-                Text(GlobalHotkey.displayString)
-                    .font(.system(.body, design: .monospaced))
+            if let chord = observable.globalHotkey?.currentChord {
+                HStack {
+                    Text("Open Gate:")
+                    Text(chord.displayString)
+                        .font(.system(.body, design: .monospaced))
+                }
             }
 
             if let error = observable.globalHotkey?.lastRegistrationError {
                 Text(error)
                     .foregroundStyle(.red)
+                    .font(.callout)
+            } else if observable.globalHotkey?.isDisabled == true {
+                Text("No shortcut.")
+                    .foregroundStyle(.secondary)
                     .font(.callout)
             } else if observable.globalHotkey?.isRegistered != true {
                 Text("Shortcut not yet registered.")

@@ -34,34 +34,34 @@ import GateOpenerCore
 /// answer for "global hotkey with no permission prompt" on macOS as of
 /// this writing. Hence: Carbon `RegisterEventHotKey` is used here.
 ///
-/// ## Default shortcut
+/// ## Chord source (bead gateopener-3vq.2)
 ///
-/// Cmd-Ctrl-Option-G. Verified (2026-08-27, on the machine this was built
-/// on) against `com.apple.symbolichotkeys`'s `AppleSymbolicHotKeys`
-/// dictionary — exported via `defaults export` and inspected programmatically
-/// — that:
-///   - no entry uses key code 5 (the `G` key) at all, under any modifier
-///     combination, and
-///   - no entry's modifier mask includes Command+Control+Option together
-///     (regardless of key).
-/// This is a triple-modifier chord; it cannot be produced by ordinary
-/// typing (see `install()`'s doc comment on accidental-firing risk), and
-/// does not collide with any macOS default shortcut on this system.
+/// The chord registered is no longer hardcoded: it is derived from the
+/// app's persisted `ShortcutPreference` (`GateOpenerCore.AppSettings`) via
+/// `apply(_:)`. `GateOpenerCore.KeyboardShortcut` stores a Carbon-free raw
+/// `keyCode`/`modifiers` pair; THIS file (the app layer, which imports
+/// Carbon) is the only place that pair is ever turned into Carbon's
+/// `UInt32` key code / modifier mask arguments to `RegisterEventHotKey`.
+/// The core stays Carbon-free — see `KeyboardShortcut.swift`'s doc comment
+/// for why the modifier bit constants there are raw numbers rather than
+/// imported Carbon constants.
+///
+/// `KeyboardShortcut.defaultChord` (Cmd-Ctrl-Option-G) is registered
+/// whenever the preference is `.unset` or a persisted `.custom` chord
+/// fails `isValid` (see `apply(_:)`'s doc comment for why that check lives
+/// here rather than trusting the model).
 ///
 /// ## Registration failure
 ///
-/// If another app has already claimed this exact combination,
-/// `RegisterEventHotKey` returns a non-`noErr` status. `install()` treats
-/// that as a soft failure: it records `lastRegistrationError` (read by
-/// Settings — see `SettingsView`'s "Keyboard Shortcut" section) and
-/// returns without crashing or throwing. The status item and Settings
-/// continue to work normally; only the hotkey itself is inert.
+/// If another app has already claimed a given combination,
+/// `RegisterEventHotKey` returns a non-`noErr` status. This is treated as a
+/// soft failure: `lastRegistrationError` is set (read by Settings — see
+/// `SettingsView`'s "Keyboard Shortcut" section) and the call returns
+/// without crashing or throwing. `apply(_:)` additionally guarantees a
+/// failed re-registration never leaves the app with NO working hotkey — see
+/// its doc comment.
 @MainActor
 final class GlobalHotkey {
-    /// The chord this app registers by default: Cmd-Ctrl-Option-G.
-    /// Exposed so Settings can display it without duplicating the literal.
-    static let displayString = "⌘⌃⌥G"
-
     private static let signature: OSType = {
         // Any 4-char OSType uniquely identifying this app's hotkey to the
         // Carbon Event Manager; arbitrary but stable.
@@ -69,11 +69,6 @@ final class GlobalHotkey {
         return (OSType(bytes[0]) << 24) | (OSType(bytes[1]) << 16) | (OSType(bytes[2]) << 8) | OSType(bytes[3])
     }()
     private static let hotKeyID = EventHotKeyID(signature: signature, id: 1)
-
-    /// `kVK_ANSI_G` = 5, `cmdKey | controlKey | optionKey` — the
-    /// Cmd-Ctrl-Option-G chord described above.
-    private static let keyCode: UInt32 = UInt32(kVK_ANSI_G)
-    private static let modifiers: UInt32 = UInt32(cmdKey | controlKey | optionKey)
 
     /// The handler invoked when the hotkey fires. Set once at construction;
     /// exists as a stored closure (rather than calling straight into
@@ -87,16 +82,43 @@ final class GlobalHotkey {
     private var eventHandlerRef: EventHandlerRef?
     private var hotKeyRef: EventHotKeyRef?
 
-    /// Non-nil iff the most recent `install()` call failed to register the
-    /// hotkey (e.g. another app already owns the combination). `nil` means
-    /// either registration has not been attempted yet or it succeeded.
-    /// Read by `SettingsView` to surface a "Shortcut unavailable" message
-    /// rather than failing silently.
+    /// The chord currently registered with the Carbon Event Manager, if
+    /// any. `nil` whenever nothing is registered — either because
+    /// `.disabled` was applied (see `isDisabled`) or because the most
+    /// recent registration attempt failed and there was no prior working
+    /// chord to fall back to.
+    private var registeredChord: KeyboardShortcut?
+
+    /// Non-nil iff the most recent registration ATTEMPT failed (e.g.
+    /// another app already owns the combination). `nil` means either no
+    /// attempt has been made yet, the most recent attempt succeeded, or
+    /// the hotkey is deliberately `.disabled` — see `isDisabled` for that
+    /// last case. A chosen "no shortcut" setting must never populate this
+    /// property: only an unexpected failure to register should. Read by
+    /// `SettingsView` to surface a "Shortcut unavailable" message rather
+    /// than failing silently.
     private(set) var lastRegistrationError: String?
 
     /// True iff the hotkey is currently registered with the system and
     /// expected to fire. Read by `SettingsView`.
     private(set) var isRegistered = false
+
+    /// True iff the CURRENT state is the operator's deliberate choice of
+    /// "no hotkey" (`ShortcutPreference.disabled`), as opposed to
+    /// `isRegistered == false` meaning "we tried to register something and
+    /// failed". `SettingsView` (bead .3) uses this to render "No shortcut"
+    /// rather than "Shortcut unavailable" when the operator chose to turn
+    /// the hotkey off — the two must never look the same.
+    private(set) var isDisabled = false
+
+    /// The chord CURRENTLY registered, if any — i.e. exactly the chord
+    /// `isRegistered == true` refers to. `nil` whenever nothing is
+    /// registered (`.disabled`, or a failed registration with no working
+    /// fallback). Read by `SettingsView` so every user-visible rendering of
+    /// the shortcut goes through `KeyboardShortcut.displayString` — the
+    /// SAME formatting used in `lastRegistrationError` — rather than a
+    /// separately-maintained string.
+    var currentChord: KeyboardShortcut? { registeredChord }
 
     /// - Parameter onHotkeyFired: called on the main actor whenever the
     ///   hotkey fires. Callers pass a closure that mirrors the left-click
@@ -110,63 +132,121 @@ final class GlobalHotkey {
         self.onHotkeyFired = onHotkeyFired
     }
 
-    /// Registers the global hotkey. Safe to call even if registration
-    /// fails: on failure, `lastRegistrationError` is set and this method
-    /// returns without throwing or crashing — the caller (AppDelegate)
-    /// does not need a do/catch.
+    /// Applies a `ShortcutPreference` to the live Carbon registration:
     ///
-    /// ## Accidental-firing risk
+    /// - `.unset` -> register `KeyboardShortcut.defaultChord`.
+    /// - `.custom(chord)` where `chord.isValid` -> register that chord.
+    /// - `.custom(chord)` where `!chord.isValid` -> register the DEFAULT
+    ///   chord instead, never the invalid one. **This check is required
+    ///   here, at the point of registration**: `KeyboardShortcut.isValid`
+    ///   is defined in `GateOpenerCore` but nothing upstream enforces it
+    ///   before a chord reaches this call (a hand-edited or corrupted
+    ///   persisted preference could carry an invalid chord straight from
+    ///   `AppSettings`). This chord fires a REAL PHYSICAL GATE OPEN; a
+    ///   single-modifier or bare-key shortcut could trigger on an ordinary
+    ///   keystroke, so the two-modifier minimum is enforced as a safety
+    ///   gate here, not trusted from the model.
+    /// - `.disabled` -> unregister and register nothing. `isRegistered`
+    ///   becomes `false` and `isDisabled` becomes `true`; critically,
+    ///   `lastRegistrationError` is left `nil` (or cleared, if a stale
+    ///   error was set before), because a deliberately-chosen "no hotkey"
+    ///   state is NOT a malfunction and must never be presented as one.
     ///
-    /// Cmd-Ctrl-Option-G requires three simultaneous modifier keys plus a
-    /// letter. No ordinary typing, and no single-or-double-modifier system
-    /// shortcut, can produce this combination by accident. Considered and
-    /// rejected as implausible: a user resting fingers on modifier keys
-    /// while typing "g" would need to be holding Cmd, Control, AND Option
-    /// simultaneously while pressing G — not a pattern that occurs in
-    /// normal typing, shortcuts, or games. This is the standard rationale
-    /// for using a triple-modifier chord for a destructive/physical-effect
-    /// action.
-    func install() {
-        // Install the Carbon event handler exactly once; re-registering the
-        // hotkey itself (e.g. if `install()` were called twice) is handled
-        // by unregistering any existing `hotKeyRef` first.
-        if eventHandlerRef == nil {
-            var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: OSType(kEventHotKeyPressed))
-            let selfPointer = Unmanaged.passUnretained(self).toOpaque()
+    /// ## Failure preserves the previous working registration
+    ///
+    /// If registering the requested chord (default, valid custom, or the
+    /// invalid-custom fallback) fails — most commonly because another app
+    /// already owns that exact combination — the PREVIOUSLY registered
+    /// chord (if any) is restored rather than left unregistered. The
+    /// operator must never end up with no hotkey merely because they tried
+    /// a chord that turned out to be taken; they keep whatever was
+    /// working, and `lastRegistrationError` reports the failure so the UI
+    /// can surface it.
+    ///
+    /// ## Idempotence / no stale registrations
+    ///
+    /// Applying `.disabled` twice is a harmless no-op (uninstalling an
+    /// already-uninstalled hotkey is safe). Applying the same chord that
+    /// is already registered re-registers it (unregister-then-register)
+    /// rather than skipping the call, so there is never a window where a
+    /// chord CHANGE would leave the app briefly unregistered followed by a
+    /// registration failure with nothing restorable — the "previous
+    /// working chord" bookkeeping below is updated only after a
+    /// successful registration, so a no-op reapplication cannot corrupt it.
+    func apply(_ preference: ShortcutPreference) {
+        switch preference {
+        case .disabled:
+            // Deliberate "no hotkey": unregister (safe even if already
+            // unregistered) and report NOTHING as an error. Do not touch
+            // `registeredChord`'s role as "last known working chord" — if
+            // the operator re-enables afterwards via `.unset`/`.custom`,
+            // that is a fresh registration attempt on its own merits, not
+            // a restore, so clearing it here has no observable effect
+            // either way.
+            uninstallHotKeyOnly()
+            isDisabled = true
+            lastRegistrationError = nil
+            registeredChord = nil
 
-            let status = InstallEventHandler(
-                GetApplicationEventTarget(),
-                { _, eventRef, userData in
-                    guard let userData, let eventRef else { return OSStatus(eventNotHandledErr) }
-                    var receivedID = EventHotKeyID()
-                    let getStatus = GetEventParameter(
-                        eventRef,
-                        EventParamName(kEventParamDirectObject),
-                        EventParamType(typeEventHotKeyID),
-                        nil,
-                        MemoryLayout<EventHotKeyID>.size,
-                        nil,
-                        &receivedID
-                    )
-                    guard getStatus == noErr, receivedID.signature == GlobalHotkey.signature, receivedID.id == GlobalHotkey.hotKeyID.id else {
-                        return OSStatus(eventNotHandledErr)
-                    }
-                    let hotkey = Unmanaged<GlobalHotkey>.fromOpaque(userData).takeUnretainedValue()
-                    Task { @MainActor in
-                        hotkey.onHotkeyFired()
-                    }
-                    return noErr
-                },
-                1,
-                &eventType,
-                selfPointer,
-                &eventHandlerRef
-            )
-            guard status == noErr else {
-                lastRegistrationError = "Shortcut unavailable — could not install hotkey handler."
-                isRegistered = false
-                return
-            }
+        case .unset:
+            isDisabled = false
+            registerWithFallback(requested: KeyboardShortcut.defaultChord)
+
+        case .custom(let chord):
+            isDisabled = false
+            let toRegister = chord.isValid ? chord : KeyboardShortcut.defaultChord
+            registerWithFallback(requested: toRegister)
+        }
+    }
+
+    /// Attempts to register `requested`. On success, updates
+    /// `registeredChord`/`isRegistered`/`lastRegistrationError` and returns.
+    /// On failure, restores the previously-registered chord (if any) so
+    /// the operator never ends up with no working hotkey, and sets
+    /// `lastRegistrationError` to describe the failure using the
+    /// SAME `KeyboardShortcut.displayString` the rest of the app uses —
+    /// never a separately-formatted string.
+    private func registerWithFallback(requested: KeyboardShortcut) {
+        let previous = registeredChord
+
+        if registerHotKey(requested) {
+            registeredChord = requested
+            isRegistered = true
+            lastRegistrationError = nil
+            return
+        }
+
+        // Registration of the requested chord failed. Report it, then try
+        // to restore whatever was working before so the operator is never
+        // left with nothing.
+        let failureMessage = "Shortcut unavailable — another app is using \(requested.displayString)."
+
+        if let previous, registerHotKey(previous) {
+            registeredChord = previous
+            isRegistered = true
+        } else {
+            registeredChord = nil
+            isRegistered = false
+        }
+        lastRegistrationError = failureMessage
+    }
+
+    /// Ensures the Carbon event handler is installed, unregisters any
+    /// currently-held `hotKeyRef`, and attempts to register `chord`.
+    /// Returns whether registration succeeded. Does NOT touch
+    /// `lastRegistrationError`/`isRegistered`/`registeredChord` — callers
+    /// (`registerWithFallback`) own that bookkeeping so both the
+    /// requested-chord attempt and the fallback-to-previous attempt can
+    /// share this one low-level routine.
+    @discardableResult
+    private func registerHotKey(_ chord: KeyboardShortcut) -> Bool {
+        if forceNextRegistrationFailureForSelfTest {
+            forceNextRegistrationFailureForSelfTest = false
+            return false
+        }
+
+        if !installEventHandlerIfNeeded() {
+            return false
         }
 
         if let existing = hotKeyRef {
@@ -176,41 +256,110 @@ final class GlobalHotkey {
 
         var newRef: EventHotKeyRef?
         let registerStatus = RegisterEventHotKey(
-            Self.keyCode,
-            Self.modifiers,
+            chord.keyCode,
+            Self.carbonModifiers(from: chord.modifiers),
             Self.hotKeyID,
             GetApplicationEventTarget(),
             0,
             &newRef
         )
 
-        if registerStatus == noErr {
-            hotKeyRef = newRef
-            isRegistered = true
-            lastRegistrationError = nil
-        } else {
+        guard registerStatus == noErr else {
             hotKeyRef = nil
-            isRegistered = false
-            // `RegisterEventHotKey` fails (most commonly with
-            // `eventHotKeyExistsErr`) when another app already owns this
-            // exact key+modifier combination. Surfaced in Settings rather
-            // than thrown/crashed — see the type's doc comment.
-            lastRegistrationError = "Shortcut unavailable — another app is using \(Self.displayString)."
+            return false
         }
+
+        hotKeyRef = newRef
+        return true
+    }
+
+    /// Translates the core's Carbon-mirroring raw modifier bitmask
+    /// (`KeyboardShortcut.cmdKey`/`shiftKey`/`optionKey`/`controlKey`) into
+    /// Carbon's actual `cmdKey`/`shiftKey`/`optionKey`/`controlKey`
+    /// constants. `GateOpenerCore` defines its constants as raw numbers
+    /// with the SAME values specifically so this translation is a
+    /// mechanical bit-for-bit OR rather than a lookup table — but it is
+    /// still done explicitly, in this file, so `GateOpenerCore` never
+    /// imports Carbon (see the file's HARD CONSTRAINT note).
+    private static func carbonModifiers(from coreModifiers: UInt32) -> UInt32 {
+        var result: UInt32 = 0
+        if coreModifiers & KeyboardShortcut.cmdKey != 0 { result |= UInt32(cmdKey) }
+        if coreModifiers & KeyboardShortcut.shiftKey != 0 { result |= UInt32(shiftKey) }
+        if coreModifiers & KeyboardShortcut.optionKey != 0 { result |= UInt32(optionKey) }
+        if coreModifiers & KeyboardShortcut.controlKey != 0 { result |= UInt32(controlKey) }
+        return result
+    }
+
+    /// Installs the Carbon event handler exactly once (idempotent — safe
+    /// to call on every `registerHotKey`). Returns `false` and sets
+    /// `lastRegistrationError` if installation itself fails (distinct
+    /// from a specific chord being unavailable).
+    private func installEventHandlerIfNeeded() -> Bool {
+        guard eventHandlerRef == nil else { return true }
+
+        var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: OSType(kEventHotKeyPressed))
+        let selfPointer = Unmanaged.passUnretained(self).toOpaque()
+
+        let status = InstallEventHandler(
+            GetApplicationEventTarget(),
+            { _, eventRef, userData in
+                guard let userData, let eventRef else { return OSStatus(eventNotHandledErr) }
+                var receivedID = EventHotKeyID()
+                let getStatus = GetEventParameter(
+                    eventRef,
+                    EventParamName(kEventParamDirectObject),
+                    EventParamType(typeEventHotKeyID),
+                    nil,
+                    MemoryLayout<EventHotKeyID>.size,
+                    nil,
+                    &receivedID
+                )
+                guard getStatus == noErr, receivedID.signature == GlobalHotkey.signature, receivedID.id == GlobalHotkey.hotKeyID.id else {
+                    return OSStatus(eventNotHandledErr)
+                }
+                let hotkey = Unmanaged<GlobalHotkey>.fromOpaque(userData).takeUnretainedValue()
+                Task { @MainActor in
+                    hotkey.onHotkeyFired()
+                }
+                return noErr
+            },
+            1,
+            &eventType,
+            selfPointer,
+            &eventHandlerRef
+        )
+
+        guard status == noErr else {
+            lastRegistrationError = "Shortcut unavailable — could not install hotkey handler."
+            isRegistered = false
+            return false
+        }
+        return true
+    }
+
+    /// Unregisters the hotkey WITHOUT removing the Carbon event handler
+    /// (the handler is cheap to leave installed and re-registering later
+    /// does not need to reinstall it) and without touching
+    /// `lastRegistrationError`. Used by `apply(.disabled)` and by
+    /// `uninstall()`.
+    private func uninstallHotKeyOnly() {
+        if let hotKeyRef {
+            UnregisterEventHotKey(hotKeyRef)
+            self.hotKeyRef = nil
+        }
+        isRegistered = false
     }
 
     /// Unregisters the hotkey and removes the Carbon event handler. Call on
     /// app termination so no stale registration can linger after quit.
     func uninstall() {
-        if let hotKeyRef {
-            UnregisterEventHotKey(hotKeyRef)
-            self.hotKeyRef = nil
-        }
+        uninstallHotKeyOnly()
         if let eventHandlerRef {
             RemoveEventHandler(eventHandlerRef)
             self.eventHandlerRef = nil
         }
-        isRegistered = false
+        registeredChord = nil
+        isDisabled = false
     }
 
     // MARK: - Verification (GATEOPENER_MOCK_SELFTEST=1 only)
@@ -225,4 +374,16 @@ final class GlobalHotkey {
     func invokeHandlerForSelfTest() {
         onHotkeyFired()
     }
+
+    /// When `true`, the NEXT single call to `registerHotKey(_:)` (from
+    /// either the primary or fallback attempt inside `registerWithFallback`)
+    /// reports failure without touching Carbon at all, and the flag then
+    /// resets itself to `false`. Exists ONLY so the self-test can
+    /// deterministically exercise `apply(_:)`'s "a failed registration
+    /// preserves the previously working chord" contract — a REAL Carbon
+    /// registration failure (another process owning the exact combination)
+    /// is not reliably reproducible from a single-process self-test.
+    /// Never set outside `GATEOPENER_MOCK_SELFTEST=1` — see
+    /// `GateOpenerApp.swift`'s self-test, the only caller.
+    var forceNextRegistrationFailureForSelfTest = false
 }

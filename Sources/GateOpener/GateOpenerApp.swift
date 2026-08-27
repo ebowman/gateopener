@@ -41,6 +41,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// and so `runSelfTestAndExit()` can invoke its handler directly. `nil`
     /// only before `applicationDidFinishLaunching` has run.
     private var globalHotkey: GlobalHotkey!
+    /// The `AppSettings` instance backing this launch (mock or real),
+    /// written by `makeGateController`. Read once at launch to apply the
+    /// persisted `shortcutPreference` to `globalHotkey` (bead
+    /// gateopener-3vq.2) and kept so the self-test can mutate/re-apply the
+    /// preference directly.
+    private var appSettings: AppSettings!
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Must happen before any window is shown (the Settings window can
@@ -52,7 +58,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // an `.accessory`/`LSUIElement` app on its own.
         MainMenu.install()
 
-        let controller = Self.makeGateController(mockOut: &mockGateOpeningForSelfTest)
+        var appSettingsForLaunch: AppSettings?
+        let controller = Self.makeGateController(mockOut: &mockGateOpeningForSelfTest, appSettingsOut: &appSettingsForLaunch)
+        self.appSettings = appSettingsForLaunch
         let observable = GateControllerObservable(controller: controller)
         self.observable = observable
         GateControllerObservable.appShared = observable
@@ -94,7 +102,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 await controller.openGate()
             }
         }
-        globalHotkey.install()
+        // Bead gateopener-3vq.2: apply the PERSISTED preference rather than
+        // always registering the hardcoded default. `apply(_:)` itself
+        // handles `.unset` (default chord), `.disabled` (no hotkey,
+        // reported distinctly from a failure), and `.custom` (validated
+        // before registering — an invalid persisted chord falls back to
+        // the default rather than being registered as-is).
+        globalHotkey.apply(appSettings.shortcutPreference)
         self.globalHotkey = globalHotkey
         observable.globalHotkey = globalHotkey
 
@@ -258,13 +272,89 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             print("SELFTEST controller state is .needsSetup after signOut: \(stateIsNeedsSetup)")
             print("SELFTEST hotkey openCallCount while .needsSetup: \(hotkeyNeedsSetupOpenCallCount)")
 
+            // Bead gateopener-3vq.2: prove `GlobalHotkey.apply(_:)` against
+            // the REAL production instance (`self.globalHotkey`, already
+            // registered with the default chord above), not a fresh copy.
+
+            // 1) .disabled -> unregistered, and reported as a deliberate
+            // "no hotkey" state, NOT a registration failure (no error set).
+            self.globalHotkey.apply(.disabled)
+            let disabledIsRegistered = self.globalHotkey.isRegistered
+            let disabledIsDisabled = self.globalHotkey.isDisabled
+            let disabledHasNoError = self.globalHotkey.lastRegistrationError == nil
+            print("SELFTEST apply(.disabled) isRegistered: \(disabledIsRegistered)")
+            print("SELFTEST apply(.disabled) isDisabled: \(disabledIsDisabled)")
+            print("SELFTEST apply(.disabled) has no error: \(disabledHasNoError)")
+
+            // Applying .disabled AGAIN must be a harmless no-op, not an
+            // error.
+            self.globalHotkey.apply(.disabled)
+            let disabledTwiceIsRegistered = self.globalHotkey.isRegistered
+            let disabledTwiceHasNoError = self.globalHotkey.lastRegistrationError == nil
+            print("SELFTEST apply(.disabled) twice still isRegistered false: \(disabledTwiceIsRegistered == false)")
+            print("SELFTEST apply(.disabled) twice still has no error: \(disabledTwiceHasNoError)")
+
+            // 2) A valid custom chord registers successfully.
+            let validCustomChord = KeyboardShortcut(keyCode: 1, modifiers: KeyboardShortcut.cmdKey | KeyboardShortcut.controlKey | KeyboardShortcut.optionKey)
+            self.globalHotkey.apply(.custom(validCustomChord))
+            let validCustomIsRegistered = self.globalHotkey.isRegistered
+            let validCustomChordMatches = self.globalHotkey.currentChord == validCustomChord
+            print("SELFTEST apply(.custom(valid)) isRegistered: \(validCustomIsRegistered)")
+            print("SELFTEST apply(.custom(valid)) registered the requested chord: \(validCustomChordMatches)")
+
+            // 3) An INVALID custom chord (fewer than two modifiers) must
+            // fall back to the DEFAULT chord — registered, not nothing —
+            // never registered as-is. This is the safety gate: this chord
+            // fires a real physical gate open, so a single-modifier/bare
+            // chord must never reach live registration.
+            let invalidCustomChord = KeyboardShortcut(keyCode: 5, modifiers: KeyboardShortcut.cmdKey)
+            let invalidChordIsValid = invalidCustomChord.isValid
+            self.globalHotkey.apply(.custom(invalidCustomChord))
+            let invalidCustomIsRegistered = self.globalHotkey.isRegistered
+            let invalidCustomFellBackToDefault = self.globalHotkey.currentChord == KeyboardShortcut.defaultChord
+            print("SELFTEST invalid custom chord correctly rejected by isValid: \(invalidChordIsValid == false)")
+            print("SELFTEST apply(.custom(invalid)) isRegistered: \(invalidCustomIsRegistered)")
+            print("SELFTEST apply(.custom(invalid)) fell back to default chord: \(invalidCustomFellBackToDefault)")
+
+            // 4) After a FAILED registration, the previously working chord
+            // is still registered. A REAL Carbon registration failure
+            // (another process already owning the exact combination) is
+            // not reliably reproducible from a single-process self-test,
+            // so `forceNextRegistrationFailureForSelfTest` makes the NEXT
+            // `RegisterEventHotKey` call fail deterministically WITHOUT
+            // touching Carbon — this exercises the real `apply(_:)` /
+            // `registerWithFallback` fallback logic exactly as production
+            // would run it on a genuine collision, only with a
+            // deterministically-triggered failure instead of an
+            // environment-dependent one.
+            self.globalHotkey.apply(.custom(validCustomChord))
+            let beforeFailureChord = self.globalHotkey.currentChord
+            let beforeFailureIsRegistered = self.globalHotkey.isRegistered
+
+            self.globalHotkey.forceNextRegistrationFailureForSelfTest = true
+            let differentChord = KeyboardShortcut(keyCode: 3, modifiers: KeyboardShortcut.cmdKey | KeyboardShortcut.controlKey | KeyboardShortcut.optionKey)
+            self.globalHotkey.apply(.custom(differentChord))
+
+            let afterFailureChord = self.globalHotkey.currentChord
+            let afterFailureIsRegistered = self.globalHotkey.isRegistered
+            let afterFailureError = self.globalHotkey.lastRegistrationError
+            print("SELFTEST before forced failure: chord=\(beforeFailureChord?.displayString ?? "nil") registered=\(beforeFailureIsRegistered)")
+            print("SELFTEST after forced registration failure still registered: \(afterFailureIsRegistered)")
+            print("SELFTEST after forced registration failure chord unchanged: \(afterFailureChord == beforeFailureChord)")
+            print("SELFTEST after forced registration failure error reported: \(afterFailureError != nil)")
+
             if menuRequestedCount == 1 && afterRightClick == 0 && afterLeftClick == 1
                 && logRecordedAttempt && logRecordedSuccess
                 && mainMenuPresent && editMenuPresent
                 && hasPasteItem && hasCopyItem && hasSelectAllItem
                 && hotkeyRegistered && hotkeyRegistrationError == nil
                 && hotkeyOpenCallCount == 1
-                && stateIsNeedsSetup && hotkeyNeedsSetupOpenCallCount == 0 {
+                && stateIsNeedsSetup && hotkeyNeedsSetupOpenCallCount == 0
+                && disabledIsRegistered == false && disabledIsDisabled && disabledHasNoError
+                && disabledTwiceIsRegistered == false && disabledTwiceHasNoError
+                && validCustomIsRegistered && validCustomChordMatches
+                && invalidChordIsValid == false && invalidCustomIsRegistered && invalidCustomFellBackToDefault
+                && afterFailureIsRegistered && afterFailureChord == beforeFailureChord && afterFailureError != nil {
                 print("SELFTEST PASS")
                 exit(0)
             } else {
@@ -308,7 +398,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// - Parameter mockOut: written with the `MockGateOpening` instance iff
     ///   mock mode is active, so the self-test path can read its call
     ///   counts directly. Left `nil` in real (non-mock) mode.
-    private static func makeGateController(mockOut: inout MockGateOpening?) -> GateController {
+    /// - Parameter appSettingsOut: written with the `AppSettings` instance
+    ///   this call constructs (mock or real), so `applicationDidFinishLaunching`
+    ///   can read `shortcutPreference` at launch (bead gateopener-3vq.2)
+    ///   without `GateController` needing to expose its private
+    ///   `appSettings` property.
+    private static func makeGateController(mockOut: inout MockGateOpening?, appSettingsOut: inout AppSettings?) -> GateController {
         let isMock = ProcessInfo.processInfo.environment["GATEOPENER_MOCK"] == "1"
 
         if isMock {
@@ -345,6 +440,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             appSettings.selectedEndpointName = MockGateOpening.mockEndpoint.friendlyName
             let mock = MockGateOpening()
             mockOut = mock
+            appSettingsOut = appSettings
             return GateController(
                 gateClient: mock,
                 tokenManager: MockTokenResolving(),
@@ -354,6 +450,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         let appSettings = AppSettings()
+        appSettingsOut = appSettings
         let credentialStore = KeychainCredentialStore()
         let api = ComelitAPI()
         let tokenManager = TokenManager(api: api, credentialStore: credentialStore)
