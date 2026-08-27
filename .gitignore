@@ -4,3 +4,16 @@
 *.db
 .beads-credential-key
 .beads/proxieddb/
+
+# Swift / Xcode build artifacts
+.build/
+.swiftpm/
+DerivedData/
+*.xcuserdatad
+.DS_Store
+*.app
+
+# Secrets
+.env
+.env.*
+!.env.example
