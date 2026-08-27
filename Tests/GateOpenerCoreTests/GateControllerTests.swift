@@ -287,9 +287,7 @@ private func makeController(
     let recordingSleep = RecordingSleep()
     let (controller, _, _, _, _) = makeController(sleep: recordingSleep)
 
-    let start = ContinuousClock.now
     await controller.openGate()
-    let elapsed = ContinuousClock.now - start
 
     // The open itself completed without any real delay. The auto-reset task
     // is fire-and-forget from openGate()'s perspective, so give it a brief
@@ -299,7 +297,10 @@ private func makeController(
         await Task.yield()
     }
 
-    #expect(elapsed < .milliseconds(500))
+    // NOTE: deliberately NO wall-clock assertion here (see bead .18).
+    // requestedDurations is the assertion that carries the meaning: the 3s
+    // delay was REQUESTED FROM THE INJECTED SLEEP rather than really slept.
+    // A real Task.sleep would leave requestedDurations empty and fail below.
     #expect(recordingSleep.requestedDurations == [.seconds(3)])
 }
 
@@ -307,7 +308,6 @@ private func makeController(
     let recordingSleep = RecordingSleep()
     let (controller, _, _, _, _) = makeController(sleep: recordingSleep)
 
-    let start = ContinuousClock.now
     await controller.openGate()
 
     // Poll (no fixed sleep) until the fire-and-forget reset task has run.
@@ -315,10 +315,12 @@ private func makeController(
         if controller.state == .idle { break }
         await Task.yield()
     }
-    let elapsed = ContinuousClock.now - start
 
+    // NOTE: deliberately NO wall-clock assertion here (see bead .18).
+    // Reaching .idle at all is the proof that the injected no-op sleep was
+    // used rather than a real 3s sleep; asserting elapsed-time thresholds
+    // made this test fail spuriously under concurrent CPU load.
     #expect(controller.state == .idle)
-    #expect(elapsed < .milliseconds(500))
 }
 
 // MARK: - 7. A throwing open never leaves state in .opening
