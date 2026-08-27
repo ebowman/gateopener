@@ -33,6 +33,9 @@ ICON_SVG="${REPO_ROOT}/Resources/AppIcon.svg"
 ICON_ICNS="${REPO_ROOT}/Resources/AppIcon.icns"
 ICON_NAME="AppIcon"
 
+OVERLAY_VIDEO="${REPO_ROOT}/Resources/gate-open.mp4"
+OVERLAY_VIDEO_NAME="gate-open.mp4"
+
 echo "==> Building ${APP_NAME} (release)..."
 swift build -c release --package-path "${REPO_ROOT}"
 
@@ -52,12 +55,18 @@ else
     echo "    (no SVG source found; reusing existing ${ICON_ICNS})"
 fi
 
+if [ ! -f "${OVERLAY_VIDEO}" ]; then
+    echo "error: overlay video not found at ${OVERLAY_VIDEO}. Run scripts/generate-overlay-video.sh first." >&2
+    exit 1
+fi
+
 echo "==> Assembling ${APP_NAME}.app (removing any stale bundle first)..."
 rm -rf "${APP_BUNDLE}"
 mkdir -p "${MACOS_DIR}" "${RESOURCES_DIR}"
 
 cp "${RELEASE_BIN}" "${MACOS_DIR}/${APP_NAME}"
 cp "${ICON_ICNS}" "${RESOURCES_DIR}/${ICON_NAME}.icns"
+cp "${OVERLAY_VIDEO}" "${RESOURCES_DIR}/${OVERLAY_VIDEO_NAME}"
 
 cat > "${CONTENTS_DIR}/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
