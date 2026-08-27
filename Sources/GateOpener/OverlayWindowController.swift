@@ -1,6 +1,7 @@
 import AppKit
 import AVFoundation
 import os
+import GateOpenerCore
 
 /// Shows a small, borderless HUD panel in the top-right corner of the
 /// screen that PROVABLY never steals keyboard focus from whatever app the
@@ -49,9 +50,23 @@ final class OverlayWindowController {
 
     private var panel: OverlayPanel?
 
-    /// - Parameter ignoresMouseEvents: see the property doc above. Defaults
-    ///   to `true` for the confirmation-overlay use case.
-    init(ignoresMouseEvents: Bool = true) {
+    /// Injected rather than constructed internally: `handle(_:)` must read
+    /// `showOpenConfirmationOverlay` fresh on every call (see that method's
+    /// doc comment for why), and taking the same `AppSettings` instance the
+    /// rest of the app layer already holds (see call sites in
+    /// `GateOpenerApp.swift`) keeps this type from silently reading a
+    /// second, possibly-different `UserDefaults` suite than the one actually
+    /// governing the running app.
+    private let appSettings: AppSettings
+
+    /// - Parameters:
+    ///   - ignoresMouseEvents: see the property doc above. Defaults to
+    ///     `true` for the confirmation-overlay use case.
+    ///   - appSettings: source of `showOpenConfirmationOverlay`, read fresh
+    ///     on every `handle(_:)` call. See the property doc above for why
+    ///     this is injected rather than constructed internally.
+    init(appSettings: AppSettings, ignoresMouseEvents: Bool = true) {
+        self.appSettings = appSettings
         self.ignoresMouseEvents = ignoresMouseEvents
     }
 
@@ -118,6 +133,185 @@ final class OverlayWindowController {
     func hide() {
         panel?.orderOut(nil)
         (currentContent() as? OverlayShowHideResponding)?.overlayDidHide()
+    }
+
+    // MARK: - GateState-driven presentation (gateopener-9kk.5)
+
+    /// How long `.succeeded` holds the overlay on screen (landing the
+    /// confirmation) before the fade-out begins. `GateController` auto-resets
+    /// to `.idle` `holdDuration + fadeDuration` seconds later at most
+    /// (`autoResetDelay` is 3s), so this pair MUST sum to comfortably less
+    /// than that or the overlay would still be visible/fading when `.idle`
+    /// arrives from the auto-reset rather than from the fast-open path.
+    private static let succeededHoldDuration: Duration = .milliseconds(1200)
+    private static let fadeDuration: TimeInterval = 0.25
+
+    /// Pending fade-then-hide work (scheduled from `.succeeded`/`.failed`),
+    /// held so a later transition can cancel it before it runs — mirrors
+    /// `StatusItemController.stillTryingTimer`'s
+    /// invalidate-before-reschedule idiom, adapted to `Task` since the work
+    /// here is a `Duration`-based hold rather than a single `Timer` fire.
+    private var pendingResolveTask: Task<Void, Never>?
+
+    /// `true` exactly while a `.succeeded`/`.failed` hold-then-fade sequence
+    /// is scheduled or in progress (from the moment `handle(_:)` schedules it
+    /// until the fade completes and the panel is ordered out). Read by the
+    /// `.idle`/`.needsSetup` branch to implement reentrancy rule (b) below.
+    private var isResolveFadePending = false
+
+    /// Downstream observer of `GateState`, shaped like
+    /// `NotificationPresenter.handle(_:)`: never called from `openGate()`'s
+    /// call chain, only assigned/chained onto `GateController.onStateChange`
+    /// (wiring itself is bead gateopener-9kk.6, not this method).
+    ///
+    /// Gated on `AppSettings.showOpenConfirmationOverlay`, read FRESH on
+    /// every call (not cached at init) so toggling the setting in Settings
+    /// takes effect immediately without an app relaunch. When the setting is
+    /// `false` this is a total no-op: no panel is ever created (this method
+    /// returns before touching `panel`/`resolvePanel()` at all), and any
+    /// previously-scheduled fade is left alone rather than force-cancelled —
+    /// there is nothing to cancel, since a panel is only ever created inside
+    /// this same gate.
+    func handle(_ state: GateState) {
+        guard appSettings.showOpenConfirmationOverlay else { return }
+
+        switch state {
+        case .opening:
+            handleOpening()
+        case .succeeded:
+            handleResolved(holdDuration: Self.succeededHoldDuration)
+        case .failed:
+            // No hold: a lingering overlay after a failure would visually
+            // imply success. See the `handleResolved(holdDuration:)` doc
+            // comment.
+            handleResolved(holdDuration: .zero)
+        case .idle, .needsSetup:
+            handleIdleOrNeedsSetup()
+        }
+    }
+
+    /// `.opening` → show and (re)start playback from zero.
+    ///
+    /// Reentrancy rule (a): a second open can commence while the overlay is
+    /// still fading out from a previous one (e.g. `.opening` arrives again
+    /// before a `.failed`/`.succeeded` fade has finished). Cancel that
+    /// pending fade/hide FIRST, then reset `alphaValue` to 1 before calling
+    /// `show()` — otherwise `show()` would order front a panel whose alpha
+    /// is mid-fade (or already 0), producing a visible glitch or an
+    /// invisible-but-technically-onscreen overlay. `show()` itself re-runs
+    /// `overlayWillShow()` (via `OverlayShowHideResponding`), which is what
+    /// actually restarts video playback from zero — see
+    /// `GateOpenVideoView.overlayWillShow()`.
+    private func handleOpening() {
+        cancelPendingResolve()
+        panel?.alphaValue = 1
+        show()
+    }
+
+    /// `.succeeded` and `.failed` share this shape structurally (hold for
+    /// `holdDuration`, then fade), differing only in what `holdDuration` the
+    /// caller passes: `.succeeded` holds ~1.2s to land the confirmation
+    /// before fading (`Self.succeededHoldDuration`); `.failed` passes
+    /// `.zero` so it fades immediately — a lingering overlay after a failure
+    /// would visually imply success, and the actual failure messaging is
+    /// `NotificationPresenter`'s job, not this type's.
+    private func handleResolved(holdDuration: Duration) {
+        // Any prior pending resolve (e.g. a stale `.failed` fade from a
+        // previous attempt that never got cancelled) must not race this new
+        // one; cancel-before-reschedule, same idiom as (a) above and as
+        // `StatusItemController.scheduleStillTryingCheck()`.
+        cancelPendingResolve()
+        guard panel != nil else { return }
+
+        isResolveFadePending = true
+        pendingResolveTask = Task { [weak self] in
+            do {
+                try await Task.sleep(for: holdDuration)
+            } catch {
+                // Cancelled (superseded by a newer transition, e.g. a fast
+                // re-open via handleOpening()'s cancelPendingResolve()) —
+                // that newer transition already owns the panel's fate, so
+                // this stale sequence must do nothing further.
+                return
+            }
+            await self?.fadeOutThenHide()
+        }
+    }
+
+    /// `.idle`/`.needsSetup` → hide immediately, UNLESS a `.succeeded`/
+    /// `.failed` hold-then-fade is already pending.
+    ///
+    /// Reentrancy rule (b), implemented exactly as specified: a fast
+    /// `.opening -> .succeeded -> .idle` sequence (GateController's
+    /// auto-reset, or a quick subsequent state read) must not truncate the
+    /// hold-then-fade that `.succeeded` just scheduled — so if
+    /// `isResolveFadePending` is true, this is a no-op; the scheduled fade
+    /// (from `handleResolved()`) is solely responsible for eventually
+    /// hiding the panel. If NO fade is pending (e.g. `.idle` arrives with no
+    /// preceding `.succeeded`/`.failed` at all, or after a previous fade has
+    /// already completed), `.idle` is not ignored indefinitely: it forces an
+    /// immediate hide so the overlay never outlives the state machine.
+    private func handleIdleOrNeedsSetup() {
+        guard !isResolveFadePending else { return }
+        guard panel != nil else { return }
+        panel?.alphaValue = 1
+        hide()
+    }
+
+    /// Animates `alphaValue` to 0 over `fadeDuration`, then orders the panel
+    /// out and resets `alphaValue` back to 1.
+    ///
+    /// The alpha reset back to 1 happens HERE, immediately after
+    /// `orderOut(nil)` and before this method returns — i.e. it is in place
+    /// before any subsequent `show()` can possibly run, since `show()` is
+    /// only ever invoked from `handleOpening()` on the main actor, and this
+    /// whole method runs on the main actor too. A panel left at alpha 0 and
+    /// then ordered front by a later `show()` would be an invisible overlay;
+    /// this is the fix for that failure mode.
+    ///
+    /// Guards against a second reentrancy-(a) case: `handleOpening()` can
+    /// call `cancelPendingResolve()` (which marks `pendingResolveTask`
+    /// cancelled) WHILE this method's animation await is already in flight —
+    /// `Task` cancellation cannot interrupt the running
+    /// `NSAnimationContext` block itself. Without the `Task.isCancelled`
+    /// check below, this method would run `hide()` + reset alpha AFTER
+    /// `handleOpening()` has already reset alpha and called `show()`,
+    /// clobbering the fresh show with a hide. Checking `Task.isCancelled`
+    /// immediately after the animation completes and bailing out (doing
+    /// NEITHER `hide()` nor the alpha reset) leaves the panel exactly as the
+    /// superseding `handleOpening()` call left it.
+    private func fadeOutThenHide() async {
+        guard let panel else {
+            isResolveFadePending = false
+            return
+        }
+
+        await withCheckedContinuation { continuation in
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = Self.fadeDuration
+                panel.animator().alphaValue = 0
+            } completionHandler: {
+                continuation.resume()
+            }
+        }
+
+        guard !Task.isCancelled else {
+            // Superseded mid-animation by a new .opening — see doc comment
+            // above. The superseding call already owns alpha/visibility.
+            return
+        }
+
+        hide()
+        // Reset BEFORE the next possible show() — see doc comment above.
+        panel.alphaValue = 1
+        isResolveFadePending = false
+        pendingResolveTask = nil
+    }
+
+    private func cancelPendingResolve() {
+        pendingResolveTask?.cancel()
+        pendingResolveTask = nil
+        isResolveFadePending = false
     }
 
     // MARK: - Private
