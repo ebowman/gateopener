@@ -1,4 +1,5 @@
 import AppKit
+import SwiftUI
 import GateOpenerCore
 
 /// `@main` entry point. Deliberately an `NSApplicationDelegate`-driven
@@ -343,6 +344,168 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             print("SELFTEST after forced registration failure chord unchanged: \(afterFailureChord == beforeFailureChord)")
             print("SELFTEST after forced registration failure error reported: \(afterFailureError != nil)")
 
+            // Bead gateopener-3vq.3: exercise the recorder's PURE logic
+            // (`RecorderKeystrokeClassification.classify`,
+            // `RecorderModifierMapping.coreModifiers`, and
+            // `ShortcutRecorderView.Coordinator`'s idle/recording state
+            // machine) directly — no NSApp event dispatch, no synthesized
+            // keystrokes, per the bead's safety constraint. See
+            // `ShortcutRecorderView.swift`'s file-level doc comment for why
+            // this logic lives in the app layer rather than
+            // `GateOpenerCore`, and is self-tested here rather than left
+            // untested, given the known gap (bead gateopener-4ub.22) of no
+            // XCTest target covering `Sources/GateOpener/`.
+
+            // 1) Modifier mapping: Carbon-mirroring bits, bit-for-bit.
+            let mappedCmdCtrlOpt = RecorderModifierMapping.coreModifiers(from: [.command, .control, .option])
+            let expectedCmdCtrlOpt = KeyboardShortcut.cmdKey | KeyboardShortcut.controlKey | KeyboardShortcut.optionKey
+            let mappedNone = RecorderModifierMapping.coreModifiers(from: [])
+            print("SELFTEST recorder modifier mapping cmd+ctrl+opt: \(mappedCmdCtrlOpt == expectedCmdCtrlOpt)")
+            print("SELFTEST recorder modifier mapping empty flags: \(mappedNone == 0)")
+
+            // 2) Keystroke classification: escape -> cancel, delete/forward
+            // delete -> clear, an ordinary key -> chord carrying the
+            // translated modifier mask, regardless of what modifiers are
+            // held for escape/delete (those must win over any chord
+            // interpretation).
+            let classifyEscape = RecorderKeystrokeClassification.classify(keyCode: 53, modifierFlags: [.command, .control])
+            let classifyDelete = RecorderKeystrokeClassification.classify(keyCode: 51, modifierFlags: [])
+            let classifyForwardDelete = RecorderKeystrokeClassification.classify(keyCode: 117, modifierFlags: [.shift])
+            let classifyChord = RecorderKeystrokeClassification.classify(keyCode: 5, modifierFlags: [.command, .control, .option])
+            print("SELFTEST recorder classify escape -> cancel: \(classifyEscape == .cancel)")
+            print("SELFTEST recorder classify delete -> clear: \(classifyDelete == .clear)")
+            print("SELFTEST recorder classify forward-delete -> clear: \(classifyForwardDelete == .clear)")
+            print("SELFTEST recorder classify G+cmd+ctrl+opt -> chord: \(classifyChord == .chord(keyCode: 5, modifiers: expectedCmdCtrlOpt))")
+
+            // 3) Coordinator state machine, driven through a throwaway
+            // `ShortcutRecorderView`/`RecorderNSView` pair — the SAME types
+            // production uses, just never attached to a window, so no
+            // click/focus/keyboard event dispatch is involved (see the
+            // bead's "could not verify headlessly" list below).
+            var recorderPreference: ShortcutPreference = .custom(KeyboardShortcut.defaultChord)
+            var recorderValidationMessage: String?
+            let recorderPreferenceBinding = Binding(get: { recorderPreference }, set: { recorderPreference = $0 })
+            let recorderValidationBinding = Binding(get: { recorderValidationMessage }, set: { recorderValidationMessage = $0 })
+            let recorderView = ShortcutRecorderView(preference: recorderPreferenceBinding, validationMessage: recorderValidationBinding)
+            let coordinator = recorderView.makeCoordinator()
+            let nsView = RecorderNSView()
+            nsView.onKeystroke = { [weak nsView] classification in
+                guard let nsView else { return }
+                coordinator.handle(classification, view: nsView)
+            }
+
+            // 3a) Idle -> recording on activation.
+            coordinator.startRecording(view: nsView)
+            let becameRecording = nsView.displayState == .recording
+            print("SELFTEST recorder coordinator startRecording enters .recording: \(becameRecording)")
+
+            // 3b) A modifier-only event while recording must NOT change
+            // state or preference.
+            coordinator.handle(.modifierOnly, view: nsView)
+            let stillRecordingAfterModifierOnly = nsView.displayState == .recording
+            let preferenceUnchangedAfterModifierOnly = recorderPreference == .custom(KeyboardShortcut.defaultChord)
+            print("SELFTEST recorder coordinator modifierOnly keeps recording: \(stillRecordingAfterModifierOnly)")
+            print("SELFTEST recorder coordinator modifierOnly leaves preference unchanged: \(preferenceUnchangedAfterModifierOnly)")
+
+            // 3c) An invalid chord (fewer than two modifiers) is rejected
+            // with a visible message, and recording CONTINUES rather than
+            // silently accepting or silently dropping back to idle.
+            coordinator.handle(.chord(keyCode: 5, modifiers: KeyboardShortcut.cmdKey), view: nsView)
+            let stillRecordingAfterInvalidChord = nsView.displayState == .recording
+            let validationMessageShown = recorderValidationMessage != nil
+            let preferenceUnchangedAfterInvalidChord = recorderPreference == .custom(KeyboardShortcut.defaultChord)
+            print("SELFTEST recorder coordinator invalid chord stays recording: \(stillRecordingAfterInvalidChord)")
+            print("SELFTEST recorder coordinator invalid chord shows validation message: \(validationMessageShown)")
+            print("SELFTEST recorder coordinator invalid chord leaves preference unchanged: \(preferenceUnchangedAfterInvalidChord)")
+
+            // 3d) A valid chord is accepted: preference updates, recording
+            // stops, validation message clears.
+            let recordedChord = KeyboardShortcut(keyCode: 1, modifiers: KeyboardShortcut.cmdKey | KeyboardShortcut.shiftKey)
+            coordinator.handle(.chord(keyCode: recordedChord.keyCode, modifiers: recordedChord.modifiers), view: nsView)
+            let idleAfterValidChord = nsView.displayState == .idle
+            let preferenceUpdatedToValidChord = recorderPreference == .custom(recordedChord)
+            let validationClearedAfterValidChord = recorderValidationMessage == nil
+            print("SELFTEST recorder coordinator valid chord returns to idle: \(idleAfterValidChord)")
+            print("SELFTEST recorder coordinator valid chord updates preference: \(preferenceUpdatedToValidChord)")
+            print("SELFTEST recorder coordinator valid chord clears validation message: \(validationClearedAfterValidChord)")
+
+            // 3e) Escape while recording cancels and restores the PRIOR
+            // value (captured at `startRecording`), not whatever is
+            // current when Escape arrives. Note: by design, `parent.
+            // preference` can never change while `displayState ==
+            // .recording` through the normal keystroke-handling path —
+            // `.clear` and a valid `.chord` are the only cases that mutate
+            // it, and both immediately leave `.recording`. So to make the
+            // restore-vs-"never touched it" distinction OBSERVABLE, this
+            // scenario simulates an intervening external change to the
+            // bound preference while still mid-recording (e.g. another
+            // code path writing the binding) — exactly the case
+            // `preferenceBeforeRecording` exists to guard against — and
+            // then asserts cancel restores the value captured at
+            // `startRecording`, NOT the intervening one. Deleting `parent.
+            // preference = preferenceBeforeRecording` from
+            // `cancelRecording` now leaves `recorderPreference` on the
+            // intervening `.disabled` value, which fails this assertion.
+            let preferenceBeforeEscapeScenario = recorderPreference
+            coordinator.startRecording(view: nsView)
+            coordinator.handle(.chord(keyCode: 2, modifiers: KeyboardShortcut.cmdKey), view: nsView) // invalid, stays recording; populates validationMessage
+            recorderPreference = .disabled // simulate an intervening external change while still recording
+            coordinator.handle(.cancel, view: nsView)
+            let idleAfterCancel = nsView.displayState == .idle
+            let preferenceRestoredAfterCancel = recorderPreference == preferenceBeforeEscapeScenario
+            // cancelRecording must clear the validation message left over
+            // from the rejected invalid chord above — deleting `parent.
+            // validationMessage = nil` from `cancelRecording` leaves this
+            // non-nil and fails this assertion.
+            let validationMessageClearedAfterCancel = recorderValidationMessage == nil
+            print("SELFTEST recorder coordinator escape cancels back to idle: \(idleAfterCancel)")
+            print("SELFTEST recorder coordinator escape restores prior preference: \(preferenceRestoredAfterCancel)")
+            print("SELFTEST recorder coordinator escape clears validation message: \(validationMessageClearedAfterCancel)")
+
+            // 3f) Delete/Backspace while recording clears to `.disabled`.
+            coordinator.startRecording(view: nsView)
+            coordinator.handle(.clear, view: nsView)
+            let idleAfterClear = nsView.displayState == .idle
+            let preferenceDisabledAfterClear = recorderPreference == .disabled
+            print("SELFTEST recorder coordinator clear returns to idle: \(idleAfterClear)")
+            print("SELFTEST recorder coordinator clear sets preference to .disabled: \(preferenceDisabledAfterClear)")
+
+            // 3g) Losing first responder while recording (e.g. window
+            // loses focus) cancels deterministically — this is what
+            // guarantees recording can never get stuck. Drive it through
+            // the SAME `onResignWhileRecording` production wiring rather
+            // than calling the coordinator method directly. Same defect as
+            // 3e applies here: `parent.preference` cannot change while
+            // still `.recording` through the normal path, so start from a
+            // known preference, simulate an intervening external change
+            // mid-recording, and assert the restore lands on the value
+            // captured at `startRecording` rather than the intervening
+            // one — the only way to make deleting the restore line in
+            // `cancelRecording` observably FAIL here.
+            nsView.onResignWhileRecording = { coordinator.cancelRecording(view: nsView) }
+            recorderPreference = .custom(recordedChord)
+            let preferenceBeforeResignScenario = recorderPreference
+            coordinator.startRecording(view: nsView)
+            coordinator.handle(.chord(keyCode: 2, modifiers: KeyboardShortcut.cmdKey), view: nsView) // invalid, stays recording
+            recorderPreference = .disabled // simulate an intervening external change while still recording
+            _ = nsView.resignFirstResponder()
+            let idleAfterResign = nsView.displayState == .idle
+            let preferenceRestoredAfterResign = recorderPreference == preferenceBeforeResignScenario
+            print("SELFTEST recorder resignFirstResponder while recording cancels to idle: \(idleAfterResign)")
+            print("SELFTEST recorder resignFirstResponder while recording restores prior preference: \(preferenceRestoredAfterResign)")
+
+            let recorderPureLogicPassed = mappedCmdCtrlOpt == expectedCmdCtrlOpt && mappedNone == 0
+                && classifyEscape == .cancel && classifyDelete == .clear && classifyForwardDelete == .clear
+                && classifyChord == .chord(keyCode: 5, modifiers: expectedCmdCtrlOpt)
+                && becameRecording
+                && stillRecordingAfterModifierOnly && preferenceUnchangedAfterModifierOnly
+                && stillRecordingAfterInvalidChord && validationMessageShown && preferenceUnchangedAfterInvalidChord
+                && idleAfterValidChord && preferenceUpdatedToValidChord && validationClearedAfterValidChord
+                && idleAfterCancel && preferenceRestoredAfterCancel && validationMessageClearedAfterCancel
+                && idleAfterClear && preferenceDisabledAfterClear
+                && idleAfterResign && preferenceRestoredAfterResign
+            print("SELFTEST recorder pure logic all passed: \(recorderPureLogicPassed)")
+
             if menuRequestedCount == 1 && afterRightClick == 0 && afterLeftClick == 1
                 && logRecordedAttempt && logRecordedSuccess
                 && mainMenuPresent && editMenuPresent
@@ -354,7 +517,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 && disabledTwiceIsRegistered == false && disabledTwiceHasNoError
                 && validCustomIsRegistered && validCustomChordMatches
                 && invalidChordIsValid == false && invalidCustomIsRegistered && invalidCustomFellBackToDefault
-                && afterFailureIsRegistered && afterFailureChord == beforeFailureChord && afterFailureError != nil {
+                && afterFailureIsRegistered && afterFailureChord == beforeFailureChord && afterFailureError != nil
+                && recorderPureLogicPassed {
                 print("SELFTEST PASS")
                 exit(0)
             } else {

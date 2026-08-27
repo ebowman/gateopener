@@ -125,35 +125,65 @@ private struct LaunchAtLoginSectionView: View {
 
 // MARK: - Global hotkey
 
-/// Read-only display of the global hotkey (bead gateopener-iif.2): shows
-/// the current chord and, if registration failed (e.g. another app already
-/// owns the combination), a visible warning rather than a silent no-op.
+/// Editable display of the global hotkey (bead gateopener-3vq.3): a
+/// click-to-activate `ShortcutRecorderView` lets the operator record a new
+/// chord, explicitly clear it to "no shortcut", or reset to the default,
+/// replacing the previous read-only display from bead gateopener-iif.2.
 ///
-/// Deliberately read-only for this bead — a full shortcut-recorder UI
-/// (letting the operator pick their own chord) is a reasonable follow-up
-/// but is out of scope here; what matters for this bead is that the
-/// operator can always SEE what the shortcut is and whether it is actually
-/// working, never a silently-hardcoded, invisible binding.
+/// `preference` is local `@State`, NOT read from `AppSettings` — this bead
+/// wires the LIVE effect only (every edit is applied immediately via
+/// `observable.globalHotkey?.apply(_:)`, exactly mirroring what
+/// `AppDelegate` does at launch). Persisting the recorded value across
+/// launches (writing it back to `AppSettings.shortcutPreference`) is bead
+/// gateopener-3vq.4's job — see that bead. Seeding `preference` from
+/// `globalHotkey?.currentChord`/`isDisabled` on `.task` means the field
+/// still shows the actual live state correctly for this session; it just
+/// does not yet survive a relaunch.
 private struct GlobalHotkeySectionView: View {
     let observable: GateControllerObservable
+
+    @State private var preference: ShortcutPreference = .unset
+    @State private var validationMessage: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             Text("Keyboard Shortcut").font(.headline)
 
-            if let chord = observable.globalHotkey?.currentChord {
-                HStack {
-                    Text("Open Gate:")
-                    Text(chord.displayString)
-                        .font(.system(.body, design: .monospaced))
+            HStack(spacing: 8) {
+                Text("Open Gate:")
+
+                ShortcutRecorderView(preference: $preference, validationMessage: $validationMessage)
+                    .frame(width: 160, height: 24)
+
+                // Explicit "no shortcut" affordance (the operator's
+                // literal request): a visible ✕ button, not a hidden
+                // gesture. Always present (not just when a chord is set)
+                // so it is discoverable, but a no-op if already disabled.
+                Button {
+                    setPreference(.disabled)
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
                 }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .help("No shortcut")
+                .disabled(isDisabled)
+
+                Button("Reset to Default") {
+                    setPreference(.custom(KeyboardShortcut.defaultChord))
+                }
+                .controlSize(.small)
             }
 
-            if let error = observable.globalHotkey?.lastRegistrationError {
+            if let validationMessage {
+                Text(validationMessage)
+                    .foregroundStyle(.red)
+                    .font(.callout)
+            } else if let error = observable.globalHotkey?.lastRegistrationError {
                 Text(error)
                     .foregroundStyle(.red)
                     .font(.callout)
-            } else if observable.globalHotkey?.isDisabled == true {
+            } else if isDisabled {
                 Text("No shortcut.")
                     .foregroundStyle(.secondary)
                     .font(.callout)
@@ -163,6 +193,48 @@ private struct GlobalHotkeySectionView: View {
                     .font(.callout)
             }
         }
+        .task {
+            seedFromLiveHotkey()
+        }
+        .onChange(of: preference) { _, newValue in
+            // The recorder view mutates `$preference` directly (recording a
+            // chord, clearing via ✕/Delete, or Escape-cancelling back to
+            // the prior value) without going through `setPreference(_:)`.
+            // Apply every resulting value live here so ALL paths — typed,
+            // cleared, reset, or reverted — reach `GlobalHotkey` the same
+            // way, rather than duplicating this call at each call site.
+            observable.globalHotkey?.apply(newValue)
+        }
+    }
+
+    private var isDisabled: Bool {
+        if case .disabled = preference { return true }
+        return false
+    }
+
+    /// Seeds local `@State` from the live `GlobalHotkey`'s actual current
+    /// state so this view never starts out showing a stale/default value
+    /// that disagrees with what is really registered.
+    private func seedFromLiveHotkey() {
+        guard let globalHotkey = observable.globalHotkey else { return }
+        if globalHotkey.isDisabled {
+            preference = .disabled
+        } else if let chord = globalHotkey.currentChord {
+            preference = .custom(chord)
+        } else {
+            preference = .unset
+        }
+    }
+
+    /// Updates local state; the `.onChange(of: preference)` above applies
+    /// it live to `GlobalHotkey` — the same `apply(_:)` call `AppDelegate`
+    /// makes at launch (see that file's doc comment on
+    /// `GlobalHotkey.apply(_:)`). Kept as one shared path so the ✕ and
+    /// "Reset to Default" buttons apply exactly the same way the recorder
+    /// itself does.
+    private func setPreference(_ newValue: ShortcutPreference) {
+        validationMessage = nil
+        preference = newValue
     }
 }
 
