@@ -170,11 +170,12 @@ PLIST
 # on identifier + team, so one grant survives all future rebuilds.
 #
 # Overridable via CODESIGN_IDENTITY; auto-detected otherwise; falls back to
-# ad-hoc so contributors without an Apple certificate can still build.
-if [ -z "${CODESIGN_IDENTITY:-}" ]; then
-    CODESIGN_IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null \
-        | sed -n 's/.*"\(Developer ID Application: .*\)"/\1/p' | head -1)"
-fi
+# ad-hoc so contributors without an Apple certificate can still build. This
+# resolution logic is shared with scripts/make-dmg.sh via
+# scripts/lib/resolve-codesign-identity.sh so the app and its DMG always
+# end up signed with the same identity.
+# shellcheck source=lib/resolve-codesign-identity.sh
+source "${SCRIPT_DIR}/lib/resolve-codesign-identity.sh"
 
 if [ -n "${CODESIGN_IDENTITY}" ]; then
     echo "==> Code-signing ${APP_NAME}.app with: ${CODESIGN_IDENTITY}"

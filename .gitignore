@@ -12,6 +12,7 @@ DerivedData/
 *.xcuserdatad
 .DS_Store
 *.app
+*.dmg
 
 # Generated app bundle assets (regenerate with scripts/generate-icon.sh /
 # scripts/build-app.sh; only the .svg source is committed).
