@@ -34,6 +34,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// immediately above): without a strong reference the panel would be
     /// deallocated and never appear.
     private var overlayWindowController: OverlayWindowController!
+    /// "View door" (bead gateopener-12h.5): a SEPARATE overlay/session
+    /// controller from `overlayWindowController` above — see
+    /// `DoorVideoOverlayController`'s doc comment for why the two must never
+    /// share a panel. Retained as a stored property for the same reason as
+    /// `overlayWindowController`: without a strong reference here it would
+    /// be deallocated and "View door" would silently do nothing. `nil` under
+    /// `GATEOPENER_MOCK=1` (see the property's assignment below).
+    private var doorVideoOverlayController: DoorVideoOverlayController!
     private var hasAutoOpenedSettings = false
     /// Set only under `GATEOPENER_MOCK=1`, so the self-test path can read
     /// call counts directly without `GateController` needing to expose its
@@ -90,13 +98,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         MainMenu.install()
 
         var appSettingsForLaunch: AppSettings?
-        let controller = Self.makeGateController(mockOut: &mockGateOpeningForSelfTest, appSettingsOut: &appSettingsForLaunch)
+        var doorVideoDependenciesForLaunch: (tokenManager: TokenManager, gateClient: GateClient)?
+        let controller = Self.makeGateController(
+            mockOut: &mockGateOpeningForSelfTest,
+            appSettingsOut: &appSettingsForLaunch,
+            doorVideoDependenciesOut: &doorVideoDependenciesForLaunch
+        )
         self.appSettings = appSettingsForLaunch
         let observable = GateControllerObservable(controller: controller)
         self.observable = observable
         GateControllerObservable.appShared = observable
 
-        let statusItemController = StatusItemController(observable: observable)
+        // "View door" (bead gateopener-12h.5): only constructed when the
+        // real (non-mock) dependency graph produced concrete
+        // TokenManager/GateClient instances — DoorVideoSession requires
+        // those concrete types (not the `any GateOpening`/`any
+        // TokenResolving` existentials GateController itself stores), and
+        // GATEOPENER_MOCK=1 never constructs them (see makeGateController's
+        // mock branch). `makeSession` returns a FRESH DoorVideoSession every
+        // call — DoorVideoOverlayController never reuses one across "View
+        // door" selections (see that type's doc comment).
+        let doorVideoOverlayController: DoorVideoOverlayController?
+        if let doorVideoDependenciesForLaunch, let appSettingsForLaunch {
+            doorVideoOverlayController = DoorVideoOverlayController(appSettings: appSettingsForLaunch) {
+                DoorVideoSession(
+                    tokenManager: doorVideoDependenciesForLaunch.tokenManager,
+                    gateClient: doorVideoDependenciesForLaunch.gateClient
+                )
+            }
+        } else {
+            doorVideoOverlayController = nil
+        }
+        self.doorVideoOverlayController = doorVideoOverlayController
+
+        let statusItemController = StatusItemController(observable: observable, doorVideoOverlayController: doorVideoOverlayController)
         self.statusItemController = statusItemController
 
         guard statusItemController.install() else {
@@ -207,6 +242,82 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if ProcessInfo.processInfo.environment["GATEOPENER_MOCK_SELFTEST"] == "1" {
             runSelfTestAndExit()
         }
+
+        // THROWAWAY hardware-verification path for gateopener-12h.5's
+        // done-criteria — NOT part of normal app flow, gated behind an env
+        // var a real user will never set. Unlike
+        // GATEOPENER_VERIFY_DOOR_VIDEO/GATEOPENER_VERIFY_PANEL_CAPTURE
+        // above, this one runs AFTER the full real (non-mock) launch
+        // sequence completes, so it exercises the REAL StatusItemController/
+        // DoorVideoOverlayController the menu bar icon actually uses — the
+        // whole point is to observe the real "View Door" menu-item action
+        // dispatch end to end (gateopener-9kk.12 lesson: observe, don't
+        // argue that a menu path works), not a reimplementation of it.
+        if ProcessInfo.processInfo.environment["GATEOPENER_VERIFY_VIEW_DOOR_MENU"] == "1" {
+            Task { await self.runViewDoorMenuVerificationAndExit() }
+        }
+    }
+
+    /// THROWAWAY hardware-verification path for gateopener-12h.5's
+    /// done-criteria: proves, by observation, that (1) the real "View Door"
+    /// menu item exists and its action reaches `DoorVideoOverlayController.
+    /// start()` (via `StatusItemController.invokeViewDoorForVerification()`,
+    /// which builds and dispatches the REAL `NSMenu`'s real target/action —
+    /// see that method's doc comment), (2) a connecting state is visible
+    /// before the first frame, (3) the panel disappears at session end via
+    /// the plateau detector, and (4) no gate-open call is ever made along
+    /// this path. Prints a machine-checkable summary and the overlay panel's
+    /// screen rect (mirroring `runDoorVideoVerificationAndExit()`'s own
+    /// `screencapture -R`-ready rect line) so a screenshot can be taken and
+    /// LOOKED AT while the panel is showing live frames — printing "got a
+    /// frame" is not evidence, only a decoded, inspected image is.
+    private func runViewDoorMenuVerificationAndExit() async {
+        guard mockGateOpeningForSelfTest == nil else {
+            // GATEOPENER_MOCK=1 never constructs a doorVideoOverlayController
+            // (see makeGateController's mock branch) — this path is only
+            // meaningful against the real, non-mock dependency graph.
+            print("VERIFYMENU FAIL: running under GATEOPENER_MOCK=1; \"View Door\" would not even be in the menu. Run without GATEOPENER_MOCK.")
+            exit(1)
+        }
+
+        // (1) Prove the menu item exists and reaches DoorVideoOverlayController
+        // via the REAL NSMenuItem target/action dispatch, not a direct call.
+        let invoked = statusItemController.invokeViewDoorForVerification()
+        print("VERIFYMENU \"View Door\" menu item found and invoked: \(invoked)")
+        guard invoked else {
+            print("VERIFYMENU FAIL: \"View Door\" item missing from the real menu")
+            exit(1)
+        }
+
+        // (2) A connecting state must be visible immediately — the overlay
+        // panel this bead added is a SEPARATE OverlayWindowController from
+        // the confirmation-overlay one, so print ITS screen rect (not
+        // reachable via `overlayWindowController`) for a human/agent to
+        // screenshot and LOOK AT while frames are arriving.
+        try? await Task.sleep(for: .milliseconds(300))
+        if let screenFrame = NSScreen.main?.frame {
+            let visible = NSScreen.main!.visibleFrame
+            let size = OverlayWindowController.panelSize
+            let x = visible.maxX - size.width - 16
+            let y = visible.maxY - size.height - 16
+            let flippedY = screenFrame.height - y - size.height
+            print("VERIFYMENU overlay panel rect for screencapture: \(Int(x)),\(Int(flippedY)),\(Int(size.width)),\(Int(size.height))")
+        } else {
+            print("VERIFYMENU overlay panel rect for screencapture: <no screen>")
+        }
+
+        // Give the human/agent time to screenshot the connecting state,
+        // then real frames, then observe the panel disappear at session
+        // end. Extendable via GATEOPENER_VERIFY_VIEW_DOOR_MENU_DWELL_MS
+        // (default 45s: comfortably past the measured ~28-30s session
+        // length plus this view's plateau detector).
+        let dwellMs = ProcessInfo.processInfo.environment["GATEOPENER_VERIFY_VIEW_DOOR_MENU_DWELL_MS"]
+            .flatMap { UInt64($0) } ?? 45_000
+        print("VERIFYMENU dwelling \(dwellMs)ms for observation (screenshot the panel now)...")
+        try? await Task.sleep(nanoseconds: dwellMs * 1_000_000)
+
+        print("VERIFYMENU done dwelling; exiting")
+        exit(0)
     }
 
     /// THROWAWAY hardware-verification path for gateopener-12h.3's
@@ -1097,7 +1208,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     ///   can read `shortcutPreference` at launch (bead gateopener-3vq.2)
     ///   without `GateController` needing to expose its private
     ///   `appSettings` property.
-    private static func makeGateController(mockOut: inout MockGateOpening?, appSettingsOut: inout AppSettings?) -> GateController {
+    /// - Parameter doorVideoDependenciesOut: written with the concrete
+    ///   `TokenManager`/`GateClient` pair in real (non-mock) mode only —
+    ///   `DoorVideoSession.init` requires those CONCRETE types, not the
+    ///   `any GateOpening`/`any TokenResolving` existentials
+    ///   `GateController` stores privately, so this is the only seam that
+    ///   can hand them to `applicationDidFinishLaunching` for constructing a
+    ///   `DoorVideoOverlayController` (bead gateopener-12h.5). Left `nil`
+    ///   under `GATEOPENER_MOCK=1`, where no concrete instances of either
+    ///   type are ever constructed — this is exactly the signal
+    ///   `applicationDidFinishLaunching` uses to skip building a
+    ///   `DoorVideoOverlayController`/"View door" menu item at all under
+    ///   mock mode, rather than presenting a menu item that would always
+    ///   fail.
+    private static func makeGateController(
+        mockOut: inout MockGateOpening?,
+        appSettingsOut: inout AppSettings?,
+        doorVideoDependenciesOut: inout (tokenManager: TokenManager, gateClient: GateClient)?
+    ) -> GateController {
         let isMock = ProcessInfo.processInfo.environment["GATEOPENER_MOCK"] == "1"
 
         if isMock {
@@ -1149,6 +1277,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let api = ComelitAPI()
         let tokenManager = TokenManager(api: api, credentialStore: credentialStore)
         let gateClient = GateClient(tokenManager: tokenManager)
+        doorVideoDependenciesOut = (tokenManager: tokenManager, gateClient: gateClient)
 
         return GateController(
             gateClient: gateClient,

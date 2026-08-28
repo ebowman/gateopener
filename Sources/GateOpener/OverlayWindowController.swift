@@ -153,14 +153,18 @@ final class OverlayWindowController {
     /// Silently degrades (logs a notice and returns) if there is no screen
     /// at all to position against — e.g. a headless CI/self-test process.
     ///
-    /// PRIVATE by design: `handle(_:)` is the sole driver of presentation
-    /// (see the type doc comment and gateopener-9kk.6/9kk.9). Unlike
-    /// `hide()`, there is no safe-to-call-externally version of `show()`
-    /// worth building — showing has real preconditions (screen resolution,
-    /// positioning) that only make sense as part of the state-machine-driven
-    /// flow, and no future feature needs an out-of-band "show a new panel"
-    /// entry point the way `hide()`'s user-initiated dismiss is needed. See
-    /// `hide()`'s doc comment for the asymmetric decision on that method.
+    /// PRIVATE by design: for THIS instance's `GateState`-driven confirmation
+    /// overlay, `handle(_:)` is the sole driver of presentation (see the type
+    /// doc comment and gateopener-9kk.6/9kk.9) and no caller should reach
+    /// around it. gateopener-12h.5 needed exactly the out-of-band "show a new
+    /// panel" entry point this comment used to say no feature would ever
+    /// need: `showForVideo()` below exposes that, but ONLY for a caller that
+    /// owns its own, separate `OverlayWindowController` instance dedicated to
+    /// that purpose (see `DoorVideoOverlayController`, which never touches
+    /// `handle(_:)` and is not driven by `GateState` at all) — the
+    /// confirmation-overlay instance's own presentation still flows solely
+    /// through `handle(_:)`. See `hide()`'s doc comment for the parallel
+    /// asymmetric decision on that method.
     private func show() {
         guard let screen = NSScreen.main ?? NSScreen.screens.first else {
             Self.logger.notice("no screen available; skipping overlay presentation")
@@ -177,6 +181,23 @@ final class OverlayWindowController {
         resolvedPanel.orderFrontRegardless()
 
         (currentContent() as? OverlayShowHideResponding)?.overlayWillShow()
+    }
+
+    /// SAFE TO CALL EXTERNALLY — the video-overlay counterpart to `hide()`'s
+    /// own external-safety note (gateopener-9kk.9). A thin public wrapper
+    /// around `show()`, added for `DoorVideoOverlayController`
+    /// (gateopener-12h.5): that type owns its OWN `OverlayWindowController`
+    /// instance (constructed with `ignoresMouseEvents: false`, distinct from
+    /// the `GateState`-driven confirmation-overlay instance `AppDelegate`
+    /// owns) and drives its presentation directly from
+    /// `DoorVideoSessionState`, not from `GateState`/`handle(_:)`. This does
+    /// NOT weaken the confirmation overlay's own invariant: that instance is
+    /// still only ever shown via `handle(_:)`, since nothing in this app
+    /// calls `showForVideo()` on it. Named distinctly from a bare `show()`
+    /// so it is never mistaken for a general-purpose public entry point on
+    /// the confirmation-overlay instance.
+    func showForVideo() {
+        show()
     }
 
     /// Hides the panel. No-op if the panel was never created or is already

@@ -14,6 +14,16 @@ final class StatusItemController: NSObject {
     private var statusItem: NSStatusItem?
     private let observable: GateControllerObservable
 
+    /// Drives the "View door" menu item (gateopener-12h.5): owns its own
+    /// `DoorVideoSession`/`OverlayWindowController` pair, entirely separate
+    /// from `observable`/`GateState` and from the gate-open confirmation
+    /// overlay. `nil` when the app has no way to construct a
+    /// `DoorVideoSession` (e.g. `GATEOPENER_MOCK=1`, where no concrete
+    /// `TokenManager`/`GateClient` exist) — in that case "View door" is
+    /// simply not added to the menu at all (see `showMenu()`), rather than
+    /// being present and silently failing.
+    private let doorVideoOverlayController: DoorVideoOverlayController?
+
     /// Wall-clock time `.opening` was first observed by THIS controller
     /// (not carried by `GateState` itself — see the bead brief). Used to
     /// escalate the tooltip to "Still trying…" once `.opening` has
@@ -27,8 +37,17 @@ final class StatusItemController: NSObject {
     /// CURRENT `.opening` episode; reset on every state change.
     private var isEscalatedToStillTrying = false
 
-    init(observable: GateControllerObservable) {
+    /// - Parameters:
+    ///   - observable: as before.
+    ///   - doorVideoOverlayController: injected rather than constructed
+    ///     internally, since building it requires `appSettings` and a
+    ///     `DoorVideoSession` factory that only `AppDelegate`'s dependency
+    ///     graph has (mirrors how `DoorVideoOverlayController` itself takes
+    ///     an injected `makeSession` factory, for the same reason). `nil`
+    ///     under mock mode — see the property's doc comment.
+    init(observable: GateControllerObservable, doorVideoOverlayController: DoorVideoOverlayController? = nil) {
         self.observable = observable
+        self.doorVideoOverlayController = doorVideoOverlayController
         super.init()
     }
 
@@ -144,8 +163,29 @@ final class StatusItemController: NSObject {
         }
     }
 
-    private func showMenu() {
+    /// Builds the real status-item menu, with every item's `target`/`action`
+    /// wired exactly as production uses it. Factored out of `showMenu()` so
+    /// `invokeViewDoorForVerification()` (throwaway hardware-verification
+    /// harness, see `GateOpenerApp.swift`'s `GATEOPENER_VERIFY_VIEW_DOOR_MENU`)
+    /// can build the SAME real `NSMenu` and dispatch its "View Door" item's
+    /// action directly — observing the actual production menu-item action
+    /// path end to end, rather than calling `doorVideoOverlayController.
+    /// start()` directly and merely arguing the menu would have reached it
+    /// (the exact gap that shipped gateopener-9kk.12 broken).
+    private func buildMenu() -> NSMenu {
         let menu = NSMenu()
+
+        // "View door" sits ABOVE "Open Gate" — seeing who is there logically
+        // precedes deciding to open (gateopener-12h.5). Only added when a
+        // `doorVideoOverlayController` was actually injected; under
+        // `GATEOPENER_MOCK=1` (no concrete TokenManager/GateClient to build
+        // a DoorVideoSession from) it is simply absent from the menu rather
+        // than present and silently failing every time.
+        if doorVideoOverlayController != nil {
+            let viewDoorItem = NSMenuItem(title: "View Door", action: #selector(menuViewDoor), keyEquivalent: "")
+            viewDoorItem.target = self
+            menu.addItem(viewDoorItem)
+        }
 
         let openItem = NSMenuItem(title: "Open Gate", action: #selector(menuOpenGate), keyEquivalent: "")
         openItem.target = self
@@ -166,6 +206,12 @@ final class StatusItemController: NSObject {
         quitItem.target = self
         menu.addItem(quitItem)
 
+        return menu
+    }
+
+    private func showMenu() {
+        let menu = buildMenu()
+
         // Popped up directly via NSMenu (rather than assigning
         // `statusItem.menu`, which would make NSStatusItem show the menu
         // unconditionally on EVERY click, including left clicks — breaking
@@ -174,8 +220,37 @@ final class StatusItemController: NSObject {
         menu.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.maxY + 4), in: button)
     }
 
+    /// THROWAWAY hardware-verification hook (see `GateOpenerApp.swift`'s
+    /// `GATEOPENER_VERIFY_VIEW_DOOR_MENU`, gated behind an env var a real
+    /// user will never set): builds the real menu via `buildMenu()` and
+    /// dispatches the "View Door" item's real `target`/`action` directly,
+    /// exactly as `NSMenu`'s modal tracking loop would upon a genuine
+    /// selection. Returns `false` (and does nothing) if no "View Door" item
+    /// exists (e.g. `doorVideoOverlayController` is `nil`), so a caller can
+    /// distinguish "the item is missing" from "the item exists and was
+    /// invoked".
+    @discardableResult
+    func invokeViewDoorForVerification() -> Bool {
+        let menu = buildMenu()
+        guard let item = menu.items.first(where: { $0.title == "View Door" }) else { return false }
+        NSApp.sendAction(item.action!, to: item.target, from: item)
+        return true
+    }
+
     @objc private func menuOpenGate() {
         handleLeftClick()
+    }
+
+    /// Handler for the "View Door" menu item. Does NOT call `openGate()` or
+    /// touch `observable`/`GateState` in any way — this path only ever
+    /// starts a `DoorVideoSession` (an `rtc/offer` PUT), never a gate-power
+    /// call. Runs synchronously inside `NSMenu`'s modal tracking loop, same
+    /// as every other menu action here (`menuOpenGate`, `menuOpenSettings`,
+    /// etc.) — verified by observation for this bead (see the bead's
+    /// done-criteria) rather than merely argued, per the gateopener-9kk.12
+    /// lesson referenced in the bead brief.
+    @objc private func menuViewDoor() {
+        doorVideoOverlayController?.start()
     }
 
     @objc private func menuOpenSettings() {
