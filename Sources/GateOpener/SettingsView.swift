@@ -42,6 +42,8 @@ struct SettingsView: View {
 
             ShowOpenOverlaySectionView()
 
+            AutoShowDoorVideoOnOpenSectionView()
+
             Divider()
 
             if isSignedIn {
@@ -169,6 +171,36 @@ private struct ShowOpenOverlaySectionView: View {
         Binding(
             get: { AppSettings().showOpenConfirmationOverlay },
             set: { AppSettings().showOpenConfirmationOverlay = $0 }
+        )
+    }
+}
+
+// MARK: - Auto-show live door video on open
+
+/// "Show live door video when opening the gate" toggle (bead
+/// gateopener-12h.6), backed directly by `AppSettings
+/// .autoShowDoorVideoOnOpen` — see that property's doc comment for why this
+/// is a SEPARATE preference from `showOpenConfirmationOverlay` above, rather
+/// than folded into it: a live video session runs for the door's full
+/// ~28-30s natural length, a much bigger on-screen commitment than the
+/// canned confirmation's ~1.45s hold+fade, so a user may reasonably want
+/// one without the other.
+///
+/// Structurally identical to `ShowOpenOverlaySectionView` above (same
+/// caveats apply verbatim, including the `GATEOPENER_MOCK=1` throwaway-suite
+/// note — see that type's doc comment for the full explanation, not
+/// repeated here).
+private struct AutoShowDoorVideoOnOpenSectionView: View {
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Toggle("Show live door video when opening the gate", isOn: autoShowDoorVideoBinding)
+        }
+    }
+
+    private var autoShowDoorVideoBinding: Binding<Bool> {
+        Binding(
+            get: { AppSettings().autoShowDoorVideoOnOpen },
+            set: { AppSettings().autoShowDoorVideoOnOpen = $0 }
         )
     }
 }

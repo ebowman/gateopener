@@ -159,7 +159,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // (this genuinely differs under `GATEOPENER_MOCK=1`, which uses a
         // throwaway suite), which would make the Settings toggle appear
         // broken. `ignoresMouseEvents` is left at its default (`true`).
-        let overlayWindowController = OverlayWindowController(appSettings: appSettings)
+        //
+        // `makeDoorVideoSession` (bead gateopener-12h.6): the SAME
+        // factory shape/dependency-availability check as
+        // `doorVideoOverlayController` immediately above — only offered
+        // when the real (non-mock) dependency graph produced concrete
+        // `TokenManager`/`GateClient` instances, `nil` otherwise (mock
+        // mode). Deliberately a SEPARATE closure/session from "View door"'s
+        // `doorVideoOverlayController`, even though both build a
+        // `DoorVideoSession` the same way: the two features run
+        // independently (a "View door" session and an open-triggered
+        // session must never share or interfere with one another), so
+        // each gets its own fresh `DoorVideoSession` per call, never a
+        // shared instance.
+        let overlayWindowController: OverlayWindowController
+        if let doorVideoDependenciesForLaunch {
+            overlayWindowController = OverlayWindowController(appSettings: appSettings) {
+                DoorVideoSession(
+                    tokenManager: doorVideoDependenciesForLaunch.tokenManager,
+                    gateClient: doorVideoDependenciesForLaunch.gateClient
+                )
+            }
+        } else {
+            overlayWindowController = OverlayWindowController(appSettings: appSettings)
+        }
         self.overlayWindowController = overlayWindowController
 
         // Global hotkey (bead gateopener-iif.2): mirrors
@@ -256,6 +279,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if ProcessInfo.processInfo.environment["GATEOPENER_VERIFY_VIEW_DOOR_MENU"] == "1" {
             Task { await self.runViewDoorMenuVerificationAndExit() }
         }
+
+        // THROWAWAY hardware-verification path for gateopener-12h.6's
+        // done-criteria — see runOpenVideoVerificationAndExit()'s doc
+        // comment. Select the trigger under test with
+        // GATEOPENER_VERIFY_OPEN_VIDEO_TRIGGER=leftclick|menu|hotkey.
+        if ProcessInfo.processInfo.environment["GATEOPENER_VERIFY_OPEN_VIDEO"] == "1" {
+            Task { await self.runOpenVideoVerificationAndExit() }
+        }
     }
 
     /// THROWAWAY hardware-verification path for gateopener-12h.5's
@@ -317,6 +348,101 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         try? await Task.sleep(nanoseconds: dwellMs * 1_000_000)
 
         print("VERIFYMENU done dwelling; exiting")
+        exit(0)
+    }
+
+    /// THROWAWAY hardware-verification path for gateopener-12h.6's
+    /// done-criteria: proves, by observation, that opening the gate via ONE
+    /// of the three real production triggers — selected by
+    /// `GATEOPENER_VERIFY_OPEN_VIDEO_TRIGGER` ("leftclick" | "menu" |
+    /// "hotkey") — (1) shows the confirmation overlay immediately with the
+    /// canned animation, (2) swaps to live video once the first frame
+    /// arrives, and (3) the overlay disappears at the video session's
+    /// natural end (the plateau detector), all driven purely through
+    /// `GateState`/`OverlayWindowController.handle(_:)` with NO per-trigger
+    /// branching in that type — this harness only choreographs WHICH real
+    /// production entry point fires the SAME `openGate()` call, exactly as
+    /// `runViewDoorMenuVerificationAndExit()` above does for "View Door".
+    /// Prints a machine-checkable summary and the confirmation-overlay
+    /// panel's screen rect for a human/agent to screenshot and LOOK AT
+    /// while live frames are showing (gateopener-9kk.12 lesson: observe,
+    /// never argue).
+    private func runOpenVideoVerificationAndExit() async {
+        guard mockGateOpeningForSelfTest == nil else {
+            print("VERIFYOPEN FAIL: running under GATEOPENER_MOCK=1; no real DoorVideoSession dependency graph exists. Run without GATEOPENER_MOCK.")
+            exit(1)
+        }
+
+        let trigger = ProcessInfo.processInfo.environment["GATEOPENER_VERIFY_OPEN_VIDEO_TRIGGER"] ?? "leftclick"
+        print("VERIFYOPEN trigger: \(trigger)")
+
+        switch trigger {
+        case "leftclick":
+            // Real production left-click path: a synthesized real NSEvent
+            // through statusItemClicked(_:), same as the self-test uses.
+            statusItemController.simulateClickForSelfTest(rightClick: false)
+        case "menu":
+            // Real production "Open Gate" NSMenuItem target/action dispatch
+            // — see StatusItemController.invokeOpenGateForVerification()'s
+            // doc comment for why this matters (gateopener-9kk.12).
+            let invoked = statusItemController.invokeOpenGateForVerification()
+            print("VERIFYOPEN \"Open Gate\" menu item found and invoked: \(invoked)")
+            guard invoked else {
+                print("VERIFYOPEN FAIL: \"Open Gate\" item missing from the real menu")
+                exit(1)
+            }
+        case "hotkey":
+            // Real production global-hotkey closure (registered via
+            // globalHotkey.apply(...) in applicationDidFinishLaunching),
+            // invoked directly rather than via a synthesized system-wide
+            // keystroke — see GlobalHotkey.invokeHandlerForSelfTest()'s doc
+            // comment; this is the same call the self-test uses.
+            globalHotkey.invokeHandlerForSelfTest()
+        case "rapid":
+            // gateopener-12h.6 done-criteria: "rapid repeated opens do not
+            // stack sessions or panels". Fires the real left-click path
+            // twice, a couple seconds apart (comfortably before the first
+            // open's video reaches .streaming, ~4-6s in) — the second open
+            // must replace the first open's session/panel, never stack a
+            // second one alongside it. OverlayWindowController.
+            // startOpenVideoSessionIfEnabled() logs a notice when this
+            // replace path is taken; grep the unified log for it to
+            // confirm.
+            statusItemController.simulateClickForSelfTest(rightClick: false)
+            try? await Task.sleep(for: .seconds(2))
+            print("VERIFYOPEN firing second rapid open now")
+            statusItemController.simulateClickForSelfTest(rightClick: false)
+        default:
+            print("VERIFYOPEN FAIL: unknown trigger '\(trigger)'; expected leftclick|menu|hotkey|rapid")
+            exit(1)
+        }
+
+        // The confirmation overlay must appear essentially immediately
+        // (canned animation, covering the gap before live video arrives).
+        try? await Task.sleep(for: .milliseconds(300))
+        if let screenFrame = NSScreen.main?.frame {
+            let visible = NSScreen.main!.visibleFrame
+            let size = OverlayWindowController.panelSize
+            let x = visible.maxX - size.width - 16
+            let y = visible.maxY - size.height - 16
+            let flippedY = screenFrame.height - y - size.height
+            print("VERIFYOPEN overlay panel rect for screencapture: \(Int(x)),\(Int(flippedY)),\(Int(size.width)),\(Int(size.height))")
+        } else {
+            print("VERIFYOPEN overlay panel rect for screencapture: <no screen>")
+        }
+
+        // Give the human/agent time to screenshot the canned animation,
+        // then live frames once they arrive (~4-6s in), then observe the
+        // panel disappear at session end (~28-30s of streaming later).
+        // Extendable via GATEOPENER_VERIFY_OPEN_VIDEO_DWELL_MS (default
+        // 45s, mirroring GATEOPENER_VERIFY_VIEW_DOOR_MENU_DWELL_MS's own
+        // rationale).
+        let dwellMs = ProcessInfo.processInfo.environment["GATEOPENER_VERIFY_OPEN_VIDEO_DWELL_MS"]
+            .flatMap { UInt64($0) } ?? 45_000
+        print("VERIFYOPEN dwelling \(dwellMs)ms for observation (screenshot the panel now)...")
+        try? await Task.sleep(nanoseconds: dwellMs * 1_000_000)
+
+        print("VERIFYOPEN done dwelling; exiting")
         exit(0)
     }
 

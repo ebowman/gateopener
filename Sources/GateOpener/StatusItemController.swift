@@ -237,6 +237,25 @@ final class StatusItemController: NSObject {
         return true
     }
 
+    /// THROWAWAY hardware-verification hook for bead gateopener-12h.6's
+    /// done-criteria: the menu-item counterpart to
+    /// `invokeViewDoorForVerification()` above, but for "Open Gate" — builds
+    /// the real menu via `buildMenu()` and dispatches the "Open Gate"
+    /// item's real `target`/`action` directly, exactly as `NSMenu`'s modal
+    /// tracking loop would upon a genuine selection. Exists specifically so
+    /// the menu-item trigger for live-video-on-open can be OBSERVED via the
+    /// real production dispatch path, not merely argued to work — the exact
+    /// gap that shipped gateopener-9kk.12 broken. Returns `false` if no
+    /// "Open Gate" item exists (should never happen in production; the item
+    /// is unconditionally added in `buildMenu()`).
+    @discardableResult
+    func invokeOpenGateForVerification() -> Bool {
+        let menu = buildMenu()
+        guard let item = menu.items.first(where: { $0.title == "Open Gate" }) else { return false }
+        NSApp.sendAction(item.action!, to: item.target, from: item)
+        return true
+    }
+
     @objc private func menuOpenGate() {
         handleLeftClick()
     }

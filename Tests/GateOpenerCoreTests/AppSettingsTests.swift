@@ -137,6 +137,50 @@ struct AppSettingsTests {
         #expect(settingsB.showOpenConfirmationOverlay)
     }
 
+    @Test func autoShowDoorVideoOnOpenDefaultsToTrueWhenUnset() {
+        let (defaults, cleanup) = makeSuite()
+        defer { cleanup() }
+
+        let settings = AppSettings(defaults: defaults)
+
+        #expect(settings.autoShowDoorVideoOnOpen)
+    }
+
+    @Test func autoShowDoorVideoOnOpenSetFalseReadsFalseOnSameInstance() {
+        let (defaults, cleanup) = makeSuite()
+        defer { cleanup() }
+
+        let settings = AppSettings(defaults: defaults)
+        settings.autoShowDoorVideoOnOpen = false
+
+        #expect(!settings.autoShowDoorVideoOnOpen)
+    }
+
+    @Test func autoShowDoorVideoOnOpenSetFalsePersistsAcrossNewInstance() {
+        let (defaults, cleanup) = makeSuite()
+        defer { cleanup() }
+
+        let settingsA = AppSettings(defaults: defaults)
+        settingsA.autoShowDoorVideoOnOpen = false
+
+        let settingsB = AppSettings(defaults: defaults)
+        #expect(!settingsB.autoShowDoorVideoOnOpen)
+    }
+
+    @Test func autoShowDoorVideoOnOpenSetTruePersists() {
+        let (defaults, cleanup) = makeSuite()
+        defer { cleanup() }
+
+        let settings = AppSettings(defaults: defaults)
+        settings.autoShowDoorVideoOnOpen = false
+        settings.autoShowDoorVideoOnOpen = true
+
+        #expect(settings.autoShowDoorVideoOnOpen)
+
+        let settingsB = AppSettings(defaults: defaults)
+        #expect(settingsB.autoShowDoorVideoOnOpen)
+    }
+
     @Test func twoInstancesOverSameSuiteSeeEachOthersWrites() {
         let (defaults, cleanup) = makeSuite()
         defer { cleanup() }
