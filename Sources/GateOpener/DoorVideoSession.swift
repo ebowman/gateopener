@@ -257,10 +257,9 @@ public final class DoorVideoSession: NSObject {
 
         let answerSDP: String
         do {
-            let sessionId = UUID().uuidString.lowercased()
-            answerSDP = try await putOffer(endpointId: endpointId, token: token, sdp: offerSDP, sessionId: sessionId)
+            answerSDP = try await putOfferWithRetry(endpointId: endpointId, token: token, sdp: offerSDP)
         } catch {
-            Self.logger.error("rtc/offer failed: \(String(describing: error), privacy: .public)")
+            Self.logger.error("rtc/offer failed after retry: \(String(describing: error), privacy: .public)")
             state = .failed(message: "Could not reach door camera")
             return
         }
@@ -407,6 +406,17 @@ public final class DoorVideoSession: NSObject {
         guard let sdp = raw as? String, !sdp.isEmpty else {
             throw DoorVideoSessionError.negotiationFailed
         }
+
+        // Cheap, permanent diagnostic (not a page round trip): confirms
+        // the non-trickle offer actually carries ICE candidates before it
+        // is PUT to rtc/offer, which -- verified against real hardware for
+        // gateopener-12h.3 -- it reliably does (the page's own
+        // iceGatheringState-complete wait in negotiate() already blocks
+        // `startNegotiation()`'s Promise from resolving until gathering
+        // finishes, so no separate Swift-side poll is needed here).
+        let candidateCount = sdp.components(separatedBy: "a=candidate:").count - 1
+        Self.logger.notice("offer SDP ready: \(sdp.count) chars, \(candidateCount, privacy: .public) ICE candidates")
+
         return sdp
     }
 
@@ -430,20 +440,42 @@ public final class DoorVideoSession: NSObject {
         streamingPollTask = Task { [weak self] in
             guard let self else { return }
             let deadline = Date().addingTimeInterval(20)
+            var lastLoggedState = ""
             while Date() < deadline {
                 if Task.isCancelled { return }
                 guard !self.hasStopped else { return }
+
+                // Primary signal: pc.getStats()'s inbound-rtp video report
+                // (framesDecoded/packetsReceived), NOT the page's
+                // requestVideoFrameCallback-driven hasVideoFrame flag.
+                // Verified against real hardware (gateopener-12h.3
+                // investigation): the peer connection can report
+                // framesDecoded in the hundreds -- real, decoded video --
+                // while requestVideoFrameCallback never fires and
+                // video.videoWidth/videoHeight stay 0, so hasVideoFrame is
+                // an unreliable signal in this WKWebView context (likely
+                // WebKit-specific requestVideoFrameCallback flakiness, not
+                // a negotiation problem -- negotiation/ICE/DTLS all
+                // succeed). getStats() is the ground truth the WebRTC spec
+                // guarantees; the <video> element's own frame-callback API
+                // is not.
                 do {
                     let raw = try await self.contentView.callAsyncJavaScript(
-                        "return window.getState ? JSON.stringify(window.getState()) : null;",
+                        "return await window.getVideoStats();",
                         contentWorld: .page
                     )
-                    if let jsonStr = raw as? String,
-                       let data = jsonStr.data(using: .utf8),
-                       let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                       let hasFrame = obj["hasVideoFrame"] as? Bool, hasFrame {
-                        self.state = .streaming
-                        return
+                    if let jsonStr = raw as? String {
+                        if jsonStr != lastLoggedState {
+                            lastLoggedState = jsonStr
+                            Self.logger.notice("video stats: \(jsonStr, privacy: .public)")
+                        }
+                        if let data = jsonStr.data(using: .utf8),
+                           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                           let video = obj["video"] as? [String: Any],
+                           let framesDecoded = video["framesDecoded"] as? Int, framesDecoded > 0 {
+                            self.state = .streaming
+                            return
+                        }
                     }
                 } catch {
                     // Transient eval errors while polling are not fatal on
@@ -489,6 +521,72 @@ public final class DoorVideoSession: NSObject {
         }
         let decoded = try JSONDecoder().decode(OfferResponse.self, from: data)
         return decoded.answer
+    }
+
+    /// Wraps `putOffer` with a bounded retry, matching a real-world
+    /// observation from the reference iOS app: `rtc/offer` sometimes
+    /// returns a TRANSIENT HTTP 500 that a second attempt clears, so a
+    /// single 500 is not necessarily proof of a malformed offer.
+    ///
+    /// Reuses `GateOpenerCore.RetryPolicy` (the same type `GateClient`
+    /// itself is built on) rather than inventing a second retry mechanism
+    /// — `DoorVideoSession` already imports `GateOpenerCore`, so this is a
+    /// same-module reuse, not a new dependency.
+    ///
+    ///  - 2 attempts total (1 retry), matching the reference app's observed
+    ///    behavior — NOT an aggressive/unbounded loop against the door.
+    ///  - Retries ONLY on HTTP 500 and transport/network errors
+    ///    (`DoorVideoSessionError.network`); any other HTTP status (4xx, or
+    ///    a non-500 5xx) is treated as non-retryable and rethrown
+    ///    immediately, since retrying an auth/shape problem will not fix it.
+    ///  - A FRESH `sessionId` (uuid4) is minted for the retry attempt, per
+    ///    the bead's requirement. The SAME offer SDP is reused across
+    ///    attempts (deliberately NOT regenerated): the SDP's ICE
+    ///    ufrag/password and DTLS fingerprint are tied to the single
+    ///    `RTCPeerConnection` already created and gathered in the page, and
+    ///    Comelit's `sessionId` is the field that scopes one negotiation
+    ///    attempt from the next — nothing about a transient 500 implies the
+    ///    offer itself was malformed. Regenerating the offer would require
+    ///    tearing down and rebuilding the whole peer connection (a second
+    ///    ICE-gathering round trip), which is unwarranted extra latency and
+    ///    complexity for what the reference app treats as a quick retry.
+    ///  - Backoff is a few hundred ms (`RetryPolicy.baseDelay`), bounded by
+    ///    `maxTotalDelay`, so the retry cannot meaningfully add to the
+    ///    human-facing wait.
+    private func putOfferWithRetry(endpointId: String, token: String, sdp: String) async throws -> String {
+        let policy = RetryPolicy(
+            maxAttempts: 2,
+            baseDelay: .milliseconds(500),
+            maxTotalDelay: .seconds(2),
+            requestTimeout: .seconds(5)
+        )
+
+        var lastError: Error = DoorVideoSessionError.network
+        for attempt in 1...policy.maxAttempts {
+            let sessionId = UUID().uuidString.lowercased()
+            do {
+                let answer = try await putOffer(endpointId: endpointId, token: token, sdp: sdp, sessionId: sessionId)
+                Self.logger.notice("rtc/offer attempt \(attempt, privacy: .public)/\(policy.maxAttempts, privacy: .public) succeeded")
+                return answer
+            } catch {
+                lastError = error
+                let retryable: Bool
+                if case DoorVideoSessionError.server(let status) = error, status == 500 {
+                    retryable = true
+                } else if case DoorVideoSessionError.network = error {
+                    retryable = true
+                } else {
+                    retryable = false
+                }
+                Self.logger.notice("rtc/offer attempt \(attempt, privacy: .public)/\(policy.maxAttempts, privacy: .public) failed: \(String(describing: error), privacy: .public), retryable=\(retryable, privacy: .public)")
+
+                guard retryable, attempt < policy.maxAttempts else {
+                    throw error
+                }
+                try? await policy.sleep(policy.baseDelay)
+            }
+        }
+        throw lastError
     }
 }
 

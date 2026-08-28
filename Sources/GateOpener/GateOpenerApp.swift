@@ -234,22 +234,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let firstFrameElapsedMs = Int(Date().timeIntervalSince(t0) * 1000)
         print("VERIFY time-to-first-frame-or-give-up = \(firstFrameElapsedMs)ms, final state = \(session.state)")
 
-        if session.state == .streaming {
-            if let raw = try? await session.contentView.callAsyncJavaScript(
-                "return await window.getVideoStats();",
-                contentWorld: .page
-            ), let jsonStr = raw as? String {
-                print("VERIFY stats: \(jsonStr)")
-            } else {
-                print("VERIFY stats: <could not fetch>")
-            }
+        // Always dump getVideoStats() and getState() to stdout regardless
+        // of final state, for diagnosability -- unified logging (os.Logger)
+        // truncates long messages, stdout does not.
+        if let raw = try? await session.contentView.callAsyncJavaScript(
+            "return await window.getVideoStats();",
+            contentWorld: .page
+        ), let jsonStr = raw as? String {
+            print("VERIFY stats: \(jsonStr)")
+        } else {
+            print("VERIFY stats: <could not fetch>")
         }
+        if let raw = try? await session.contentView.callAsyncJavaScript(
+            "return window.getState ? JSON.stringify(window.getState()) : null;",
+            contentWorld: .page
+        ), let jsonStr = raw as? String {
+            print("VERIFY full state: \(jsonStr)")
+        }
+
+        // Capture success BEFORE stop() -- stop() unconditionally
+        // transitions .streaming to .ended("stopped"), so checking
+        // session.state after stop() would always report failure even on
+        // a successful run.
+        let reachedStreaming = session.state == .streaming
 
         session.stop()
         // Give stop()'s fire-and-forget closeSession() a moment to run
         // before the process exits.
         try? await Task.sleep(nanoseconds: 500_000_000)
-        exit(session.state == .streaming ? 0 : 1)
+        exit(reachedStreaming ? 0 : 1)
     }
 
     /// Verification path for the bead .8 done-criteria: proves, via the
