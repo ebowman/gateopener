@@ -3,6 +3,7 @@
 <head><title>comelit door camera</title></head>
 <body style="margin:0;background:#000">
 <video id="v" autoplay playsinline muted style="width:100%;height:100%;background:#222"></video>
+<canvas id="c" style="display:none"></canvas>
 <script>
 // Drives ONE WebRTC session against the Comelit door camera, via WKWebView.
 // This is a stripped-down copy of ../comelit/comelit/webrtc_page.html
@@ -172,6 +173,31 @@ window.getVideoStats = async function () {
     }
   });
   return JSON.stringify({video, audio});
+};
+
+// EXPERIMENT (gateopener-12h.8, option (c)): draws the current video frame
+// to the hidden canvas above and returns it as a base64 JPEG data URL.
+// Ported verbatim (semantics unchanged) from
+// ../comelit/comelit/webrtc_page.html's window.captureFrameJpeg, which is
+// proven against this exact hardware -- it is how the Python reference app
+// serves MJPEG. Returns null if the <video> element has no natural size yet
+// (video.videoWidth/videoHeight are 0), which is deliberately the same
+// signal DoorVideoSession's hasVideoFrame path already found unreliable in
+// this WKWebView context -- this experiment exists to find out whether
+// canvas capture is ALSO gated on that, or can succeed independently of it.
+window.captureFrameJpeg = function (quality) {
+  const video = document.getElementById("v");
+  if (!video.videoWidth || !video.videoHeight) {
+    return null;
+  }
+  const canvas = document.getElementById("c");
+  if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+  }
+  const ctx = canvas.getContext('2d');
+  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+  return canvas.toDataURL('image/jpeg', quality || 0.85);
 };
 
 // Tears down the RTCPeerConnection. Idempotent: safe to call even if no
