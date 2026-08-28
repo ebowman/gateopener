@@ -36,6 +36,9 @@ ICON_NAME="AppIcon"
 OVERLAY_VIDEO="${REPO_ROOT}/Resources/gate-open.mp4"
 OVERLAY_VIDEO_NAME="gate-open.mp4"
 
+DOOR_VIDEO_PAGE="${REPO_ROOT}/Resources/door-video.html"
+DOOR_VIDEO_PAGE_NAME="door-video.html"
+
 echo "==> Building ${APP_NAME} (release)..."
 swift build -c release --package-path "${REPO_ROOT}"
 
@@ -60,6 +63,11 @@ if [ ! -f "${OVERLAY_VIDEO}" ]; then
     exit 1
 fi
 
+if [ ! -f "${DOOR_VIDEO_PAGE}" ]; then
+    echo "error: door camera WebRTC page not found at ${DOOR_VIDEO_PAGE}." >&2
+    exit 1
+fi
+
 echo "==> Assembling ${APP_NAME}.app (removing any stale bundle first)..."
 rm -rf "${APP_BUNDLE}"
 mkdir -p "${MACOS_DIR}" "${RESOURCES_DIR}"
@@ -67,6 +75,7 @@ mkdir -p "${MACOS_DIR}" "${RESOURCES_DIR}"
 cp "${RELEASE_BIN}" "${MACOS_DIR}/${APP_NAME}"
 cp "${ICON_ICNS}" "${RESOURCES_DIR}/${ICON_NAME}.icns"
 cp "${OVERLAY_VIDEO}" "${RESOURCES_DIR}/${OVERLAY_VIDEO_NAME}"
+cp "${DOOR_VIDEO_PAGE}" "${RESOURCES_DIR}/${DOOR_VIDEO_PAGE_NAME}"
 
 cat > "${CONTENTS_DIR}/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -107,8 +116,30 @@ cat > "${CONTENTS_DIR}/Info.plist" <<PLIST
 </plist>
 PLIST
 
-echo "==> Ad-hoc code-signing ${APP_NAME}.app..."
-codesign --force --deep --sign - "${APP_BUNDLE}"
+# Prefer a STABLE signing identity over ad-hoc. An ad-hoc signature
+# (`--sign -`) derives the app's identity from its own hash, so it changes
+# on EVERY rebuild and macOS treats each build as a different application
+# — invalidating any keychain "Always Allow" grant and re-prompting for the
+# Comelit credentials every single time. A Developer ID identity is keyed
+# on identifier + team, so one grant survives all future rebuilds.
+#
+# Overridable via CODESIGN_IDENTITY; auto-detected otherwise; falls back to
+# ad-hoc so contributors without an Apple certificate can still build.
+if [ -z "${CODESIGN_IDENTITY:-}" ]; then
+    CODESIGN_IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null \
+        | sed -n 's/.*"\(Developer ID Application: .*\)"/\1/p' | head -1)"
+fi
+
+if [ -n "${CODESIGN_IDENTITY}" ]; then
+    echo "==> Code-signing ${APP_NAME}.app with: ${CODESIGN_IDENTITY}"
+    codesign --force --deep --sign "${CODESIGN_IDENTITY}" --timestamp=none "${APP_BUNDLE}"
+else
+    echo "==> Ad-hoc code-signing ${APP_NAME}.app (no Developer ID identity found)..."
+    echo "    NOTE: ad-hoc identity changes on every rebuild, so macOS will"
+    echo "    re-prompt for keychain access after each build. Set"
+    echo "    CODESIGN_IDENTITY, or install a Developer ID certificate, to stop that."
+    codesign --force --deep --sign - "${APP_BUNDLE}"
+fi
 
 echo "==> Verifying signature..."
 codesign -dv "${APP_BUNDLE}"

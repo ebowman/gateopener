@@ -59,15 +59,39 @@ final class OverlayWindowController {
     /// governing the running app.
     private let appSettings: AppSettings
 
+    /// Factory for a fresh `DoorVideoSession` on the gate-OPEN path (bead
+    /// gateopener-12h.6) — deliberately the SAME shape as
+    /// `DoorVideoOverlayController.makeSession`, and for the same reason:
+    /// building a real session requires the concrete `TokenManager`/
+    /// `GateClient` instances that only exist in the app's real (non-mock)
+    /// dependency graph (see `AppDelegate.makeGateController`). `nil` when
+    /// the caller has no such dependency graph to offer (mock mode, or a
+    /// caller — e.g. the confirmation-overlay unit-test-only construction
+    /// path — that simply doesn't want this feature); `handleOpening()`
+    /// treats a `nil` factory exactly like the `autoShowDoorVideoOnOpen`
+    /// setting being off: canned-animation-only, today's exact behavior.
+    private let makeDoorVideoSession: (() -> DoorVideoSession?)?
+
     /// - Parameters:
     ///   - ignoresMouseEvents: see the property doc above. Defaults to
     ///     `true` for the confirmation-overlay use case.
-    ///   - appSettings: source of `showOpenConfirmationOverlay`, read fresh
-    ///     on every `handle(_:)` call. See the property doc above for why
-    ///     this is injected rather than constructed internally.
-    init(appSettings: AppSettings, ignoresMouseEvents: Bool = true) {
+    ///   - appSettings: source of `showOpenConfirmationOverlay`/
+    ///     `autoShowDoorVideoOnOpen`, read fresh on every `handle(_:)` call.
+    ///     See the property doc above for why this is injected rather than
+    ///     constructed internally.
+    ///   - makeDoorVideoSession: see the property doc above. Defaults to
+    ///     `nil` (no live-video-on-open feature at all), which is exactly
+    ///     what every existing call site that does not pass this parameter
+    ///     needs — this widens `init`'s surface without breaking any
+    ///     existing caller.
+    init(
+        appSettings: AppSettings,
+        ignoresMouseEvents: Bool = true,
+        makeDoorVideoSession: (() -> DoorVideoSession?)? = nil
+    ) {
         self.appSettings = appSettings
         self.ignoresMouseEvents = ignoresMouseEvents
+        self.makeDoorVideoSession = makeDoorVideoSession
     }
 
     /// Replaces the panel's displayed content. Callers may call this before
@@ -80,9 +104,51 @@ final class OverlayWindowController {
     /// below); a future live-camera feature calls this same method with an
     /// `RTCMTLNSVideoView` (or similar) instead, touching no other part of
     /// this type.
+    ///
+    /// gateopener-12h.2: swapping content into an ALREADY-VISIBLE panel must
+    /// start the incoming content and stop the outgoing content, exactly as
+    /// `show()`/`hide()` would, even though neither of those is called here.
+    /// Without this, content swapped in after the panel is already on screen
+    /// (e.g. show a "connecting" placeholder, then swap in the live video
+    /// once frames arrive) never receives `overlayWillShow()` and sits frozen
+    /// — for video, a black tile that looks like a WebRTC failure rather than
+    /// the lifecycle bug it actually is.
+    ///
+    /// - The OUTGOING view's `overlayDidHide()` fires first (only when the
+    ///   panel is visible and content is actually being replaced, not
+    ///   installed for the first time), so a swapped-out player pauses rather
+    ///   than continuing to decode off-screen.
+    /// - The INCOMING view's `overlayWillShow()` fires only when the panel
+    ///   both exists and `isVisible`. When the panel is not visible yet, a
+    ///   later `show()` call is what delivers that hook — firing it here too
+    ///   would double-fire it.
+    /// - Re-setting the SAME view is a no-op: neither hook fires. A same-view
+    ///   re-set is not a transition, and firing `overlayWillShow()` alone
+    ///   (unpaired with a `overlayDidHide()`) would restart a video from
+    ///   frame zero. Callers that swap content on state changes can
+    ///   legitimately re-set the view they already installed.
+    /// - No reordering/re-positioning/re-presenting of the panel happens
+    ///   here: this method only ever touches content-view lifecycle hooks,
+    ///   never `orderFrontRegardless()`/`position(_:on:)`.
     func setContent(_ view: NSView) {
+        let outgoing = currentContent()
+        let isPanelVisible = panel?.isVisible ?? false
+
         pendingContent = view
         panel?.installContent(view)
+
+        guard isPanelVisible else { return }
+
+        // Re-setting the SAME view is a genuine no-op, not a transition.
+        // Without this guard `overlayWillShow()` would fire unpaired (no
+        // matching `overlayDidHide()`), which for a video view means
+        // seek(.zero) + play() — silently restarting the stream from the
+        // beginning. The live-camera code swaps content on state changes
+        // and can legitimately re-set the view it already installed.
+        guard outgoing !== view else { return }
+
+        (outgoing as? OverlayShowHideResponding)?.overlayDidHide()
+        (view as? OverlayShowHideResponding)?.overlayWillShow()
     }
 
     private var pendingContent: NSView?
@@ -111,14 +177,18 @@ final class OverlayWindowController {
     /// Silently degrades (logs a notice and returns) if there is no screen
     /// at all to position against — e.g. a headless CI/self-test process.
     ///
-    /// PRIVATE by design: `handle(_:)` is the sole driver of presentation
-    /// (see the type doc comment and gateopener-9kk.6/9kk.9). Unlike
-    /// `hide()`, there is no safe-to-call-externally version of `show()`
-    /// worth building — showing has real preconditions (screen resolution,
-    /// positioning) that only make sense as part of the state-machine-driven
-    /// flow, and no future feature needs an out-of-band "show a new panel"
-    /// entry point the way `hide()`'s user-initiated dismiss is needed. See
-    /// `hide()`'s doc comment for the asymmetric decision on that method.
+    /// PRIVATE by design: for THIS instance's `GateState`-driven confirmation
+    /// overlay, `handle(_:)` is the sole driver of presentation (see the type
+    /// doc comment and gateopener-9kk.6/9kk.9) and no caller should reach
+    /// around it. gateopener-12h.5 needed exactly the out-of-band "show a new
+    /// panel" entry point this comment used to say no feature would ever
+    /// need: `showForVideo()` below exposes that, but ONLY for a caller that
+    /// owns its own, separate `OverlayWindowController` instance dedicated to
+    /// that purpose (see `DoorVideoOverlayController`, which never touches
+    /// `handle(_:)` and is not driven by `GateState` at all) — the
+    /// confirmation-overlay instance's own presentation still flows solely
+    /// through `handle(_:)`. See `hide()`'s doc comment for the parallel
+    /// asymmetric decision on that method.
     private func show() {
         guard let screen = NSScreen.main ?? NSScreen.screens.first else {
             Self.logger.notice("no screen available; skipping overlay presentation")
@@ -135,6 +205,23 @@ final class OverlayWindowController {
         resolvedPanel.orderFrontRegardless()
 
         (currentContent() as? OverlayShowHideResponding)?.overlayWillShow()
+    }
+
+    /// SAFE TO CALL EXTERNALLY — the video-overlay counterpart to `hide()`'s
+    /// own external-safety note (gateopener-9kk.9). A thin public wrapper
+    /// around `show()`, added for `DoorVideoOverlayController`
+    /// (gateopener-12h.5): that type owns its OWN `OverlayWindowController`
+    /// instance (constructed with `ignoresMouseEvents: false`, distinct from
+    /// the `GateState`-driven confirmation-overlay instance `AppDelegate`
+    /// owns) and drives its presentation directly from
+    /// `DoorVideoSessionState`, not from `GateState`/`handle(_:)`. This does
+    /// NOT weaken the confirmation overlay's own invariant: that instance is
+    /// still only ever shown via `handle(_:)`, since nothing in this app
+    /// calls `showForVideo()` on it. Named distinctly from a bare `show()`
+    /// so it is never mistaken for a general-purpose public entry point on
+    /// the confirmation-overlay instance.
+    func showForVideo() {
+        show()
     }
 
     /// Hides the panel. No-op if the panel was never created or is already
@@ -157,6 +244,14 @@ final class OverlayWindowController {
     /// symmetric.
     func hide() {
         cancelPendingResolve()
+        // gateopener-12h.6: an in-flight open-triggered video session must
+        // never outlive the panel it is being shown in — an external
+        // `hide()` call (or `handleOpenVideoSessionEnded()`'s own internal
+        // one, see below) has to stop it, not just leave it running behind
+        // an invisible panel. Mirrors `cancelPendingResolve()` immediately
+        // above: both are cleanup steps that make this method a genuinely
+        // safe, total dismiss primitive regardless of what was in flight.
+        teardownOpenVideoSession()
         panel?.orderOut(nil)
         panel?.alphaValue = 1
         (currentContent() as? OverlayShowHideResponding)?.overlayDidHide()
@@ -185,6 +280,43 @@ final class OverlayWindowController {
     /// until the fade completes and the panel is ordered out). Read by the
     /// `.idle`/`.needsSetup` branch to implement reentrancy rule (b) below.
     private var isResolveFadePending = false
+
+    // MARK: - Live video on open (gateopener-12h.6)
+
+    /// The in-flight, open-triggered `DoorVideoSession`, if any. `nil`
+    /// whenever no such session is running — including the entire time
+    /// before `.opening` first starts one, and again once it ends/fails/is
+    /// superseded. See `handleOpening()`/`teardownOpenVideoSession()`.
+    ///
+    /// THIS CHANGES THE OVERLAY'S LIFETIME FOR THE OPEN PATH, and that is
+    /// deliberate — read this whole section before touching any of it.
+    /// Historically (bead gateopener-9kk.5/.6) the confirmation overlay's
+    /// entire lifetime was `.opening` -> show -> `.succeeded`/`.failed` ->
+    /// hold (~1.2s or 0s) -> fade (~0.25s) -> hide, driven purely by
+    /// `GateState`. An open completes in ~2s, but live video takes ~4-6s to
+    /// its first frame (dominated by the cloud `rtc/offer` round trip, not
+    /// reducible) and then runs for the door's full measured ~28-30s
+    /// natural session length (gateopener-12h.4) — video arrives and keeps
+    /// running long after `GateState` has already reached `.succeeded`/
+    /// `.idle`. So: whenever a video session is in flight for the CURRENT
+    /// open, `GateState`'s own `.succeeded`/`.failed`/`.idle`/`.needsSetup`
+    /// transitions must NOT hide the panel (see the guards added to
+    /// `handleResolved(holdDuration:)`/`handleIdleOrNeedsSetup()` below) —
+    /// the video's own end signal (`DoorVideoFrameView`'s plateau/
+    /// hard-timeout detector, delivered via `onSessionEnded` below) becomes
+    /// the sole thing that hides the panel for that open. If video was
+    /// never started for this open (setting off, no factory, or `start()`
+    /// never reaches `.streaming`/fails outright), none of this applies and
+    /// the panel behaves EXACTLY as it always has — video is additive, per
+    /// the bead's explicit failure-must-degrade requirement.
+    private var openVideoSession: DoorVideoSession?
+
+    /// The frame view currently showing `openVideoSession`'s live feed, if
+    /// streaming has actually started. Held so `teardownOpenVideoSession()`
+    /// can clear its callbacks (preventing a stale `onSessionEnded`/future
+    /// state delivery to a torn-down controller) and so a same-session
+    /// re-`setContent` is never attempted from two different call sites.
+    private var openVideoFrameView: DoorVideoFrameView?
 
     /// Downstream observer of `GateState`, shaped like
     /// `NotificationPresenter.handle(_:)`: never called from `openGate()`'s
@@ -256,6 +388,135 @@ final class OverlayWindowController {
         cancelPendingResolve()
         panel?.alphaValue = 1
         show()
+        startOpenVideoSessionIfEnabled()
+    }
+
+    /// Starts a fresh live-video session for THIS open, in parallel with the
+    /// canned animation `handleOpening()` just showed — see the
+    /// `openVideoSession` doc comment above for why the two run
+    /// side by side rather than one replacing the other.
+    ///
+    /// Reentrancy: a second `.opening` arriving while a previous open's
+    /// video session is still in flight (e.g. a fast repeated open) must
+    /// not stack two sessions or leave the first one's frame view attached
+    /// — `teardownOpenVideoSession()` stops and clears the previous session
+    /// FIRST, unconditionally, exactly mirroring `DoorVideoOverlayController
+    /// .start()`'s own "replace, don't stack" rule for the separate "View
+    /// door" panel.
+    ///
+    /// No-ops (canned-animation-only, today's exact behavior) when either
+    /// `autoShowDoorVideoOnOpen` is off or no `makeDoorVideoSession` factory
+    /// was injected (mock mode / a caller that opted out) — see those
+    /// properties' doc comments.
+    private func startOpenVideoSessionIfEnabled() {
+        if openVideoSession != nil {
+            Self.logger.notice("a new open arrived while a previous open's video session was still in flight; replacing it")
+        }
+        teardownOpenVideoSession()
+
+        guard appSettings.autoShowDoorVideoOnOpen, let makeDoorVideoSession else { return }
+        guard let session = makeDoorVideoSession() else { return }
+
+        openVideoSession = session
+
+        let frameView = DoorVideoFrameView(
+            session: session,
+            frame: NSRect(origin: .zero, size: Self.panelSize)
+        )
+        // Session-end detection (plateau/hard-timeout — see
+        // `DoorVideoFrameView`'s own doc comment) is the SOLE trigger that
+        // hides the panel for this open; GateState's own `.succeeded`/
+        // `.failed`/`.idle` transitions are deliberately blocked from doing
+        // so while `openVideoSession != nil` (see `handleResolved(
+        // holdDuration:)`/`handleIdleOrNeedsSetup()` below).
+        frameView.onSessionEnded = { [weak self] in
+            self?.handleOpenVideoSessionEnded()
+        }
+        openVideoFrameView = frameView
+
+        session.onStateChange = { [weak self] state in
+            self?.handleOpenVideoState(state)
+        }
+
+        Task {
+            await session.start()
+        }
+    }
+
+    /// `DoorVideoSession.onStateChange` handler for the open-triggered
+    /// session. Mirrors `DoorVideoOverlayController.handle(_:)`'s shape but
+    /// is deliberately much narrower: `.idle`/`.connecting` do nothing (the
+    /// canned animation is already covering that gap — see the
+    /// `openVideoSession` doc comment above), `.streaming` swaps the panel's
+    /// content to the live feed, and `.ended`/`.failed` tear the video down
+    /// WITHOUT hiding the panel via the video path — `.failed` in
+    /// particular must leave the canned animation's own already-scheduled
+    /// (or already-elapsed) hold-then-fade in full control, exactly as if
+    /// video had never been attempted (failure-must-degrade requirement).
+    /// `.ended` DOES still need to hide the panel — that happens via
+    /// `handleOpenVideoSessionEnded()` below, not from this switch directly,
+    /// since `DoorVideoFrameView`'s plateau detector (not
+    /// `DoorVideoSession.state` reaching `.ended`, which per
+    /// `DoorVideoSession`'s own doc comment never fires on its own) is the
+    /// primary end-of-session signal per the bead's explicit instruction.
+    private func handleOpenVideoState(_ state: DoorVideoSessionState) {
+        switch state {
+        case .idle, .connecting:
+            break
+        case .streaming:
+            guard let openVideoFrameView, openVideoSession != nil else { return }
+            setContent(openVideoFrameView)
+        case .ended:
+            handleOpenVideoSessionEnded()
+        case .failed:
+            // Additive-only: swallow the failure and leave the canned
+            // animation's own GateState-driven hold-then-fade as the only
+            // thing controlling the panel from here — see this method's
+            // doc comment.
+            teardownOpenVideoSession()
+        }
+    }
+
+    /// Invoked from `DoorVideoFrameView.onSessionEnded` (plateau/hard-
+    /// timeout — the PRIMARY end-of-session signal per the bead) or from
+    /// `DoorVideoSession` reaching `.ended` on its own. Tears down the video
+    /// session and, since the video session ending is what the user's open
+    /// is now waiting on (GateState itself resolved long ago), hides the
+    /// panel directly here rather than waiting for another GateState
+    /// transition that may never arrive.
+    ///
+    /// Idempotent: guards `openVideoSession != nil` itself, and `hide()`
+    /// below also unconditionally calls `teardownOpenVideoSession()` (see
+    /// that method's doc comment) — so a second call for the same session
+    /// (e.g. both `DoorVideoFrameView`'s hard timeout AND a late
+    /// `DoorVideoSession.ended` firing) is a harmless no-op either way.
+    private func handleOpenVideoSessionEnded() {
+        guard openVideoSession != nil else { return }
+        panel?.alphaValue = 1
+        hide()
+    }
+
+    /// Stops and releases the current open-triggered video session, if any.
+    /// Safe to call when nothing is in flight (no-op). Clears both
+    /// `onStateChange` and `onSessionEnded` on the outgoing session/view
+    /// BEFORE releasing them, so a straggling async callback from a
+    /// just-superseded or just-stopped session can never reach this
+    /// controller again (e.g. reentering `handleOpenVideoSessionEnded()`
+    /// for a session this method itself is in the middle of discarding).
+    ///
+    /// Does NOT touch the panel's visibility/content — callers decide that
+    /// separately (`startOpenVideoSessionIfEnabled()` replaces content via
+    /// a fresh session's own `.streaming` transition; `handleOpenVideoState
+    /// (_:)`'s `.failed` branch deliberately leaves the canned animation's
+    /// content in place; `handleOpenVideoSessionEnded()` hides the panel
+    /// itself, after calling this).
+    private func teardownOpenVideoSession() {
+        guard let session = openVideoSession else { return }
+        session.onStateChange = nil
+        openVideoFrameView?.onSessionEnded = nil
+        session.stop()
+        openVideoSession = nil
+        openVideoFrameView = nil
     }
 
     /// `.succeeded` and `.failed` share this shape structurally (hold for
@@ -272,6 +533,20 @@ final class OverlayWindowController {
         // `StatusItemController.scheduleStillTryingCheck()`.
         cancelPendingResolve()
         guard panel != nil else { return }
+
+        // gateopener-12h.6: a video session in flight for THIS open owns
+        // the panel's fate from here — see the `openVideoSession` doc
+        // comment above. Scheduling the normal hold-then-fade here would
+        // hide the panel out from under live video that has not even
+        // started streaming yet (or has, and is nowhere near its ~28-30s
+        // natural end). `isResolveFadePending` is deliberately left
+        // `false` in this branch: that flag exists to stop `.idle`/
+        // `.needsSetup` from truncating a hold-then-fade THIS method
+        // scheduled, and no such sequence is scheduled here, so leaving it
+        // `false` is correct, not an oversight — `handleIdleOrNeedsSetup()`
+        // has its own, separate `openVideoSession != nil` guard for this
+        // same case.
+        guard openVideoSession == nil else { return }
 
         isResolveFadePending = true
         pendingResolveTask = Task { [weak self] in
@@ -303,6 +578,15 @@ final class OverlayWindowController {
     /// immediate hide so the overlay never outlives the state machine.
     private func handleIdleOrNeedsSetup() {
         guard !isResolveFadePending else { return }
+        // gateopener-12h.6: same rationale as the guard in
+        // `handleResolved(holdDuration:)` above — while a video session is
+        // in flight for the current open, only that session's own end
+        // signal (`handleOpenVideoSessionEnded()`) may hide the panel.
+        // `GateState` typically reaches `.idle` (via `GateController`'s
+        // auto-reset) well before the ~28-30s video session is anywhere
+        // near over; hiding here would cut the live feed off almost as
+        // soon as it started.
+        guard openVideoSession == nil else { return }
         guard panel != nil else { return }
         panel?.alphaValue = 1
         hide()

@@ -158,6 +158,7 @@ echo "==> Done."
 echo "    ${APP_NAME}.app is installed at: ${DEST_BUNDLE}"
 echo "    Launched from /Applications."
 echo ""
-echo "    Note: because the app is ad-hoc signed and just moved to a new path," \
-     "macOS may prompt for Keychain access the first time it runs from here." \
-     "That prompt is expected, not a bug."
+echo "    Note: if this build's code signature differs from the one macOS last" \
+     "approved, it may prompt once for Keychain access. With a stable Developer" \
+     "ID identity that happens at most once; ad-hoc builds re-prompt on every" \
+     "rebuild, because their identity is derived from the binary's own hash."

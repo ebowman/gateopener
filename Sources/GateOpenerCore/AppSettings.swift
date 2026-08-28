@@ -25,13 +25,14 @@ public final class AppSettings: @unchecked Sendable {
         static let lastDiscoveryDate = "ie.boboco.GateOpener.lastDiscoveryDate"
         static let shortcutPreference = "ie.boboco.GateOpener.shortcutPreference"
         static let showOpenConfirmationOverlay = "ie.boboco.GateOpener.showOpenConfirmationOverlay"
+        static let autoShowDoorVideoOnOpen = "ie.boboco.GateOpener.autoShowDoorVideoOnOpen"
 
         /// All keys owned by `AppSettings`. Used by `reset()` so unrelated
         /// UserDefaults keys (e.g. from other parts of the app, or the test
         /// suite) are never touched.
         static let all = [
             aptId, selectedEndpointId, selectedEndpointName, lastDiscoveryDate, shortcutPreference,
-            showOpenConfirmationOverlay,
+            showOpenConfirmationOverlay, autoShowDoorVideoOnOpen,
         ]
     }
 
@@ -102,9 +103,9 @@ public final class AppSettings: @unchecked Sendable {
     /// shown after a successful open. Defaults to `true` — the overlay is
     /// the whole point of the feature.
     ///
-    /// This is distinct from (and must not be confused with) a later,
-    /// separate preference for auto-playing the live door camera on open
-    /// (expected name: `autoShowDoorVideoOnOpen`). This property governs
+    /// This is distinct from (and must not be confused with)
+    /// `autoShowDoorVideoOnOpen` below, the separate preference for
+    /// auto-playing the live door camera on open. This property governs
     /// only the canned confirmation animation.
     public var showOpenConfirmationOverlay: Bool {
         get {
@@ -118,6 +119,43 @@ public final class AppSettings: @unchecked Sendable {
                 : defaults.bool(forKey: Keys.showOpenConfirmationOverlay)
         }
         set { defaults.set(newValue, forKey: Keys.showOpenConfirmationOverlay) }
+    }
+
+    /// Whether opening the gate also starts a LIVE door-camera video session
+    /// in the confirmation overlay (bead gateopener-12h.6), alongside the
+    /// canned confirmation animation `showOpenConfirmationOverlay` above
+    /// governs. Defaults to `true` — this is the behavior the user asked
+    /// for verbatim ("I get a 'session' of live video so I can see the gate
+    /// opening"), so it must work out of the box with no configuration.
+    ///
+    /// DELIBERATELY A SEPARATE PREFERENCE from `showOpenConfirmationOverlay`,
+    /// not a reuse of it: a live video session runs for the door's full
+    /// ~28-30s natural session length (see `DoorVideoSession`/
+    /// `DoorVideoFrameView`'s plateau detector), which is a much bigger
+    /// on-screen commitment than the confirmation overlay's ~1.45s
+    /// hold+fade. A user may reasonably want the instant "yes, it opened"
+    /// confirmation on every single open (keep
+    /// `showOpenConfirmationOverlay` on) without also getting a ~30-second
+    /// video panel on screen every time (turn `autoShowDoorVideoOnOpen`
+    /// off) — folding these into one toggle would remove that choice.
+    /// Turning `showOpenConfirmationOverlay` off does NOT imply turning
+    /// this off too: a user could in principle want live video without the
+    /// canned animation, though in practice `OverlayWindowController`
+    /// always shows the canned animation first (video arrives ~4-6s later
+    /// and needs somewhere to land) — see that type's `handle(_:)`.
+    public var autoShowDoorVideoOnOpen: Bool {
+        get {
+            // Same absent-key-means-true handling as
+            // `showOpenConfirmationOverlay` above, and for the same reason:
+            // `UserDefaults.bool(forKey:)`'s `false`-for-absent-key default
+            // would silently ship this feature OFF for every user who has
+            // never touched the toggle, which is the opposite of the
+            // required default.
+            defaults.object(forKey: Keys.autoShowDoorVideoOnOpen) == nil
+                ? true
+                : defaults.bool(forKey: Keys.autoShowDoorVideoOnOpen)
+        }
+        set { defaults.set(newValue, forKey: Keys.autoShowDoorVideoOnOpen) }
     }
 
     /// True if and only if a non-empty `selectedEndpointId` is present.

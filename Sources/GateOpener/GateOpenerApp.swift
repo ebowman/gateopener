@@ -34,6 +34,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// immediately above): without a strong reference the panel would be
     /// deallocated and never appear.
     private var overlayWindowController: OverlayWindowController!
+    /// "View door" (bead gateopener-12h.5): a SEPARATE overlay/session
+    /// controller from `overlayWindowController` above — see
+    /// `DoorVideoOverlayController`'s doc comment for why the two must never
+    /// share a panel. Retained as a stored property for the same reason as
+    /// `overlayWindowController`: without a strong reference here it would
+    /// be deallocated and "View door" would silently do nothing. `nil` under
+    /// `GATEOPENER_MOCK=1` (see the property's assignment below).
+    private var doorVideoOverlayController: DoorVideoOverlayController!
     private var hasAutoOpenedSettings = false
     /// Set only under `GATEOPENER_MOCK=1`, so the self-test path can read
     /// call counts directly without `GateController` needing to expose its
@@ -57,6 +65,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var appSettings: AppSettings!
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // THROWAWAY hardware-verification path for gateopener-12h.3 — NOT
+        // part of the normal app flow, gated behind an env var a real user
+        // will never set. Exercises DoorVideoSession against the real
+        // Comelit API/door camera and prints getStats() results, then
+        // exits. Candidate for removal once gateopener-12h.4/.5 add a real
+        // UI entry point that exercises the same code path.
+        if ProcessInfo.processInfo.environment["GATEOPENER_VERIFY_DOOR_VIDEO"] == "1" {
+            Task { await Self.runDoorVideoVerificationAndExit() }
+            return
+        }
+
+        // EXPERIMENT for gateopener-12h.8, option (c): identical in spirit
+        // to GATEOPENER_VERIFY_DOOR_VIDEO above (THROWAWAY, env-var gated,
+        // never part of normal app flow), but hosts `contentView` in a
+        // panel configured EXACTLY like OverlayWindowController's
+        // (non-activating, never key) and asks whether captureFrameJpeg()
+        // can pull real pixels out of the hidden canvas anyway. See that
+        // method's doc comment for the full experiment writeup.
+        if ProcessInfo.processInfo.environment["GATEOPENER_VERIFY_PANEL_CAPTURE"] == "1" {
+            Task { await Self.runPanelCaptureExperimentAndExit() }
+            return
+        }
+
         // Must happen before any window is shown (the Settings window can
         // auto-open below on `.needsSetup`) so the Edit menu exists the
         // first time a text field becomes first responder. See
@@ -67,13 +98,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         MainMenu.install()
 
         var appSettingsForLaunch: AppSettings?
-        let controller = Self.makeGateController(mockOut: &mockGateOpeningForSelfTest, appSettingsOut: &appSettingsForLaunch)
+        var doorVideoDependenciesForLaunch: (tokenManager: TokenManager, gateClient: GateClient)?
+        let controller = Self.makeGateController(
+            mockOut: &mockGateOpeningForSelfTest,
+            appSettingsOut: &appSettingsForLaunch,
+            doorVideoDependenciesOut: &doorVideoDependenciesForLaunch
+        )
         self.appSettings = appSettingsForLaunch
         let observable = GateControllerObservable(controller: controller)
         self.observable = observable
         GateControllerObservable.appShared = observable
 
-        let statusItemController = StatusItemController(observable: observable)
+        // "View door" (bead gateopener-12h.5): only constructed when the
+        // real (non-mock) dependency graph produced concrete
+        // TokenManager/GateClient instances — DoorVideoSession requires
+        // those concrete types (not the `any GateOpening`/`any
+        // TokenResolving` existentials GateController itself stores), and
+        // GATEOPENER_MOCK=1 never constructs them (see makeGateController's
+        // mock branch). `makeSession` returns a FRESH DoorVideoSession every
+        // call — DoorVideoOverlayController never reuses one across "View
+        // door" selections (see that type's doc comment).
+        let doorVideoOverlayController: DoorVideoOverlayController?
+        if let doorVideoDependenciesForLaunch, let appSettingsForLaunch {
+            doorVideoOverlayController = DoorVideoOverlayController(appSettings: appSettingsForLaunch) {
+                DoorVideoSession(
+                    tokenManager: doorVideoDependenciesForLaunch.tokenManager,
+                    gateClient: doorVideoDependenciesForLaunch.gateClient
+                )
+            }
+        } else {
+            doorVideoOverlayController = nil
+        }
+        self.doorVideoOverlayController = doorVideoOverlayController
+
+        let statusItemController = StatusItemController(observable: observable, doorVideoOverlayController: doorVideoOverlayController)
         self.statusItemController = statusItemController
 
         guard statusItemController.install() else {
@@ -101,7 +159,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // (this genuinely differs under `GATEOPENER_MOCK=1`, which uses a
         // throwaway suite), which would make the Settings toggle appear
         // broken. `ignoresMouseEvents` is left at its default (`true`).
-        let overlayWindowController = OverlayWindowController(appSettings: appSettings)
+        //
+        // `makeDoorVideoSession` (bead gateopener-12h.6): the SAME
+        // factory shape/dependency-availability check as
+        // `doorVideoOverlayController` immediately above — only offered
+        // when the real (non-mock) dependency graph produced concrete
+        // `TokenManager`/`GateClient` instances, `nil` otherwise (mock
+        // mode). Deliberately a SEPARATE closure/session from "View door"'s
+        // `doorVideoOverlayController`, even though both build a
+        // `DoorVideoSession` the same way: the two features run
+        // independently (a "View door" session and an open-triggered
+        // session must never share or interfere with one another), so
+        // each gets its own fresh `DoorVideoSession` per call, never a
+        // shared instance.
+        let overlayWindowController: OverlayWindowController
+        if let doorVideoDependenciesForLaunch {
+            overlayWindowController = OverlayWindowController(appSettings: appSettings) {
+                DoorVideoSession(
+                    tokenManager: doorVideoDependenciesForLaunch.tokenManager,
+                    gateClient: doorVideoDependenciesForLaunch.gateClient
+                )
+            }
+        } else {
+            overlayWindowController = OverlayWindowController(appSettings: appSettings)
+        }
         self.overlayWindowController = overlayWindowController
 
         // Global hotkey (bead gateopener-iif.2): mirrors
@@ -184,6 +265,543 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if ProcessInfo.processInfo.environment["GATEOPENER_MOCK_SELFTEST"] == "1" {
             runSelfTestAndExit()
         }
+
+        // THROWAWAY hardware-verification path for gateopener-12h.5's
+        // done-criteria — NOT part of normal app flow, gated behind an env
+        // var a real user will never set. Unlike
+        // GATEOPENER_VERIFY_DOOR_VIDEO/GATEOPENER_VERIFY_PANEL_CAPTURE
+        // above, this one runs AFTER the full real (non-mock) launch
+        // sequence completes, so it exercises the REAL StatusItemController/
+        // DoorVideoOverlayController the menu bar icon actually uses — the
+        // whole point is to observe the real "View Door" menu-item action
+        // dispatch end to end (gateopener-9kk.12 lesson: observe, don't
+        // argue that a menu path works), not a reimplementation of it.
+        if ProcessInfo.processInfo.environment["GATEOPENER_VERIFY_VIEW_DOOR_MENU"] == "1" {
+            Task { await self.runViewDoorMenuVerificationAndExit() }
+        }
+
+        // THROWAWAY hardware-verification path for gateopener-12h.6's
+        // done-criteria — see runOpenVideoVerificationAndExit()'s doc
+        // comment. Select the trigger under test with
+        // GATEOPENER_VERIFY_OPEN_VIDEO_TRIGGER=leftclick|menu|hotkey.
+        if ProcessInfo.processInfo.environment["GATEOPENER_VERIFY_OPEN_VIDEO"] == "1" {
+            Task { await self.runOpenVideoVerificationAndExit() }
+        }
+    }
+
+    /// THROWAWAY hardware-verification path for gateopener-12h.5's
+    /// done-criteria: proves, by observation, that (1) the real "View Door"
+    /// menu item exists and its action reaches `DoorVideoOverlayController.
+    /// start()` (via `StatusItemController.invokeViewDoorForVerification()`,
+    /// which builds and dispatches the REAL `NSMenu`'s real target/action —
+    /// see that method's doc comment), (2) a connecting state is visible
+    /// before the first frame, (3) the panel disappears at session end via
+    /// the plateau detector, and (4) no gate-open call is ever made along
+    /// this path. Prints a machine-checkable summary and the overlay panel's
+    /// screen rect (mirroring `runDoorVideoVerificationAndExit()`'s own
+    /// `screencapture -R`-ready rect line) so a screenshot can be taken and
+    /// LOOKED AT while the panel is showing live frames — printing "got a
+    /// frame" is not evidence, only a decoded, inspected image is.
+    private func runViewDoorMenuVerificationAndExit() async {
+        guard mockGateOpeningForSelfTest == nil else {
+            // GATEOPENER_MOCK=1 never constructs a doorVideoOverlayController
+            // (see makeGateController's mock branch) — this path is only
+            // meaningful against the real, non-mock dependency graph.
+            print("VERIFYMENU FAIL: running under GATEOPENER_MOCK=1; \"View Door\" would not even be in the menu. Run without GATEOPENER_MOCK.")
+            exit(1)
+        }
+
+        // (1) Prove the menu item exists and reaches DoorVideoOverlayController
+        // via the REAL NSMenuItem target/action dispatch, not a direct call.
+        let invoked = statusItemController.invokeViewDoorForVerification()
+        print("VERIFYMENU \"View Door\" menu item found and invoked: \(invoked)")
+        guard invoked else {
+            print("VERIFYMENU FAIL: \"View Door\" item missing from the real menu")
+            exit(1)
+        }
+
+        // (2) A connecting state must be visible immediately — the overlay
+        // panel this bead added is a SEPARATE OverlayWindowController from
+        // the confirmation-overlay one, so print ITS screen rect (not
+        // reachable via `overlayWindowController`) for a human/agent to
+        // screenshot and LOOK AT while frames are arriving.
+        try? await Task.sleep(for: .milliseconds(300))
+        if let screenFrame = NSScreen.main?.frame {
+            let visible = NSScreen.main!.visibleFrame
+            let size = OverlayWindowController.panelSize
+            let x = visible.maxX - size.width - 16
+            let y = visible.maxY - size.height - 16
+            let flippedY = screenFrame.height - y - size.height
+            print("VERIFYMENU overlay panel rect for screencapture: \(Int(x)),\(Int(flippedY)),\(Int(size.width)),\(Int(size.height))")
+        } else {
+            print("VERIFYMENU overlay panel rect for screencapture: <no screen>")
+        }
+
+        // Give the human/agent time to screenshot the connecting state,
+        // then real frames, then observe the panel disappear at session
+        // end. Extendable via GATEOPENER_VERIFY_VIEW_DOOR_MENU_DWELL_MS
+        // (default 45s: comfortably past the measured ~28-30s session
+        // length plus this view's plateau detector).
+        let dwellMs = ProcessInfo.processInfo.environment["GATEOPENER_VERIFY_VIEW_DOOR_MENU_DWELL_MS"]
+            .flatMap { UInt64($0) } ?? 45_000
+        print("VERIFYMENU dwelling \(dwellMs)ms for observation (screenshot the panel now)...")
+        try? await Task.sleep(nanoseconds: dwellMs * 1_000_000)
+
+        print("VERIFYMENU done dwelling; exiting")
+        exit(0)
+    }
+
+    /// THROWAWAY hardware-verification path for gateopener-12h.6's
+    /// done-criteria: proves, by observation, that opening the gate via ONE
+    /// of the three real production triggers — selected by
+    /// `GATEOPENER_VERIFY_OPEN_VIDEO_TRIGGER` ("leftclick" | "menu" |
+    /// "hotkey") — (1) shows the confirmation overlay immediately with the
+    /// canned animation, (2) swaps to live video once the first frame
+    /// arrives, and (3) the overlay disappears at the video session's
+    /// natural end (the plateau detector), all driven purely through
+    /// `GateState`/`OverlayWindowController.handle(_:)` with NO per-trigger
+    /// branching in that type — this harness only choreographs WHICH real
+    /// production entry point fires the SAME `openGate()` call, exactly as
+    /// `runViewDoorMenuVerificationAndExit()` above does for "View Door".
+    /// Prints a machine-checkable summary and the confirmation-overlay
+    /// panel's screen rect for a human/agent to screenshot and LOOK AT
+    /// while live frames are showing (gateopener-9kk.12 lesson: observe,
+    /// never argue).
+    private func runOpenVideoVerificationAndExit() async {
+        guard mockGateOpeningForSelfTest == nil else {
+            print("VERIFYOPEN FAIL: running under GATEOPENER_MOCK=1; no real DoorVideoSession dependency graph exists. Run without GATEOPENER_MOCK.")
+            exit(1)
+        }
+
+        let trigger = ProcessInfo.processInfo.environment["GATEOPENER_VERIFY_OPEN_VIDEO_TRIGGER"] ?? "leftclick"
+        print("VERIFYOPEN trigger: \(trigger)")
+
+        switch trigger {
+        case "leftclick":
+            // Real production left-click path: a synthesized real NSEvent
+            // through statusItemClicked(_:), same as the self-test uses.
+            statusItemController.simulateClickForSelfTest(rightClick: false)
+        case "menu":
+            // Real production "Open Gate" NSMenuItem target/action dispatch
+            // — see StatusItemController.invokeOpenGateForVerification()'s
+            // doc comment for why this matters (gateopener-9kk.12).
+            let invoked = statusItemController.invokeOpenGateForVerification()
+            print("VERIFYOPEN \"Open Gate\" menu item found and invoked: \(invoked)")
+            guard invoked else {
+                print("VERIFYOPEN FAIL: \"Open Gate\" item missing from the real menu")
+                exit(1)
+            }
+        case "hotkey":
+            // Real production global-hotkey closure (registered via
+            // globalHotkey.apply(...) in applicationDidFinishLaunching),
+            // invoked directly rather than via a synthesized system-wide
+            // keystroke — see GlobalHotkey.invokeHandlerForSelfTest()'s doc
+            // comment; this is the same call the self-test uses.
+            globalHotkey.invokeHandlerForSelfTest()
+        case "rapid":
+            // gateopener-12h.6 done-criteria: "rapid repeated opens do not
+            // stack sessions or panels". Fires the real left-click path
+            // twice, a couple seconds apart (comfortably before the first
+            // open's video reaches .streaming, ~4-6s in) — the second open
+            // must replace the first open's session/panel, never stack a
+            // second one alongside it. OverlayWindowController.
+            // startOpenVideoSessionIfEnabled() logs a notice when this
+            // replace path is taken; grep the unified log for it to
+            // confirm.
+            statusItemController.simulateClickForSelfTest(rightClick: false)
+            try? await Task.sleep(for: .seconds(2))
+            print("VERIFYOPEN firing second rapid open now")
+            statusItemController.simulateClickForSelfTest(rightClick: false)
+        default:
+            print("VERIFYOPEN FAIL: unknown trigger '\(trigger)'; expected leftclick|menu|hotkey|rapid")
+            exit(1)
+        }
+
+        // The confirmation overlay must appear essentially immediately
+        // (canned animation, covering the gap before live video arrives).
+        try? await Task.sleep(for: .milliseconds(300))
+        if let screenFrame = NSScreen.main?.frame {
+            let visible = NSScreen.main!.visibleFrame
+            let size = OverlayWindowController.panelSize
+            let x = visible.maxX - size.width - 16
+            let y = visible.maxY - size.height - 16
+            let flippedY = screenFrame.height - y - size.height
+            print("VERIFYOPEN overlay panel rect for screencapture: \(Int(x)),\(Int(flippedY)),\(Int(size.width)),\(Int(size.height))")
+        } else {
+            print("VERIFYOPEN overlay panel rect for screencapture: <no screen>")
+        }
+
+        // Give the human/agent time to screenshot the canned animation,
+        // then live frames once they arrive (~4-6s in), then observe the
+        // panel disappear at session end (~28-30s of streaming later).
+        // Extendable via GATEOPENER_VERIFY_OPEN_VIDEO_DWELL_MS (default
+        // 45s, mirroring GATEOPENER_VERIFY_VIEW_DOOR_MENU_DWELL_MS's own
+        // rationale).
+        let dwellMs = ProcessInfo.processInfo.environment["GATEOPENER_VERIFY_OPEN_VIDEO_DWELL_MS"]
+            .flatMap { UInt64($0) } ?? 45_000
+        print("VERIFYOPEN dwelling \(dwellMs)ms for observation (screenshot the panel now)...")
+        try? await Task.sleep(nanoseconds: dwellMs * 1_000_000)
+
+        print("VERIFYOPEN done dwelling; exiting")
+        exit(0)
+    }
+
+    /// THROWAWAY hardware-verification path for gateopener-12h.3's
+    /// done-criteria: establishes ONE real `DoorVideoSession` against the
+    /// real Comelit API and door camera, waits for `.streaming`, fetches
+    /// `getVideoStats()` from the page, prints the result, then calls
+    /// `stop()` and exits. Never calls `GateClient.open` — only
+    /// `rtc/offer`, which starts a video session and opens nothing.
+    ///
+    /// Uses the SAME construction path as `makeGateController`'s real
+    /// (non-mock) branch, so this is the production auth/discovery code,
+    /// not a reimplementation.
+    ///
+    /// gateopener-12h.8 ROOT CAUSE (verified empirically by isolating each
+    /// variable independently — see bd memory
+    /// `gateopener-12h-8-root-cause-wkwebview-refuses-to` for the full
+    /// record): `WKWebView` does not paint ANY content — not even the
+    /// page's own background color, let alone decoded video — unless it is
+    /// hosted in a window that is or becomes KEY.
+    ///  - Hosting in a window that is never added/ordered front at all: no
+    ///    paint (the original bug — `contentView`'s own doc comment used
+    ///    to, wrongly, call this "fine").
+    ///  - Hosting in `OverlayWindowController`'s exact panel recipe
+    ///    (`styleMask: [.borderless, .nonactivatingPanel]`,
+    ///    `isFloatingPanel`, `.statusBar` level, `orderFrontRegardless()`):
+    ///    still no paint, because `.nonactivatingPanel` makes the panel
+    ///    structurally UNABLE to ever become key — confirmed even after
+    ///    adding `NSApp.activate(ignoringOtherApps:)` and even calling
+    ///    `makeKeyAndOrderFront(_:)` on it directly (a no-op on a
+    ///    non-activating panel).
+    ///  - Removing ONLY `.nonactivatingPanel` (same borderless/floating/
+    ///    statusBar panel, same frame, same everything else) and calling
+    ///    `makeKeyAndOrderFront(_:)` instead of `orderFrontRegardless()`:
+    ///    paints real decoded video immediately.
+    /// `.accessory` activation policy and `NSApp.activate(...)` were tested
+    /// and ruled out independently — neither one, alone or combined, made
+    /// a `.nonactivatingPanel` paint. Key-window status is what mattered.
+    ///
+    /// CONSTRAINT THIS PUTS ON gateopener-12h.5: `OverlayWindowController`'s
+    /// panel is deliberately, permanently non-activating/non-key (see that
+    /// type's doc comment — the confirmation HUD must never steal keyboard
+    /// focus). `DoorVideoSession.contentView` cannot simply be dropped into
+    /// that SAME panel via `setContent(_:)` and expect to paint. 12h.5 will
+    /// need either a separate, key-capable window/panel for live video
+    /// (accepting that it may steal focus, unlike the HUD), or a way to
+    /// grant JUST the video panel key status without disturbing the rest of
+    /// the app's focus model (e.g. a distinct panel that CAN become key,
+    /// still `isFloatingPanel`/`.statusBar` for stacking, shown only for
+    /// the deliberate "View door" action rather than a passive HUD) — this
+    /// needs a real design decision, not a copy-paste of the HUD panel.
+    ///
+    /// This harness therefore hosts `contentView` in an ordinary titled,
+    /// closable `NSWindow` (which naturally becomes key via
+    /// `makeKeyAndOrderFront(_:)`) — the simplest faithful proof that the
+    /// paint problem is fixed, not a preview of 12h.5's eventual chrome.
+    private static func runDoorVideoVerificationAndExit() async {
+        let credentialStore = KeychainCredentialStore()
+        let api = ComelitAPI()
+        let tokenManager = TokenManager(api: api, credentialStore: credentialStore)
+        let gateClient = GateClient(tokenManager: tokenManager)
+
+        let t0 = Date()
+        let session = DoorVideoSession(tokenManager: tokenManager, gateClient: gateClient)
+        session.onStateChange = { state in
+            let elapsedMs = Int(Date().timeIntervalSince(t0) * 1000)
+            print("VERIFY [\(elapsedMs)ms] state=\(state)")
+        }
+
+        // Host `contentView` in a real, titled, CLOSABLE window and make it
+        // key BEFORE start() so the WKWebView actually composites for the
+        // whole session (not just once streaming begins) — see the
+        // gateopener-12h.8 root-cause note above: `makeKeyAndOrderFront(_:)`
+        // is load-bearing here, NOT merely `orderFrontRegardless()`.
+        // `.closable` + a real title bar means the human running this
+        // verification can dismiss the window with the standard close
+        // button rather than having to kill the process.
+        let hostWindow = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: false
+        )
+        hostWindow.title = "Door Camera (verification)"
+        hostWindow.contentView?.wantsLayer = true
+        if let hostContentView = hostWindow.contentView {
+            session.contentView.frame = hostContentView.bounds
+            session.contentView.autoresizingMask = [.width, .height]
+            hostContentView.addSubview(session.contentView)
+        }
+        // Positioned top-trailing on the main screen, matching where
+        // `OverlayWindowController` anchors its own panel (16pt from the
+        // top-right of `visibleFrame`) -- purely so a human watching this
+        // verification run sees the window somewhere sane, NOT because
+        // this harness's window is a preview of 12h.5's production
+        // chrome (it explicitly is not; see the doc comment above).
+        if let screen = NSScreen.main {
+            let visible = screen.visibleFrame
+            let size = hostWindow.frame.size
+            let origin = NSPoint(x: visible.maxX - size.width - 16, y: visible.maxY - size.height - 16)
+            hostWindow.setFrameOrigin(origin)
+        }
+        // NSApp.activate(ignoringOtherApps:) + makeKeyAndOrderFront(_:) --
+        // BOTH needed. This deliberately steals keyboard focus, which is
+        // fine for a human explicitly running this verification path but
+        // would be WRONG for a passive HUD (see the root-cause note above
+        // on why this constrains 12h.5's design).
+        NSApp.activate(ignoringOtherApps: true)
+        hostWindow.makeKeyAndOrderFront(nil)
+
+        await session.start()
+
+        // Poll up to 20s for .streaming (mirrors the spike harness's
+        // deadline), then fetch stats regardless of outcome so a failure
+        // still prints diagnosable state.
+        let deadline = Date().addingTimeInterval(20)
+        while session.state != .streaming, Date() < deadline {
+            if case .failed = session.state { break }
+            try? await Task.sleep(nanoseconds: 300_000_000)
+        }
+
+        let firstFrameElapsedMs = Int(Date().timeIntervalSince(t0) * 1000)
+        print("VERIFY time-to-first-frame-or-give-up = \(firstFrameElapsedMs)ms, final state = \(session.state)")
+
+        // Always dump getVideoStats() and getState() to stdout regardless
+        // of final state, for diagnosability -- unified logging (os.Logger)
+        // truncates long messages, stdout does not.
+        if let raw = try? await session.contentView.callAsyncJavaScript(
+            "return await window.getVideoStats();",
+            contentWorld: .page
+        ), let jsonStr = raw as? String {
+            print("VERIFY stats: \(jsonStr)")
+        } else {
+            print("VERIFY stats: <could not fetch>")
+        }
+        if let raw = try? await session.contentView.callAsyncJavaScript(
+            "return window.getState ? JSON.stringify(window.getState()) : null;",
+            contentWorld: .page
+        ), let jsonStr = raw as? String {
+            print("VERIFY full state: \(jsonStr)")
+        }
+
+        // Capture success BEFORE stop() -- stop() unconditionally
+        // transitions .streaming to .ended("stopped"), so checking
+        // session.state after stop() would always report failure even on
+        // a successful run.
+        let reachedStreaming = session.state == .streaming
+
+        // gateopener-12h.8: print the on-screen frame of `hostWindow` so a
+        // caller can `screencapture -x -R <rect>` it and LOOK at the actual
+        // pixels -- this is the whole point of the bead, and printing the
+        // rect here means no guessing/hardcoding screen coordinates.
+        if let screenFrame = hostWindow.screen?.frame {
+            let windowFrame = hostWindow.frame
+            // Flip AppKit's bottom-left-origin frame to the top-left-origin
+            // rect `screencapture -R` expects.
+            let flippedY = screenFrame.height - windowFrame.origin.y - windowFrame.height
+            print("VERIFY window rect for screencapture: \(Int(windowFrame.origin.x)),\(Int(flippedY)),\(Int(windowFrame.width)),\(Int(windowFrame.height))")
+        } else {
+            print("VERIFY window rect for screencapture: <no screen>")
+        }
+        // Give the window server a moment to composite the latest decoded
+        // frame before anything captures the screen. Extendable via
+        // GATEOPENER_VERIFY_DOOR_VIDEO_DWELL_MS (default 500ms) purely to
+        // give a human/screencapture more time to grab a frame while
+        // manually confirming gateopener-12h.8's done-criteria; production
+        // behavior (and the default when unset) is unchanged.
+        let dwellMs = ProcessInfo.processInfo.environment["GATEOPENER_VERIFY_DOOR_VIDEO_DWELL_MS"]
+            .flatMap { UInt64($0) } ?? 500
+        try? await Task.sleep(nanoseconds: dwellMs * 1_000_000)
+
+        session.stop()
+        // Give stop()'s fire-and-forget closeSession() a moment to run
+        // before the process exits.
+        try? await Task.sleep(nanoseconds: 500_000_000)
+        // Explicitly close the host window rather than relying on process
+        // exit to remove it -- proves the window is genuinely closable
+        // (gateopener-12h.8 follow-up: the human running this must be able
+        // to dismiss the video window without killing the process) and
+        // matches how an embedder would tear this down on a real "close"
+        // action rather than app termination.
+        hostWindow.close()
+        exit(reachedStreaming ? 0 : 1)
+    }
+
+    /// EXPERIMENT for gateopener-12h.8, option (c) — answers ONE question:
+    /// does `captureFrameJpeg()` (a hidden-`<canvas>` frame grab, ported
+    /// from `../comelit/comelit/webrtc_page.html` into `door-video.html`)
+    /// produce real pixels when `DoorVideoSession.contentView` is hosted in
+    /// a panel that is structurally incapable of ever becoming key — i.e.
+    /// the EXACT panel recipe `OverlayWindowController` uses. See bd memory
+    /// `gateopener-12h-8-root-cause-wkwebview-refuses-to` (corrected
+    /// version) for why this question matters: a WKWebView must become key
+    /// ONCE to start compositing, and `.nonactivatingPanel` makes that
+    /// structurally impossible, so the confirmation-overlay panel can never
+    /// host a plain `<video>` element. This experiment tests whether canvas
+    /// capture sidesteps that requirement entirely, since the reference
+    /// Python app never displays its `<video>` on screen either — it only
+    /// ever reads frames out via canvas.
+    ///
+    /// Deliberately NEVER calls `makeKeyAndOrderFront(_:)` or
+    /// `NSApp.activate(...)` anywhere in this method — the whole point is
+    /// to prove (or disprove) capture WITHOUT ever granting key status.
+    /// Uses `orderFrontRegardless()` only, exactly like
+    /// `OverlayWindowController.show()`.
+    ///
+    /// THROWAWAY: gated behind an env var a real user will never set, not
+    /// part of normal app flow, candidate for removal once this bead's
+    /// production decision is made (see the bead's write-up for the
+    /// eventual disposition).
+    private static func runPanelCaptureExperimentAndExit() async {
+        let credentialStore = KeychainCredentialStore()
+        let api = ComelitAPI()
+        let tokenManager = TokenManager(api: api, credentialStore: credentialStore)
+        let gateClient = GateClient(tokenManager: tokenManager)
+
+        let t0 = Date()
+        let session = DoorVideoSession(tokenManager: tokenManager, gateClient: gateClient)
+        session.onStateChange = { state in
+            let elapsedMs = Int(Date().timeIntervalSince(t0) * 1000)
+            print("PANELCAP [\(elapsedMs)ms] state=\(state)")
+        }
+
+        // Panel configuration copied EXACTLY from
+        // OverlayWindowController.resolvePanel()/show() -- styleMask,
+        // isFloatingPanel, level, backgroundColor, isOpaque, hasShadow,
+        // hidesOnDeactivate, collectionBehavior, and the show mechanism
+        // (orderFrontRegardless() only) all match. Deliberately duplicated
+        // here rather than reusing OverlayWindowController/OverlayPanel
+        // directly, since those types are private to this file's target
+        // and this experiment must not touch production wiring.
+        let panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: true
+        )
+        panel.isFloatingPanel = true
+        panel.level = .statusBar
+        panel.backgroundColor = .clear
+        panel.isOpaque = false
+        panel.hasShadow = true
+        panel.hidesOnDeactivate = false
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+
+        let hostContentView = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: 240))
+        hostContentView.wantsLayer = true
+        panel.contentView = hostContentView
+
+        session.contentView.frame = hostContentView.bounds
+        session.contentView.autoresizingMask = [.width, .height]
+        hostContentView.addSubview(session.contentView)
+
+        if let screen = NSScreen.main {
+            let visible = screen.visibleFrame
+            let size = panel.frame.size
+            let origin = NSPoint(x: visible.maxX - size.width - 16, y: visible.maxY - size.height - 16)
+            panel.setFrameOrigin(origin)
+        }
+
+        // orderFrontRegardless() ONLY -- see the doc comment above. NEVER
+        // makeKeyAndOrderFront(_:), NEVER NSApp.activate(...).
+        panel.orderFrontRegardless()
+
+        await session.start()
+
+        let deadline = Date().addingTimeInterval(20)
+        while session.state != .streaming, Date() < deadline {
+            if case .failed = session.state { break }
+            try? await Task.sleep(nanoseconds: 300_000_000)
+        }
+
+        let elapsedMs = Int(Date().timeIntervalSince(t0) * 1000)
+        print("PANELCAP time-to-streaming-or-give-up = \(elapsedMs)ms, final state = \(session.state)")
+
+        guard session.state == .streaming else {
+            print("PANELCAP FAIL: never reached .streaming")
+            session.stop()
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            exit(1)
+        }
+
+        // Give the panel a moment before capturing -- mirrors
+        // GATEOPENER_VERIFY_DOOR_VIDEO_DWELL_MS's rationale, though here
+        // nothing on-screen is being screenshotted; this only gives the
+        // decoder a little longer to accumulate frames before the first
+        // capture attempt.
+        try? await Task.sleep(nanoseconds: 500_000_000)
+
+        // Log videoWidth/videoHeight/framesDecoded BEFORE attempting
+        // capture, so a null/failed capture can be distinguished as "no
+        // frames arriving" vs "frames arriving but canvas is blank".
+        if let raw = try? await session.contentView.callAsyncJavaScript(
+            "return await window.getVideoStats();",
+            contentWorld: .page
+        ), let jsonStr = raw as? String {
+            print("PANELCAP stats: \(jsonStr)")
+        }
+        if let raw = try? await session.contentView.callAsyncJavaScript(
+            "return window.getState ? JSON.stringify(window.getState()) : null;",
+            contentWorld: .page
+        ), let jsonStr = raw as? String {
+            print("PANELCAP full state: \(jsonStr)")
+        }
+
+        // The capture itself: window.captureFrameJpeg() via
+        // callAsyncJavaScript (NEVER evaluateJavaScript -- see
+        // DoorVideoSession's GOTCHA doc comment; it is a synchronous
+        // function but callAsyncJavaScript is used uniformly here to match
+        // this file's established pattern for all page calls).
+        var dataURL: String?
+        do {
+            let raw = try await session.contentView.callAsyncJavaScript(
+                "return window.captureFrameJpeg ? window.captureFrameJpeg(0.85) : null;",
+                contentWorld: .page
+            )
+            dataURL = raw as? String
+        } catch {
+            print("PANELCAP captureFrameJpeg() threw: \(error)")
+        }
+
+        if dataURL == nil {
+            print("PANELCAP RESULT: captureFrameJpeg() returned null -- video.videoWidth/videoHeight are 0, canvas capture is ALSO gated on the same signal that never populates in this WKWebView context. Option (c) FAILS.")
+            session.stop()
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            exit(1)
+        }
+
+        // Decode the base64 JPEG data URL and write it to a PNG file so a
+        // human/agent can LOOK at the actual pixels. Never report success
+        // without having looked at decoded pixels -- printing "got a data
+        // URL" is not evidence; only the decoded image is.
+        let outputPath = ProcessInfo.processInfo.environment["GATEOPENER_VERIFY_PANEL_CAPTURE_OUTPUT"]
+            ?? "/tmp/gateopener-panelcap-frame.png"
+        guard let dataURL,
+              let commaIndex = dataURL.firstIndex(of: ","),
+              let jpegData = Data(base64Encoded: String(dataURL[dataURL.index(after: commaIndex)...])),
+              let image = NSBitmapImageRep(data: jpegData),
+              let pngData = image.representation(using: .png, properties: [:]) else {
+            print("PANELCAP RESULT: captureFrameJpeg() returned a non-empty string but it could not be decoded as a JPEG (data URL malformed or NSBitmapImageRep failed). Treating as FAIL.")
+            session.stop()
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            exit(1)
+        }
+
+        do {
+            try pngData.write(to: URL(fileURLWithPath: outputPath))
+            print("PANELCAP RESULT: captureFrameJpeg() decoded successfully, \(image.pixelsWide)x\(image.pixelsHigh) pixels, written to \(outputPath). LOOK AT THIS FILE to confirm it shows the real door camera scene before declaring option (c) a success.")
+        } catch {
+            print("PANELCAP RESULT: decoded image but failed to write PNG to \(outputPath): \(error)")
+            session.stop()
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            exit(1)
+        }
+
+        session.stop()
+        try? await Task.sleep(nanoseconds: 500_000_000)
+        panel.orderOut(nil)
+        exit(0)
     }
 
     /// Verification path for the bead .8 done-criteria: proves, via the
@@ -716,7 +1334,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     ///   can read `shortcutPreference` at launch (bead gateopener-3vq.2)
     ///   without `GateController` needing to expose its private
     ///   `appSettings` property.
-    private static func makeGateController(mockOut: inout MockGateOpening?, appSettingsOut: inout AppSettings?) -> GateController {
+    /// - Parameter doorVideoDependenciesOut: written with the concrete
+    ///   `TokenManager`/`GateClient` pair in real (non-mock) mode only —
+    ///   `DoorVideoSession.init` requires those CONCRETE types, not the
+    ///   `any GateOpening`/`any TokenResolving` existentials
+    ///   `GateController` stores privately, so this is the only seam that
+    ///   can hand them to `applicationDidFinishLaunching` for constructing a
+    ///   `DoorVideoOverlayController` (bead gateopener-12h.5). Left `nil`
+    ///   under `GATEOPENER_MOCK=1`, where no concrete instances of either
+    ///   type are ever constructed — this is exactly the signal
+    ///   `applicationDidFinishLaunching` uses to skip building a
+    ///   `DoorVideoOverlayController`/"View door" menu item at all under
+    ///   mock mode, rather than presenting a menu item that would always
+    ///   fail.
+    private static func makeGateController(
+        mockOut: inout MockGateOpening?,
+        appSettingsOut: inout AppSettings?,
+        doorVideoDependenciesOut: inout (tokenManager: TokenManager, gateClient: GateClient)?
+    ) -> GateController {
         let isMock = ProcessInfo.processInfo.environment["GATEOPENER_MOCK"] == "1"
 
         if isMock {
@@ -768,6 +1403,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let api = ComelitAPI()
         let tokenManager = TokenManager(api: api, credentialStore: credentialStore)
         let gateClient = GateClient(tokenManager: tokenManager)
+        doorVideoDependenciesOut = (tokenManager: tokenManager, gateClient: gateClient)
 
         return GateController(
             gateClient: gateClient,
