@@ -94,16 +94,26 @@ swift test
 
 ## Release flow (maintainers)
 
-Producing a distributable release is a four-stage pipeline:
+Producing and publishing a distributable release is a four-stage pipeline:
 
 ```bash
 scripts/build-app.sh        # build + sign GateOpener.app
 scripts/make-dmg.sh         # package it into a signed DMG
 scripts/notarize-dmg.sh     # submit to Apple, wait, staple the ticket
+make release                # generate the update manifest and publish
 ```
 
-followed by publishing a GitHub release (tag, DMG asset, and an update
-manifest for the self-updater).
+`make release` (`scripts/publish-release.sh`) tags the current commit,
+generates the stable-named `appcast.json` update manifest describing the
+just-built DMG (its `dmgSHA256` is computed from that exact DMG file, so it
+can never describe a different binary), and publishes both the DMG and the
+manifest as GitHub Release assets via `gh release create`. It refuses to run
+unless every precondition holds — no git remote named `origin`, a dirty
+working tree, an already-existing `v<version>` tag, or a DMG that isn't
+notarized all fail fast with a specific, actionable message naming which
+check failed. It is **not** part of `make`'s default target, so a bare
+`make` or `make all` never publishes anything; only running `make release`
+deliberately does.
 
 This requires, on the machine doing the release:
 
@@ -115,8 +125,11 @@ This requires, on the machine doing the release:
   `NOTARY_KEY` / `NOTARY_KEY_ID` / `NOTARY_ISSUER` environment variables
   pointing at an App Store Connect API key. Neither the key file, key ID,
   nor issuer ID are ever printed, logged, or committed by this script.
-- `gh` authenticated (`gh auth login`) against this repository, to publish
-  the release and upload the DMG asset.
+- `gh` authenticated (`gh auth login`) against this repository, plus a git
+  remote named `origin` pointing at it, to publish the release and upload
+  the DMG and manifest assets. `make release` derives the GitHub owner and
+  repo from `origin`'s URL (SSH or HTTPS) rather than a hardcoded value, so
+  a fork or rename works without editing anything.
 
 Contributors without any of the above can still build, run, and test the app
 completely — none of this is required to work on the code.
