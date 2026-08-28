@@ -207,6 +207,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Uses the SAME construction path as `makeGateController`'s real
     /// (non-mock) branch, so this is the production auth/discovery code,
     /// not a reimplementation.
+    ///
+    /// gateopener-12h.8 ROOT CAUSE (verified empirically by isolating each
+    /// variable independently — see bd memory
+    /// `gateopener-12h-8-root-cause-wkwebview-refuses-to` for the full
+    /// record): `WKWebView` does not paint ANY content — not even the
+    /// page's own background color, let alone decoded video — unless it is
+    /// hosted in a window that is or becomes KEY.
+    ///  - Hosting in a window that is never added/ordered front at all: no
+    ///    paint (the original bug — `contentView`'s own doc comment used
+    ///    to, wrongly, call this "fine").
+    ///  - Hosting in `OverlayWindowController`'s exact panel recipe
+    ///    (`styleMask: [.borderless, .nonactivatingPanel]`,
+    ///    `isFloatingPanel`, `.statusBar` level, `orderFrontRegardless()`):
+    ///    still no paint, because `.nonactivatingPanel` makes the panel
+    ///    structurally UNABLE to ever become key — confirmed even after
+    ///    adding `NSApp.activate(ignoringOtherApps:)` and even calling
+    ///    `makeKeyAndOrderFront(_:)` on it directly (a no-op on a
+    ///    non-activating panel).
+    ///  - Removing ONLY `.nonactivatingPanel` (same borderless/floating/
+    ///    statusBar panel, same frame, same everything else) and calling
+    ///    `makeKeyAndOrderFront(_:)` instead of `orderFrontRegardless()`:
+    ///    paints real decoded video immediately.
+    /// `.accessory` activation policy and `NSApp.activate(...)` were tested
+    /// and ruled out independently — neither one, alone or combined, made
+    /// a `.nonactivatingPanel` paint. Key-window status is what mattered.
+    ///
+    /// CONSTRAINT THIS PUTS ON gateopener-12h.5: `OverlayWindowController`'s
+    /// panel is deliberately, permanently non-activating/non-key (see that
+    /// type's doc comment — the confirmation HUD must never steal keyboard
+    /// focus). `DoorVideoSession.contentView` cannot simply be dropped into
+    /// that SAME panel via `setContent(_:)` and expect to paint. 12h.5 will
+    /// need either a separate, key-capable window/panel for live video
+    /// (accepting that it may steal focus, unlike the HUD), or a way to
+    /// grant JUST the video panel key status without disturbing the rest of
+    /// the app's focus model (e.g. a distinct panel that CAN become key,
+    /// still `isFloatingPanel`/`.statusBar` for stacking, shown only for
+    /// the deliberate "View door" action rather than a passive HUD) — this
+    /// needs a real design decision, not a copy-paste of the HUD panel.
+    ///
+    /// This harness therefore hosts `contentView` in an ordinary titled,
+    /// closable `NSWindow` (which naturally becomes key via
+    /// `makeKeyAndOrderFront(_:)`) — the simplest faithful proof that the
+    /// paint problem is fixed, not a preview of 12h.5's eventual chrome.
     private static func runDoorVideoVerificationAndExit() async {
         let credentialStore = KeychainCredentialStore()
         let api = ComelitAPI()
@@ -219,6 +262,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let elapsedMs = Int(Date().timeIntervalSince(t0) * 1000)
             print("VERIFY [\(elapsedMs)ms] state=\(state)")
         }
+
+        // Host `contentView` in a real, titled, CLOSABLE window and make it
+        // key BEFORE start() so the WKWebView actually composites for the
+        // whole session (not just once streaming begins) — see the
+        // gateopener-12h.8 root-cause note above: `makeKeyAndOrderFront(_:)`
+        // is load-bearing here, NOT merely `orderFrontRegardless()`.
+        // `.closable` + a real title bar means the human running this
+        // verification can dismiss the window with the standard close
+        // button rather than having to kill the process.
+        let hostWindow = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 320, height: 240),
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: false
+        )
+        hostWindow.title = "Door Camera (verification)"
+        hostWindow.contentView?.wantsLayer = true
+        if let hostContentView = hostWindow.contentView {
+            session.contentView.frame = hostContentView.bounds
+            session.contentView.autoresizingMask = [.width, .height]
+            hostContentView.addSubview(session.contentView)
+        }
+        // Positioned top-trailing on the main screen, matching where
+        // `OverlayWindowController` anchors its own panel (16pt from the
+        // top-right of `visibleFrame`) -- purely so a human watching this
+        // verification run sees the window somewhere sane, NOT because
+        // this harness's window is a preview of 12h.5's production
+        // chrome (it explicitly is not; see the doc comment above).
+        if let screen = NSScreen.main {
+            let visible = screen.visibleFrame
+            let size = hostWindow.frame.size
+            let origin = NSPoint(x: visible.maxX - size.width - 16, y: visible.maxY - size.height - 16)
+            hostWindow.setFrameOrigin(origin)
+        }
+        // NSApp.activate(ignoringOtherApps:) + makeKeyAndOrderFront(_:) --
+        // BOTH needed. This deliberately steals keyboard focus, which is
+        // fine for a human explicitly running this verification path but
+        // would be WRONG for a passive HUD (see the root-cause note above
+        // on why this constrains 12h.5's design).
+        NSApp.activate(ignoringOtherApps: true)
+        hostWindow.makeKeyAndOrderFront(nil)
 
         await session.start()
 
@@ -258,10 +342,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // a successful run.
         let reachedStreaming = session.state == .streaming
 
+        // gateopener-12h.8: print the on-screen frame of `hostWindow` so a
+        // caller can `screencapture -x -R <rect>` it and LOOK at the actual
+        // pixels -- this is the whole point of the bead, and printing the
+        // rect here means no guessing/hardcoding screen coordinates.
+        if let screenFrame = hostWindow.screen?.frame {
+            let windowFrame = hostWindow.frame
+            // Flip AppKit's bottom-left-origin frame to the top-left-origin
+            // rect `screencapture -R` expects.
+            let flippedY = screenFrame.height - windowFrame.origin.y - windowFrame.height
+            print("VERIFY window rect for screencapture: \(Int(windowFrame.origin.x)),\(Int(flippedY)),\(Int(windowFrame.width)),\(Int(windowFrame.height))")
+        } else {
+            print("VERIFY window rect for screencapture: <no screen>")
+        }
+        // Give the window server a moment to composite the latest decoded
+        // frame before anything captures the screen. Extendable via
+        // GATEOPENER_VERIFY_DOOR_VIDEO_DWELL_MS (default 500ms) purely to
+        // give a human/screencapture more time to grab a frame while
+        // manually confirming gateopener-12h.8's done-criteria; production
+        // behavior (and the default when unset) is unchanged.
+        let dwellMs = ProcessInfo.processInfo.environment["GATEOPENER_VERIFY_DOOR_VIDEO_DWELL_MS"]
+            .flatMap { UInt64($0) } ?? 500
+        try? await Task.sleep(nanoseconds: dwellMs * 1_000_000)
+
         session.stop()
         // Give stop()'s fire-and-forget closeSession() a moment to run
         // before the process exits.
         try? await Task.sleep(nanoseconds: 500_000_000)
+        // Explicitly close the host window rather than relying on process
+        // exit to remove it -- proves the window is genuinely closable
+        // (gateopener-12h.8 follow-up: the human running this must be able
+        // to dismiss the video window without killing the process) and
+        // matches how an embedder would tear this down on a real "close"
+        // action rather than app termination.
+        hostWindow.close()
         exit(reachedStreaming ? 0 : 1)
     }
 

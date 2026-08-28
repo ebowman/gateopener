@@ -159,10 +159,18 @@ public final class DoorVideoSession: NSObject {
         self.session = session
 
         let config = WKWebViewConfiguration()
-        // Offscreen/hidden is fine per the bead — this type does not manage
-        // window placement; whatever embeds `contentView` (a later bead)
-        // owns that. A minimal non-zero frame avoids a degenerate 0x0
-        // layout before the embedder resizes it.
+        // A minimal non-zero frame avoids a degenerate 0x0 layout before the
+        // embedder resizes it. This type does NOT manage window placement —
+        // whatever embeds `contentView` owns that — but embedding into a
+        // REAL, ordered-front window (or a window-hosted, layer-backed view
+        // hierarchy, e.g. `OverlayWindowController.setContent(_:)`) is NOT
+        // optional: gateopener-12h.8 found, verified against real hardware,
+        // that a `WKWebView` never added to a window decodes RTP
+        // (framesDecoded > 0 in `pc.getStats()`) but never composites a
+        // single pixel to its `<video>` element (videoWidth/videoHeight
+        // stay 0). The embedder MUST add `contentView` to a window (or a
+        // view hierarchy already in a window) and order that window front
+        // BEFORE relying on the stream painting anything visible.
         self.contentView = WKWebView(frame: NSRect(x: 0, y: 0, width: 320, height: 240), configuration: config)
 
         super.init()
