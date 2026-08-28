@@ -80,9 +80,51 @@ final class OverlayWindowController {
     /// below); a future live-camera feature calls this same method with an
     /// `RTCMTLNSVideoView` (or similar) instead, touching no other part of
     /// this type.
+    ///
+    /// gateopener-12h.2: swapping content into an ALREADY-VISIBLE panel must
+    /// start the incoming content and stop the outgoing content, exactly as
+    /// `show()`/`hide()` would, even though neither of those is called here.
+    /// Without this, content swapped in after the panel is already on screen
+    /// (e.g. show a "connecting" placeholder, then swap in the live video
+    /// once frames arrive) never receives `overlayWillShow()` and sits frozen
+    /// — for video, a black tile that looks like a WebRTC failure rather than
+    /// the lifecycle bug it actually is.
+    ///
+    /// - The OUTGOING view's `overlayDidHide()` fires first (only when the
+    ///   panel is visible and content is actually being replaced, not
+    ///   installed for the first time), so a swapped-out player pauses rather
+    ///   than continuing to decode off-screen.
+    /// - The INCOMING view's `overlayWillShow()` fires only when the panel
+    ///   both exists and `isVisible`. When the panel is not visible yet, a
+    ///   later `show()` call is what delivers that hook — firing it here too
+    ///   would double-fire it.
+    /// - Re-setting the SAME view is a no-op: neither hook fires. A same-view
+    ///   re-set is not a transition, and firing `overlayWillShow()` alone
+    ///   (unpaired with a `overlayDidHide()`) would restart a video from
+    ///   frame zero. Callers that swap content on state changes can
+    ///   legitimately re-set the view they already installed.
+    /// - No reordering/re-positioning/re-presenting of the panel happens
+    ///   here: this method only ever touches content-view lifecycle hooks,
+    ///   never `orderFrontRegardless()`/`position(_:on:)`.
     func setContent(_ view: NSView) {
+        let outgoing = currentContent()
+        let isPanelVisible = panel?.isVisible ?? false
+
         pendingContent = view
         panel?.installContent(view)
+
+        guard isPanelVisible else { return }
+
+        // Re-setting the SAME view is a genuine no-op, not a transition.
+        // Without this guard `overlayWillShow()` would fire unpaired (no
+        // matching `overlayDidHide()`), which for a video view means
+        // seek(.zero) + play() — silently restarting the stream from the
+        // beginning. The live-camera code swaps content on state changes
+        // and can legitimately re-set the view it already installed.
+        guard outgoing !== view else { return }
+
+        (outgoing as? OverlayShowHideResponding)?.overlayDidHide()
+        (view as? OverlayShowHideResponding)?.overlayWillShow()
     }
 
     private var pendingContent: NSView?
