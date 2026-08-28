@@ -23,3 +23,10 @@ Resources/AppIcon.icns
 .env
 .env.*
 !.env.example
+*.p8
+*.pem
+*.p12
+*.cer
+.comelit_token.json
+*_token.json
+*token_cache*
