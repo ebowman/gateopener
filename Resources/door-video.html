@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html>
+<head><title>comelit door camera</title></head>
+<body style="margin:0;background:#000">
+<video id="v" autoplay playsinline muted style="width:100%;height:100%;background:#222"></video>
+<script>
+// Drives ONE WebRTC session against the Comelit door camera, via WKWebView.
+// This is a stripped-down copy of ../comelit/comelit/webrtc_page.html
+// (itself the source for the proven scratchpad/webrtc-spike harness): the
+// stale-frame watchdog and renegotiation machinery have been DELIBERATELY
+// removed. DoorVideoSession (Swift) establishes exactly one session and
+// never renegotiates -- see the gateopener-12h epic and bd memories
+// gateopener-yjn-spike-result-wkwebview-webkit-s-own /
+// gateopener-yjn-spike-addendum-answers-to-a-follow for why this recipe
+// (recvonly transceivers, audio before video, non-trickle ICE, pre-resolved
+// STUN IPs injected by Swift) is load-bearing and must not be improvised.
+
+window.__state = {
+  pc: null,
+  offerReady: false,
+  offerSdp: null,
+  ontrackFired: false,
+  hasVideoFrame: false,
+  log: [],
+};
+
+function logMsg(msg) {
+  const line = `[${new Date().toISOString()}] ${msg}`;
+  window.__state.log.push(line);
+  if (window.__state.log.length > 200) {
+    window.__state.log.splice(0, window.__state.log.length - 200);
+  }
+  console.log(line);
+}
+
+// Builds the RTCPeerConnection, wires up ontrack and the recvonly
+// audio+video transceivers (audio first -- the door's answer generation is
+// m-line-order sensitive), creates the offer, and waits for non-trickle ICE
+// gathering to complete. Called exactly once per page load.
+async function negotiate() {
+  window.__state.offerReady = false;
+  window.__state.offerSdp = null;
+  window.__state.hasVideoFrame = false;
+
+  // Comelit's own STUN server, pre-resolved to an IP and injected by Swift
+  // as window.__ICE_SERVERS__ BEFORE this script runs -- a bare mDNS-only
+  // host candidate is rejected by the door station's signaling backend, and
+  // resolving the STUN hostname from inside the page is unreliable. Falls
+  // back to the hostname form only if that injection did not happen
+  // (should not occur in normal operation).
+  const iceServerUrls = (window.__ICE_SERVERS__ && window.__ICE_SERVERS__.length)
+    ? window.__ICE_SERVERS__
+    : ["stun:stun.cloud.comelitgroup.com:3478"];
+  const pc = new RTCPeerConnection({
+    iceServers: [{ urls: iceServerUrls }],
+    iceCandidatePoolSize: 0,
+  });
+  logMsg("Created RTCPeerConnection with comelit STUN server(s): " + JSON.stringify(iceServerUrls));
+  window.__state.pc = pc;
+
+  pc.oniceconnectionstatechange = () => logMsg("iceConnectionState=" + pc.iceConnectionState);
+  pc.onconnectionstatechange = () => logMsg("connectionState=" + pc.connectionState);
+  pc.onsignalingstatechange = () => logMsg("signalingState=" + pc.signalingState);
+  pc.onicegatheringstatechange = () => logMsg("iceGatheringState=" + pc.iceGatheringState);
+  pc.onicecandidateerror = (e) => logMsg("iceCandidateError: " + JSON.stringify({errorCode: e.errorCode, errorText: e.errorText, url: e.url}));
+
+  pc.ontrack = (event) => {
+    window.__state.ontrackFired = true;
+    logMsg("ontrack fired, kind=" + event.track.kind + " id=" + event.track.id);
+    if (event.track.kind === "video") {
+      const video = document.getElementById("v");
+      if (event.streams && event.streams[0]) {
+        video.srcObject = event.streams[0];
+      } else {
+        video.srcObject = new MediaStream([event.track]);
+      }
+      video.play().catch(err => logMsg("video.play() error: " + err));
+      if (video.requestVideoFrameCallback) {
+        const onFrame = () => {
+          if (!window.__state.hasVideoFrame) {
+            logMsg("first video frame natural size: " + video.videoWidth + "x" + video.videoHeight);
+          }
+          window.__state.hasVideoFrame = true;
+          video.requestVideoFrameCallback(onFrame);
+        };
+        video.requestVideoFrameCallback(onFrame);
+      }
+    }
+  };
+
+  // audio first, then video, to match the real app's SDP m-line order (the
+  // door station's answer generation is order-sensitive against the offer).
+  pc.addTransceiver('audio', { direction: 'recvonly' });
+  pc.addTransceiver('video', { direction: 'recvonly' });
+  pc.createDataChannel('data');
+
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  logMsg("setLocalDescription done, waiting for ICE gathering complete...");
+
+  await new Promise((resolve) => {
+    if (pc.iceGatheringState === 'complete') {
+      resolve();
+      return;
+    }
+    const check = () => {
+      if (pc.iceGatheringState === 'complete') {
+        pc.removeEventListener('icegatheringstatechange', check);
+        resolve();
+      }
+    };
+    pc.addEventListener('icegatheringstatechange', check);
+    // Safety timeout in case gathering never completes.
+    setTimeout(resolve, 8000);
+  });
+
+  logMsg("ICE gathering complete (or timed out), offer ready");
+  window.__state.offerSdp = pc.localDescription.sdp;
+  window.__state.offerReady = true;
+}
+
+// Called from Swift once the answer SDP is obtained from the Comelit rtc/
+// offer API (the PUT itself happens in Swift so the bearer token never
+// reaches page JS).
+window.applyAnswer = async function (answerSdp) {
+  const pc = window.__state.pc;
+  await pc.setRemoteDescription({ type: 'answer', sdp: answerSdp });
+  logMsg("setRemoteDescription(answer) done, signalingState=" + pc.signalingState);
+  return true;
+};
+
+// Entry point Swift calls to start the (only) negotiation cycle for this
+// session, returning the non-trickle offer SDP for Swift to PUT to
+// rtc/offer with a new sessionId.
+window.startNegotiation = async function () {
+  await negotiate();
+  return window.__state.offerSdp;
+};
+
+window.getState = function () {
+  const pc = window.__state.pc;
+  const video = document.getElementById("v");
+  return {
+    iceConnectionState: pc ? pc.iceConnectionState : null,
+    connectionState: pc ? pc.connectionState : null,
+    signalingState: pc ? pc.signalingState : null,
+    ontrackFired: window.__state.ontrackFired,
+    hasVideoFrame: window.__state.hasVideoFrame,
+    videoWidth: video.videoWidth,
+    videoHeight: video.videoHeight,
+    log: window.__state.log,
+  };
+};
+
+// Fetches pc.getStats(), summarized to exactly the fields DoorVideoSession
+// needs (packetsReceived/framesDecoded/framesReceived for video,
+// packetsReceived for audio).
+window.getVideoStats = async function () {
+  const pc = window.__state.pc;
+  if (!pc) return JSON.stringify({error: 'no pc'});
+  const stats = await pc.getStats();
+  let video = {packetsReceived: 0, framesDecoded: 0, framesReceived: 0};
+  let audio = {packetsReceived: 0};
+  stats.forEach((report) => {
+    if (report.type === 'inbound-rtp' && report.kind === 'video') {
+      video.packetsReceived = report.packetsReceived || 0;
+      video.framesDecoded = report.framesDecoded || 0;
+      video.framesReceived = report.framesReceived || 0;
+    }
+    if (report.type === 'inbound-rtp' && report.kind === 'audio') {
+      audio.packetsReceived = report.packetsReceived || 0;
+    }
+  });
+  return JSON.stringify({video, audio});
+};
+
+// Tears down the RTCPeerConnection. Idempotent: safe to call even if no
+// session was ever started, or if called more than once.
+window.closeSession = function () {
+  const pc = window.__state.pc;
+  if (pc) {
+    try {
+      pc.close();
+    } catch (err) {
+      logMsg("error closing RTCPeerConnection: " + err);
+    }
+  }
+  window.__state.pc = null;
+  const video = document.getElementById("v");
+  video.srcObject = null;
+  return true;
+};
+</script>
+</body>
+</html>

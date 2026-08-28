@@ -36,6 +36,9 @@ ICON_NAME="AppIcon"
 OVERLAY_VIDEO="${REPO_ROOT}/Resources/gate-open.mp4"
 OVERLAY_VIDEO_NAME="gate-open.mp4"
 
+DOOR_VIDEO_PAGE="${REPO_ROOT}/Resources/door-video.html"
+DOOR_VIDEO_PAGE_NAME="door-video.html"
+
 echo "==> Building ${APP_NAME} (release)..."
 swift build -c release --package-path "${REPO_ROOT}"
 
@@ -60,6 +63,11 @@ if [ ! -f "${OVERLAY_VIDEO}" ]; then
     exit 1
 fi
 
+if [ ! -f "${DOOR_VIDEO_PAGE}" ]; then
+    echo "error: door camera WebRTC page not found at ${DOOR_VIDEO_PAGE}." >&2
+    exit 1
+fi
+
 echo "==> Assembling ${APP_NAME}.app (removing any stale bundle first)..."
 rm -rf "${APP_BUNDLE}"
 mkdir -p "${MACOS_DIR}" "${RESOURCES_DIR}"
@@ -67,6 +75,7 @@ mkdir -p "${MACOS_DIR}" "${RESOURCES_DIR}"
 cp "${RELEASE_BIN}" "${MACOS_DIR}/${APP_NAME}"
 cp "${ICON_ICNS}" "${RESOURCES_DIR}/${ICON_NAME}.icns"
 cp "${OVERLAY_VIDEO}" "${RESOURCES_DIR}/${OVERLAY_VIDEO_NAME}"
+cp "${DOOR_VIDEO_PAGE}" "${RESOURCES_DIR}/${DOOR_VIDEO_PAGE_NAME}"
 
 cat > "${CONTENTS_DIR}/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

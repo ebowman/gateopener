@@ -57,6 +57,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var appSettings: AppSettings!
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // THROWAWAY hardware-verification path for gateopener-12h.3 — NOT
+        // part of the normal app flow, gated behind an env var a real user
+        // will never set. Exercises DoorVideoSession against the real
+        // Comelit API/door camera and prints getStats() results, then
+        // exits. Candidate for removal once gateopener-12h.4/.5 add a real
+        // UI entry point that exercises the same code path.
+        if ProcessInfo.processInfo.environment["GATEOPENER_VERIFY_DOOR_VIDEO"] == "1" {
+            Task { await Self.runDoorVideoVerificationAndExit() }
+            return
+        }
+
         // Must happen before any window is shown (the Settings window can
         // auto-open below on `.needsSetup`) so the Edit menu exists the
         // first time a text field becomes first responder. See
@@ -184,6 +195,61 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if ProcessInfo.processInfo.environment["GATEOPENER_MOCK_SELFTEST"] == "1" {
             runSelfTestAndExit()
         }
+    }
+
+    /// THROWAWAY hardware-verification path for gateopener-12h.3's
+    /// done-criteria: establishes ONE real `DoorVideoSession` against the
+    /// real Comelit API and door camera, waits for `.streaming`, fetches
+    /// `getVideoStats()` from the page, prints the result, then calls
+    /// `stop()` and exits. Never calls `GateClient.open` — only
+    /// `rtc/offer`, which starts a video session and opens nothing.
+    ///
+    /// Uses the SAME construction path as `makeGateController`'s real
+    /// (non-mock) branch, so this is the production auth/discovery code,
+    /// not a reimplementation.
+    private static func runDoorVideoVerificationAndExit() async {
+        let credentialStore = KeychainCredentialStore()
+        let api = ComelitAPI()
+        let tokenManager = TokenManager(api: api, credentialStore: credentialStore)
+        let gateClient = GateClient(tokenManager: tokenManager)
+
+        let t0 = Date()
+        let session = DoorVideoSession(tokenManager: tokenManager, gateClient: gateClient)
+        session.onStateChange = { state in
+            let elapsedMs = Int(Date().timeIntervalSince(t0) * 1000)
+            print("VERIFY [\(elapsedMs)ms] state=\(state)")
+        }
+
+        await session.start()
+
+        // Poll up to 20s for .streaming (mirrors the spike harness's
+        // deadline), then fetch stats regardless of outcome so a failure
+        // still prints diagnosable state.
+        let deadline = Date().addingTimeInterval(20)
+        while session.state != .streaming, Date() < deadline {
+            if case .failed = session.state { break }
+            try? await Task.sleep(nanoseconds: 300_000_000)
+        }
+
+        let firstFrameElapsedMs = Int(Date().timeIntervalSince(t0) * 1000)
+        print("VERIFY time-to-first-frame-or-give-up = \(firstFrameElapsedMs)ms, final state = \(session.state)")
+
+        if session.state == .streaming {
+            if let raw = try? await session.contentView.callAsyncJavaScript(
+                "return await window.getVideoStats();",
+                contentWorld: .page
+            ), let jsonStr = raw as? String {
+                print("VERIFY stats: \(jsonStr)")
+            } else {
+                print("VERIFY stats: <could not fetch>")
+            }
+        }
+
+        session.stop()
+        // Give stop()'s fire-and-forget closeSession() a moment to run
+        // before the process exits.
+        try? await Task.sleep(nanoseconds: 500_000_000)
+        exit(session.state == .streaming ? 0 : 1)
     }
 
     /// Verification path for the bead .8 done-criteria: proves, via the
