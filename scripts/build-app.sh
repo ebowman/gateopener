@@ -116,8 +116,30 @@ cat > "${CONTENTS_DIR}/Info.plist" <<PLIST
 </plist>
 PLIST
 
-echo "==> Ad-hoc code-signing ${APP_NAME}.app..."
-codesign --force --deep --sign - "${APP_BUNDLE}"
+# Prefer a STABLE signing identity over ad-hoc. An ad-hoc signature
+# (`--sign -`) derives the app's identity from its own hash, so it changes
+# on EVERY rebuild and macOS treats each build as a different application
+# — invalidating any keychain "Always Allow" grant and re-prompting for the
+# Comelit credentials every single time. A Developer ID identity is keyed
+# on identifier + team, so one grant survives all future rebuilds.
+#
+# Overridable via CODESIGN_IDENTITY; auto-detected otherwise; falls back to
+# ad-hoc so contributors without an Apple certificate can still build.
+if [ -z "${CODESIGN_IDENTITY:-}" ]; then
+    CODESIGN_IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null \
+        | sed -n 's/.*"\(Developer ID Application: .*\)"/\1/p' | head -1)"
+fi
+
+if [ -n "${CODESIGN_IDENTITY}" ]; then
+    echo "==> Code-signing ${APP_NAME}.app with: ${CODESIGN_IDENTITY}"
+    codesign --force --deep --sign "${CODESIGN_IDENTITY}" --timestamp=none "${APP_BUNDLE}"
+else
+    echo "==> Ad-hoc code-signing ${APP_NAME}.app (no Developer ID identity found)..."
+    echo "    NOTE: ad-hoc identity changes on every rebuild, so macOS will"
+    echo "    re-prompt for keychain access after each build. Set"
+    echo "    CODESIGN_IDENTITY, or install a Developer ID certificate, to stop that."
+    codesign --force --deep --sign - "${APP_BUNDLE}"
+fi
 
 echo "==> Verifying signature..."
 codesign -dv "${APP_BUNDLE}"
