@@ -192,6 +192,10 @@ final class StatusItemController: NSObject {
         aboutItem.target = self
         menu.addItem(aboutItem)
 
+        let checkForUpdatesItem = NSMenuItem(title: "Check for Updates…", action: #selector(menuCheckForUpdates), keyEquivalent: "")
+        checkForUpdatesItem.target = self
+        menu.addItem(checkForUpdatesItem)
+
         menu.addItem(.separator())
 
         let quitItem = NSMenuItem(title: "Quit", action: #selector(menuQuit), keyEquivalent: "q")
@@ -241,6 +245,10 @@ final class StatusItemController: NSObject {
         alert.addButton(withTitle: "OK")
         NSApp.activate(ignoringOtherApps: true)
         alert.runModal()
+    }
+
+    @objc private func menuCheckForUpdates() {
+        UpdateChecker.checkForUpdates()
     }
 
     @objc private func menuQuit() {
