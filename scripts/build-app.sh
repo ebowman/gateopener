@@ -179,7 +179,15 @@ source "${SCRIPT_DIR}/lib/resolve-codesign-identity.sh"
 
 if [ -n "${CODESIGN_IDENTITY}" ]; then
     echo "==> Code-signing ${APP_NAME}.app with: ${CODESIGN_IDENTITY}"
-    codesign --force --deep --sign "${CODESIGN_IDENTITY}" --timestamp=none "${APP_BUNDLE}"
+    # Hardened runtime + a secure (networked) timestamp are both REQUIRED
+    # for notarization (see scripts/notarize-dmg.sh, bead gateopener-c33.3)
+    # — Apple's notary service rejects a Developer ID-signed binary that
+    # lacks either with "does not include a secure timestamp" / "does not
+    # have the hardened runtime enabled". Only applied on the Developer ID
+    # path: the ad-hoc fallback below can never be notarized anyway, so
+    # there's no reason to pay for a network round trip to Apple's
+    # timestamp server on that path.
+    codesign --force --deep --sign "${CODESIGN_IDENTITY}" --timestamp --options runtime "${APP_BUNDLE}"
 else
     echo "==> Ad-hoc code-signing ${APP_NAME}.app (no Developer ID identity found)..."
     echo "    NOTE: ad-hoc identity changes on every rebuild, so macOS will"

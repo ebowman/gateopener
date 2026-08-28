@@ -121,12 +121,20 @@ hdiutil create \
     -ov \
     "${DMG_PATH}"
 
+# Explicit, stable identifier rather than the filename-derived default.
+# codesign otherwise derives the identifier from the DMG's filename and
+# TRUNCATES it at the first dot (e.g. "GateOpener-0.1.0.dmg" becomes
+# "GateOpener-0"), which is harmless for local signing but notarization
+# is stricter about it. Keep this fixed across versions so the DMG's
+# identity doesn't change release to release.
+DMG_IDENTIFIER="ie.boboco.GateOpener.dmg"
+
 if [ -n "${CODESIGN_IDENTITY}" ]; then
     echo "==> Code-signing ${DMG_NAME} with: ${CODESIGN_IDENTITY}"
-    codesign --force --sign "${CODESIGN_IDENTITY}" --timestamp=none "${DMG_PATH}"
+    codesign --force --sign "${CODESIGN_IDENTITY}" --identifier "${DMG_IDENTIFIER}" --timestamp=none "${DMG_PATH}"
 else
     echo "==> Ad-hoc code-signing ${DMG_NAME} (ALLOW_ADHOC_DMG=1; local testing only)..."
-    codesign --force --sign - "${DMG_PATH}"
+    codesign --force --sign - --identifier "${DMG_IDENTIFIER}" "${DMG_PATH}"
 fi
 
 echo "==> Verifying DMG signature..."
