@@ -21,12 +21,58 @@ CONTENTS_DIR="${APP_BUNDLE}/Contents"
 MACOS_DIR="${CONTENTS_DIR}/MacOS"
 RESOURCES_DIR="${CONTENTS_DIR}/Resources"
 
-# Version: a fixed short version for now (bump by hand as releases happen),
-# plus a build number derived from git so two builds from different commits
-# are distinguishable. Falls back to "0" if git metadata is unavailable
-# (e.g. building from a tarball with no .git directory), so the script
-# never fails outright over an unavailable build number.
-SHORT_VERSION="0.1.0"
+# Version: SINGLE AUTHORITATIVE SOURCE is the repo-root VERSION file (bump
+# it by hand as releases happen). Everything else — this script's
+# Info.plist, the eventual git tag, DMG filename, and update-manifest
+# latestVersion — must be derived FROM the built bundle (see
+# scripts/read-app-version.sh), never from a second hardcoded literal, so
+# they cannot silently disagree.
+#
+# CFBundleVersion (the build number) is derived from git commit count, which
+# is reproducible and always increases as commits land, so macOS reliably
+# treats a later build as newer even when CFBundleShortVersionString is
+# unchanged between two builds. Falls back to "0" if git metadata is
+# unavailable (e.g. building from a source tarball with no .git directory),
+# so the script never fails outright over an unavailable build number.
+VERSION_FILE="${REPO_ROOT}/VERSION"
+if [ ! -f "${VERSION_FILE}" ]; then
+    echo "error: VERSION file not found at ${VERSION_FILE}" >&2
+    exit 1
+fi
+# Trim leading/trailing whitespace ONLY — deliberately not `tr -d`, which
+# strips interior whitespace too and would silently turn "1. 2.0" (or a
+# value with an embedded newline) into a valid-looking "1.2.0". The updater
+# performs no such normalization, so anything the build quietly repairs here
+# is a version the two sides could disagree about.
+SHORT_VERSION="$(<"${VERSION_FILE}")"
+SHORT_VERSION="${SHORT_VERSION#"${SHORT_VERSION%%[![:space:]]*}"}"
+SHORT_VERSION="${SHORT_VERSION%"${SHORT_VERSION##*[![:space:]]}"}"
+
+# Guard: fail loudly on an unversionable value rather than produce a bundle
+# whose version cannot be meaningfully ordered. Mirrors the updater's
+# fail-closed SemanticVersion (Sources/GateOpenerCore/UpdateManifest.swift):
+# 1 to 4 dot-separated non-negative integer components, nothing else.
+if ! [[ "${SHORT_VERSION}" =~ ^[0-9]+(\.[0-9]+){0,3}$ ]]; then
+    echo "error: VERSION file contains an invalid version string: '${SHORT_VERSION}'" >&2
+    echo "       expected 1-4 dot-separated non-negative integers, e.g. 1.2.0" >&2
+    exit 1
+fi
+
+# Each component must also fit in Int64, because SemanticVersion parses via
+# Swift's Int(_:) and returns nil on overflow. A bundle whose version the
+# updater cannot parse fails CLOSED — users would simply never be offered an
+# update again, silently. 18 digits is comfortably under Int64.max and far
+# beyond any real version number.
+IFS='.' read -r -a _version_components <<< "${SHORT_VERSION}"
+for _component in "${_version_components[@]}"; do
+    if [ "${#_component}" -gt 18 ]; then
+        echo "error: VERSION component '${_component}' is too large to parse as an integer." >&2
+        echo "       The updater would silently stop offering updates. Keep components under 19 digits." >&2
+        exit 1
+    fi
+done
+unset _version_components _component
+
 BUILD_NUMBER="$(git -C "${REPO_ROOT}" rev-list --count HEAD 2>/dev/null || echo "0")"
 
 ICON_SVG="${REPO_ROOT}/Resources/AppIcon.svg"
@@ -124,15 +170,24 @@ PLIST
 # on identifier + team, so one grant survives all future rebuilds.
 #
 # Overridable via CODESIGN_IDENTITY; auto-detected otherwise; falls back to
-# ad-hoc so contributors without an Apple certificate can still build.
-if [ -z "${CODESIGN_IDENTITY:-}" ]; then
-    CODESIGN_IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null \
-        | sed -n 's/.*"\(Developer ID Application: .*\)"/\1/p' | head -1)"
-fi
+# ad-hoc so contributors without an Apple certificate can still build. This
+# resolution logic is shared with scripts/make-dmg.sh via
+# scripts/lib/resolve-codesign-identity.sh so the app and its DMG always
+# end up signed with the same identity.
+# shellcheck source=lib/resolve-codesign-identity.sh
+source "${SCRIPT_DIR}/lib/resolve-codesign-identity.sh"
 
 if [ -n "${CODESIGN_IDENTITY}" ]; then
     echo "==> Code-signing ${APP_NAME}.app with: ${CODESIGN_IDENTITY}"
-    codesign --force --deep --sign "${CODESIGN_IDENTITY}" --timestamp=none "${APP_BUNDLE}"
+    # Hardened runtime + a secure (networked) timestamp are both REQUIRED
+    # for notarization (see scripts/notarize-dmg.sh, bead gateopener-c33.3)
+    # — Apple's notary service rejects a Developer ID-signed binary that
+    # lacks either with "does not include a secure timestamp" / "does not
+    # have the hardened runtime enabled". Only applied on the Developer ID
+    # path: the ad-hoc fallback below can never be notarized anyway, so
+    # there's no reason to pay for a network round trip to Apple's
+    # timestamp server on that path.
+    codesign --force --deep --sign "${CODESIGN_IDENTITY}" --timestamp --options runtime "${APP_BUNDLE}"
 else
     echo "==> Ad-hoc code-signing ${APP_NAME}.app (no Developer ID identity found)..."
     echo "    NOTE: ad-hoc identity changes on every rebuild, so macOS will"
@@ -143,5 +198,13 @@ fi
 
 echo "==> Verifying signature..."
 codesign -dv "${APP_BUNDLE}"
+
+# Read the version back OUT of the built bundle rather than trust the
+# shell variables above, so downstream release steps (git tag, DMG
+# filename, update-manifest latestVersion) can rely on what was actually
+# written to Info.plist. See scripts/read-app-version.sh.
+BUILT_SHORT_VERSION="$("${SCRIPT_DIR}/read-app-version.sh" "${APP_BUNDLE}" short)"
+BUILT_BUILD_NUMBER="$("${SCRIPT_DIR}/read-app-version.sh" "${APP_BUNDLE}" build)"
+echo "==> Built version: ${BUILT_SHORT_VERSION} (build ${BUILT_BUILD_NUMBER})"
 
 echo "==> Done: ${APP_BUNDLE}"

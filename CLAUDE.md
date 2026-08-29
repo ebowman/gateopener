@@ -60,7 +60,7 @@ This protocol applies when ending a Beads implementation workflow. It is subordi
 
 ## Reference Implementation: ../comelit (Python)
 
-**There is a prior, working Python implementation of this system at `/Users/ebowman/src/comelit`.
+**There is a prior, working Python implementation of this system at `../comelit`.
 Consult it before designing or implementing any Comelit-facing feature.** This Swift app is a
 re-implementation of a subset of it; much of the protocol knowledge here was won the hard way
 there, through live reverse-engineering against real hardware.
@@ -99,7 +99,7 @@ Load-bearing details, all discovered empirically:
 
 ### `bd memories` in ../comelit is the real archive
 
-`/Users/ebowman/src/comelit` has its own beads database with **~28 memories**, many documenting
+`../comelit` has its own beads database with **~28 memories**, many documenting
 video dead ends in detail — and several are explicit *corrections superseding earlier theories*.
 When researching a Comelit behavior, run `bd memories <keyword>` **in that repo** and prefer the
 latest correction over any earlier claim. Start here:

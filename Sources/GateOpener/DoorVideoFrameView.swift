@@ -183,6 +183,23 @@ final class DoorVideoFrameView: NSView, OverlayShowHideResponding {
         lastFrameReceivedAt = nil
         lastFrameData = nil
 
+        // Defence in depth (gateopener-f8w.2): every production call site
+        // (`OverlayWindowController.startOpenVideoSessionIfEnabled()`,
+        // `DoorVideoOverlayController.start()`) constructs a brand-new
+        // `DoorVideoFrameView` per session today, so `imageView.image` is
+        // always nil the first time `startPolling()` runs for a given
+        // instance in practice. This reset does not rely on that: it makes
+        // "no frame decoded by THIS session yet" structurally true from
+        // `imageView`'s own state, not merely from caller discipline, so a
+        // future caller that reuses an existing `DoorVideoFrameView` across
+        // sessions (or a second `overlayWillShow()` on the same instance)
+        // can never display an image left over from a previous session
+        // before this one's own first frame decodes. Restores the
+        // "Connecting…" label to match, exactly mirroring `init`'s initial
+        // (unhidden) state.
+        imageView.image = nil
+        connectingLabel.isHidden = false
+
         pollTask = Task { [weak self] in
             guard let self else { return }
             while !Task.isCancelled {

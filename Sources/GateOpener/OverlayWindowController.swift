@@ -380,13 +380,48 @@ final class OverlayWindowController {
     /// pending fade/hide FIRST, then reset `alphaValue` to 1 before calling
     /// `show()` — otherwise `show()` would order front a panel whose alpha
     /// is mid-fade (or already 0), producing a visible glitch or an
-    /// invisible-but-technically-onscreen overlay. `show()` itself re-runs
-    /// `overlayWillShow()` (via `OverlayShowHideResponding`), which is what
-    /// actually restarts video playback from zero — see
-    /// `GateOpenVideoView.overlayWillShow()`.
+    /// invisible-but-technically-onscreen overlay.
+    ///
+    /// gateopener-f8w.2: EXPLICITLY installs a fresh canned-animation view
+    /// via `setContent(_:)` BEFORE `show()`, on every single call — not just
+    /// the first. This is the fix for the stale-frame-on-reopen bug (see the
+    /// `gateopener-f8w-root-cause-...` bd memory): previously this method
+    /// never called `setContent(_:)` at all, so `show()` simply re-fired
+    /// `overlayWillShow()` on whatever content happened to still be
+    /// installed — the PREVIOUS open's live `DoorVideoFrameView`, still
+    /// holding its last decoded frame, on any reopen within the same
+    /// process. Calling `setContent(_:)` here makes that structurally
+    /// impossible: the panel's content is synchronously replaced with the
+    /// canned animation before `show()` ever fires `overlayWillShow()`, so
+    /// there is no path left where a previous session's frame can be
+    /// re-displayed.
+    ///
+    /// MUST be a FRESH `GateOpenVideoView` instance every call, not the
+    /// cached default content: `setContent(_:)` treats re-setting the SAME
+    /// view instance as a no-op (bead gateopener-12h.2) specifically so a
+    /// state-driven content swap that happens to reselect the current view
+    /// does not spuriously restart it — but that same guard would mean a
+    /// second `.opening` reusing the one shared default instance would
+    /// SILENTLY NOT restart playback, showing only the first open's held
+    /// final frame forever after. Building a new `GateOpenVideoView` (via
+    /// `makeCannedAnimationContent()`) for every open sidesteps the no-op
+    /// guard by construction — the incoming view is never `===` the
+    /// outgoing one — so `overlayWillShow()` reliably fires and
+    /// `GateOpenVideoView.overlayWillShow()` reliably seeks to `.zero` and
+    /// calls `play()`. `show()` then delivers that same `overlayWillShow()`
+    /// hook once more (harmless: it is the identical view `setContent(_:)`
+    /// just installed, so `show()`'s own call is the only firing — see
+    /// `setContent(_:)`'s doc comment on the panel-not-yet-visible case,
+    /// which applies here since the panel may not be visible yet on a fresh
+    /// `.opening`).
+    ///
+    /// Falls back to the plain HUD placeholder when the bundled clip is
+    /// unavailable (unbundled process), exactly like the original default
+    /// content — see `makeCannedAnimationContent()`.
     private func handleOpening() {
         cancelPendingResolve()
         panel?.alphaValue = 1
+        setContent(Self.makeCannedAnimationContent())
         show()
         startOpenVideoSessionIfEnabled()
     }
@@ -748,7 +783,7 @@ final class OverlayWindowController {
         contentView.setAccessibilityElement(false)
         created.contentView = contentView
 
-        let installedContent = pendingContent ?? Self.makeDefaultContent()
+        let installedContent = pendingContent ?? Self.makeCannedAnimationContent()
         created.installContent(installedContent)
 
         panel = created
@@ -765,19 +800,28 @@ final class OverlayWindowController {
         panel.setFrame(NSRect(origin: origin, size: size), display: false)
     }
 
-    /// Default content: the bundled gate-open video (see
-    /// `GateOpenVideoView`). Falls back to the plain HUD placeholder when
-    /// the video asset cannot be located — see
+    /// Builds a FRESH canned gate-open animation view (see
+    /// `GateOpenVideoView`) — a brand-new `GateOpenVideoView`/`AVPlayer`
+    /// instance every call, never a shared/cached one. Falls back to the
+    /// plain HUD placeholder when the video asset cannot be located — see
     /// `GateOpenVideoView.makeIfAvailable()` for why that happens (chiefly:
     /// an unbundled process, where `Bundle.main` has no `Resources`
     /// directory at all) and why it must never crash.
-    private static func makeDefaultContent() -> NSView {
+    ///
+    /// Used both as the panel's initial default content (`resolvePanel()`)
+    /// and — critically — by `handleOpening()` on EVERY `.opening`, per-open,
+    /// specifically so each open gets its own view instance rather than
+    /// reusing a previous open's (see `handleOpening()`'s doc comment for why
+    /// instance-freshness, not just view-type, is load-bearing here:
+    /// `setContent(_:)`'s same-view no-op guard would otherwise silently
+    /// suppress the restart-from-zero on any reopen).
+    private static func makeCannedAnimationContent() -> NSView {
         GateOpenVideoView.makeIfAvailable(size: panelSize) ?? makePlaceholderContent()
     }
 
     /// Placeholder content: a rounded, semi-transparent dark HUD backing
     /// with no live data. Used both as this bead's degrade path (see
-    /// `makeDefaultContent()`) and available to any future feature via
+    /// `makeCannedAnimationContent()`) and available to any future feature via
     /// `setContent(_:)` — see that method's doc comment.
     private static func makePlaceholderContent() -> NSView {
         let effectView = NSVisualEffectView(frame: NSRect(origin: .zero, size: panelSize))
