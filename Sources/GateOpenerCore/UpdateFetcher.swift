@@ -56,24 +56,23 @@ public enum UpdateFetcher {
 
     /// The base URL this app fetches its update manifest and DMGs from.
     ///
-    /// *** THIS IS A PLACEHOLDER. THERE IS NO REMOTE REPOSITORY YET. ***
-    ///
     /// `scripts/publish-release.sh` derives the real `OWNER/REPO` from
     /// `git remote get-url origin` at release time and publishes
     /// `appcast.json` to
     /// `https://github.com/OWNER/REPO/releases/latest/download/appcast.json`
     /// (see that script's header comment on why the manifest filename is
-    /// stable across releases while the DMG filename is versioned). Once a
-    /// real GitHub repository exists for this project, replace the
-    /// `OWNER/REPO` placeholder below with the actual owner/repo pair — this
-    /// is the ONLY place in the app that needs to change; nothing else
-    /// hardcodes a repository identity.
+    /// stable across releases while the DMG filename is versioned).
+    ///
+    /// This is the ONLY place in the app that hardcodes a repository
+    /// identity. If the repo is ever renamed or moved, change it here and
+    /// keep it in step with `origin` — a stale value here means the app
+    /// silently fetches a 404 and never offers an update again.
     ///
     /// `UpdateInstaller.pinnedDMGHost` independently pins the DMG download
     /// host to `github.com` regardless of this constant, so a malicious
     /// manifest still cannot smuggle a DMG from anywhere else even if this
     /// value were ever wrong — see that type's doc comment.
-    public static let manifestURLString = "https://github.com/OWNER/REPO/releases/latest/download/appcast.json"
+    public static let manifestURLString = "https://github.com/ebowman/gateopener/releases/latest/download/appcast.json"
 
     /// Fetches the manifest and compares it against `currentVersion`
     /// (expected to be `Bundle.main.CFBundleShortVersionString` or
