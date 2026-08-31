@@ -1,4 +1,5 @@
 import AppKit
+import GateOpenerCore
 import os
 
 /// Layer-backed `NSView` that renders a live door-camera image inside
@@ -45,12 +46,13 @@ import os
 ///     STRICT increase in either counter resets the plateau clock, even if
 ///     the decoded JPEG is byte-identical to the previous poll — real RTP
 ///     is still arriving and being decoded, the camera's subject just
-///     isn't moving. See `rtpCountersShowProgress(previous:current:)`,
+///     isn't moving. See `DoorVideoLiveness.
+///     rtpCountersShowProgress(previous:current:)` (GateOpenerCore),
 ///     factored out as a pure, WKWebView-free function specifically so
-///     this logic can be reasoned about (and, environment permitting,
-///     tested) in isolation. A counter that goes DOWN (stats reset) or
-///     stays flat does NOT count as progress, so a genuinely frozen/dead
-///     RTP stream still plateaus after `plateauInterval` like before.
+///     this logic can be reasoned about and unit-tested in isolation. A
+///     counter that goes DOWN (stats reset) or stays flat does NOT count
+///     as progress, so a genuinely frozen/dead RTP stream still plateaus
+///     after `plateauInterval` like before.
 ///  2. Byte-difference fallback (only when RTP counters are unavailable
 ///     for this poll — e.g. `pc.getStats()` itself failed): `captureFrameJpeg()`
 ///     returning `nil` (video.videoWidth/videoHeight go to 0 once the
@@ -81,49 +83,6 @@ final class DoorVideoFrameView: NSView, OverlayShowHideResponding {
     /// lengths (gateopener-12h.4) plus the plateau window, but short enough
     /// that a genuinely stuck session cannot outlive it by much.
     static let hardTimeout: TimeInterval = 35
-
-    /// Inbound-video RTP counters sampled from `pc.getStats()` via the
-    /// page's `window.captureFrameAndStats` bridge (see `Resources/
-    /// door-video.html`). Two counters are tracked, not just one, because
-    /// either can legitimately be the one that increments most reliably
-    /// depending on decoder state — mirrors `DoorVideoSession.
-    /// watchForFirstFrame()`'s analogous preference for `getStats()`-based
-    /// signals over the page's own `requestVideoFrameCallback`, which that
-    /// type's doc comment documents as unreliable in this WKWebView
-    /// context.
-    struct RTPCounters: Equatable {
-        let framesReceived: Int
-        let packetsReceived: Int
-    }
-
-    /// Pure decision, deliberately free of any WKWebView/Date/Task
-    /// plumbing so it can be reasoned about (and exercised) in isolation
-    /// from the live poll loop: does `current` represent genuine forward
-    /// RTP progress relative to `previous`?
-    ///
-    /// - `previous == nil` (no counters observed yet, or the previous poll
-    ///   could not obtain any — see `lastRTPCounters`'s doc comment) counts
-    ///   as progress only if `current` ALREADY shows nonzero traffic. An
-    ///   all-zero baseline sample (e.g. taken right as negotiation
-    ///   completes, before any RTP has actually arrived) must NOT hold the
-    ///   plateau clock open indefinitely on its own — a session that never
-    ///   receives any RTP at all still needs to plateau/hard-timeout
-    ///   normally, exactly as before this fix.
-    /// - A counter that DECREASES relative to `previous` indicates a reset
-    ///   (e.g. the page's stats object reinitializing) rather than genuine
-    ///   progress, and does not by itself count as progress.
-    /// - Otherwise, progress is any STRICT increase in either counter —
-    ///   this is what fixes the false plateau on a static scene (frames
-    ///   are still arriving and being decoded, the picture just isn't
-    ///   changing), while a genuinely frozen/dead RTP stream (counters
-    ///   stay flat poll after poll) still plateaus after `plateauInterval`.
-    static func rtpCountersShowProgress(previous: RTPCounters?, current: RTPCounters) -> Bool {
-        guard let previous else {
-            return current.framesReceived > 0 || current.packetsReceived > 0
-        }
-        return current.framesReceived > previous.framesReceived
-            || current.packetsReceived > previous.packetsReceived
-    }
 
     private let session: DoorVideoSession
     private let imageView: NSImageView
@@ -332,7 +291,7 @@ final class DoorVideoFrameView: NSView, OverlayShowHideResponding {
            let packetsReceived = (videoStats["packetsReceived"] as? NSNumber)?.intValue {
             rtpAvailable = true
             let current = RTPCounters(framesReceived: framesReceived, packetsReceived: packetsReceived)
-            if Self.rtpCountersShowProgress(previous: lastRTPCounters, current: current) {
+            if DoorVideoLiveness.rtpCountersShowProgress(previous: lastRTPCounters, current: current) {
                 progressed = true
             }
             lastRTPCounters = current
