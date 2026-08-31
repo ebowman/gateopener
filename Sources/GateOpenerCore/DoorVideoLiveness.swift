@@ -28,14 +28,19 @@ public enum DoorVideoLiveness {
     /// from the live poll loop: does `current` represent genuine forward
     /// RTP progress relative to `previous`?
     ///
-    /// - `previous == nil` (no counters observed yet, or the previous poll
-    ///   could not obtain any — see `DoorVideoFrameView.lastRTPCounters`'s
-    ///   doc comment) counts as progress only if `current` ALREADY shows
-    ///   nonzero traffic. An all-zero baseline sample (e.g. taken right as
-    ///   negotiation completes, before any RTP has actually arrived) must
-    ///   NOT hold the plateau clock open indefinitely on its own — a
-    ///   session that never receives any RTP at all still needs to
-    ///   plateau/hard-timeout normally, exactly as before this fix.
+    /// - `previous == nil` (no counters observed yet this session — see
+    ///   `DoorVideoFrameView.lastRTPCounters`'s doc comment) counts as
+    ///   progress only if `current` ALREADY shows nonzero traffic. An
+    ///   all-zero baseline sample (e.g. taken right as negotiation
+    ///   completes, before any RTP has actually arrived) must NOT hold the
+    ///   plateau clock open indefinitely on its own — a session that never
+    ///   receives any RTP at all still needs to plateau/hard-timeout
+    ///   normally, exactly as before this fix. NOTE: the caller must only
+    ///   pass `nil` for a genuinely fresh session baseline, never as a
+    ///   stand-in for "counters were unavailable this poll" — doing the
+    ///   latter would let a dead stream's nonzero cumulative counters
+    ///   register a false "progress" on every such gap, since any nonzero
+    ///   `current` counts as progress against a `nil` previous.
     /// - A counter that DECREASES relative to `previous` indicates a reset
     ///   (e.g. the page's stats object reinitializing) rather than genuine
     ///   progress, and does not by itself count as progress.

@@ -109,12 +109,26 @@ final class DoorVideoFrameView: NSView, OverlayShowHideResponding {
     /// more than `plateauInterval` in the past.
     private var lastProgressAt: Date?
     private var lastFrameData: Data?
-    /// The most recent RTP counters this view has observed, or `nil` if
-    /// none has been observed yet this session. `nil` is also restored
-    /// mid-session (see `pollOnce()`) whenever a poll cannot obtain RTP
-    /// counters at all, so a later poll that CAN obtain them treats that
-    /// as a fresh baseline rather than comparing across a gap with no
-    /// data.
+    /// The most recent RTP counters this view has observed, or `nil` only
+    /// before the first counters of a session have been observed (reset at
+    /// the start of each session by `startPolling()`). When a
+    /// poll cannot obtain RTP counters at all (`pc.getStats()` failed this
+    /// tick), `pollOnce()` deliberately leaves this baseline UNCHANGED
+    /// rather than nulling it, so the next poll that CAN obtain counters
+    /// compares against the last known-good sample instead of against a
+    /// fresh `nil` baseline. Comparing across such a gap is safe:
+    ///  - a mid-session stats RESET presents to `rtpCountersShowProgress`
+    ///    as a counter DECREASE, which does not count as progress, and this
+    ///    baseline then re-anchors on the assignment immediately following
+    ///    that call;
+    ///  - a live stream's counters strictly increase across the gap and
+    ///    correctly count as progress;
+    ///  - a dead stream's counters are flat across the gap and correctly do
+    ///    NOT count as progress — whereas nulling the baseline on every gap
+    ///    let a dead stream's nonzero cumulative counters register one
+    ///    false "progress" per gap (`rtpCountersShowProgress(previous: nil,
+    ///    current:)` returns true for any nonzero `current`), re-arming the
+    ///    plateau clock indefinitely.
     private var lastRTPCounters: RTPCounters?
     private var sessionStartedAt: Date?
     private var hasReportedEnded = false
@@ -296,10 +310,11 @@ final class DoorVideoFrameView: NSView, OverlayShowHideResponding {
             }
             lastRTPCounters = current
         } else {
-            // RTP counters unavailable this poll — do not compare a FUTURE
-            // available sample against a stale baseline from before this
-            // gap (see `lastRTPCounters`'s doc comment).
-            lastRTPCounters = nil
+            // RTP counters unavailable this poll — deliberately do NOT
+            // clear `lastRTPCounters` here. Keep the prior baseline so the
+            // next poll that CAN obtain counters compares across the gap
+            // instead of against a fresh nil baseline (see `lastRTPCounters`'s
+            // doc comment for why comparing across the gap is safe).
         }
 
         guard let dataURL = payload["jpeg"] as? String,

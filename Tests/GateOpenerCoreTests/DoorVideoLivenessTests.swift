@@ -38,6 +38,42 @@ struct DoorVideoLivenessTests {
         #expect(DoorVideoLiveness.rtpCountersShowProgress(previous: previous, current: current) == false)
     }
 
+    /// Retained-baseline-across-a-gap scenario (gateopener-v6t.3):
+    /// `DoorVideoFrameView.pollOnce()` deliberately keeps `lastRTPCounters`
+    /// unchanged (rather than nulling it) when a poll cannot obtain RTP
+    /// counters at all, so the NEXT poll that can obtain them compares
+    /// against this last known-good sample instead of a fresh `nil`. This
+    /// is the case that fix protects: a genuinely dead stream's cumulative
+    /// counters are identical before and after such a gap, so comparing
+    /// across the gap (same as `bothCountersExactlyFlatIsNotProgress`
+    /// above, restated here under its own name for discoverability) still
+    /// correctly reports no progress — unlike comparing a nonzero `current`
+    /// against a nulled `previous`, which would (see
+    /// `previousNilFalsePositiveIfUsedMidSessionIsWhyBaselineMustBeRetained`
+    /// below) falsely register progress on every such gap.
+    @Test func flatCountersAcrossRetainedGapBaselineIsNotProgress() {
+        let counters = RTPCounters(framesReceived: 10, packetsReceived: 20)
+        #expect(DoorVideoLiveness.rtpCountersShowProgress(previous: counters, current: counters) == false)
+    }
+
+    /// Documents WHY `pollOnce()` must never null `lastRTPCounters` mid-
+    /// session merely because a single poll's `pc.getStats()` failed:
+    /// `rtpCountersShowProgress(previous: nil, current:)` returns `true`
+    /// for ANY nonzero `current`, which is exactly correct at session start
+    /// (nil means "no counters observed yet") but would be a FALSE POSITIVE
+    /// if `previous` were nulled to represent a mid-session gap instead — a
+    /// DEAD stream's counters stay nonzero (its last cumulative total)
+    /// forever, so every gap would re-arm the plateau clock by treating
+    /// that stale nonzero total as fresh progress. This is the bug fixed by
+    /// gateopener-v6t.3: keep the baseline unchanged across gaps (see
+    /// `flatCountersAcrossRetainedGapBaselineIsNotProgress` above) rather
+    /// than nulling it.
+    @Test func previousNilFalsePositiveIfUsedMidSessionIsWhyBaselineMustBeRetained() {
+        // Same nonzero `current` a dead stream would keep reporting forever.
+        let deadStreamCumulativeCounters = RTPCounters(framesReceived: 42, packetsReceived: 84)
+        #expect(DoorVideoLiveness.rtpCountersShowProgress(previous: nil, current: deadStreamCumulativeCounters) == true)
+    }
+
     @Test func oneCounterDecreasesWhileOtherStaysFlatIsNotProgress() {
         // Models a stats-reset: framesReceived drops (e.g. the page's stats
         // object reinitialized) while packetsReceived stays exactly flat.
