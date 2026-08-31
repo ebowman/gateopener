@@ -44,11 +44,17 @@ async function negotiate() {
   window.__state.hasVideoFrame = false;
 
   // Comelit's own STUN server, pre-resolved to an IP and injected by Swift
-  // as window.__ICE_SERVERS__ BEFORE this script runs -- a bare mDNS-only
-  // host candidate is rejected by the door station's signaling backend, and
-  // resolving the STUN hostname from inside the page is unreliable. Falls
-  // back to the hostname form only if that injection did not happen
-  // (should not occur in normal operation).
+  // as window.__ICE_SERVERS__ -- a bare mDNS-only host candidate is
+  // rejected by the door station's signaling backend, and resolving the
+  // STUN hostname from inside the page is unreliable. The actual
+  // sequencing (see DoorVideoSession.swift): this script has already run
+  // in full (this file only DEFINES negotiate()/startNegotiation()/etc. at
+  // load time) and the page has finished loading before Swift injects
+  // window.__ICE_SERVERS__; that injection then happens before Swift
+  // calls startNegotiation(), i.e. before THIS function constructs the
+  // RTCPeerConnection below -- not "before this script runs". Falls back
+  // to the hostname form only if that injection did not happen (should
+  // not occur in normal operation).
   const iceServerUrls = (window.__ICE_SERVERS__ && window.__ICE_SERVERS__.length)
     ? window.__ICE_SERVERS__
     : ["stun:stun.cloud.comelitgroup.com:3478"];
@@ -198,6 +204,42 @@ window.captureFrameJpeg = function (quality) {
   const ctx = canvas.getContext('2d');
   ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
   return canvas.toDataURL('image/jpeg', quality || 0.85);
+};
+
+// Combined per-poll bridge call (static-scene false-plateau fix): returns
+// the captured JPEG data URL (or null, per captureFrameJpeg above) AND the
+// current inbound-video RTP counters in ONE round trip, so
+// DoorVideoFrameView's poll loop does not need two separate
+// callAsyncJavaScript calls every ~125ms. `video` is null (rather than
+// zeroed counters) specifically when pc.getStats() could not be read at
+// all (no peer connection yet, or getStats() itself threw) -- that
+// distinction matters to the Swift side, which treats a null `video` as
+// "RTP counters unavailable, fall back to byte-difference detection" and
+// a present-but-zero `video` as "counters obtained, currently no
+// traffic". Reuses captureFrameJpeg/pc.getStats() rather than duplicating
+// their logic; JSON.stringify()'d (not returned as a bridged JS object)
+// to match window.getVideoStats's existing, already-proven
+// stringify-then-JSONSerialization-on-the-Swift-side bridging pattern.
+window.captureFrameAndStats = async function (quality) {
+  const jpeg = window.captureFrameJpeg(quality);
+  const pc = window.__state.pc;
+  let video = null;
+  if (pc) {
+    try {
+      const stats = await pc.getStats();
+      video = {packetsReceived: 0, framesReceived: 0};
+      stats.forEach((report) => {
+        if (report.type === 'inbound-rtp' && report.kind === 'video') {
+          video.packetsReceived = report.packetsReceived || 0;
+          video.framesReceived = report.framesReceived || 0;
+        }
+      });
+    } catch (err) {
+      logMsg("captureFrameAndStats: getStats() failed: " + err);
+      video = null;
+    }
+  }
+  return JSON.stringify({jpeg: jpeg, video: video});
 };
 
 // Tears down the RTCPeerConnection. Idempotent: safe to call even if no

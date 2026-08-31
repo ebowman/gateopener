@@ -35,16 +35,35 @@ import os
 /// auto-detect that — it stays `.streaming` until `stop()` is called
 /// explicitly, and ICE state lags the actual stop by 10-20s (unusable as a
 /// live signal; it would leave a frozen picture on screen for that whole
-/// window). So this view detects end-of-session itself, from the ONE signal
-/// that is actually timely: `captureFrameJpeg()` starts returning `nil`
-/// (video.videoWidth/videoHeight go to 0 once the underlying `<video>`
-/// element stops receiving frames) or the same frame repeats for
-/// `plateauInterval`. The plateau/failure signal is treated as the PRIMARY
-/// end-of-session trigger; a `hardTimeout` backstop guards against the poll
-/// loop itself somehow wedging without ever observing a plateau. On either
-/// trigger this view calls `onSessionEnded` exactly once and stops polling —
-/// it does NOT call `session.stop()` itself (that is the owner's job, since
-/// the owner is what constructed the session).
+/// window). So this view detects end-of-session itself, from the signals
+/// that are actually timely, in priority order:
+///
+///  1. RTP progress (PRIMARY — fixes a false plateau on a static scene,
+///     e.g. a still door/hallway): each poll's combined bridge call
+///     (`window.captureFrameAndStats`) also returns the peer connection's
+///     inbound-video `framesReceived`/`packetsReceived` counters. Any
+///     STRICT increase in either counter resets the plateau clock, even if
+///     the decoded JPEG is byte-identical to the previous poll — real RTP
+///     is still arriving and being decoded, the camera's subject just
+///     isn't moving. See `rtpCountersShowProgress(previous:current:)`,
+///     factored out as a pure, WKWebView-free function specifically so
+///     this logic can be reasoned about (and, environment permitting,
+///     tested) in isolation. A counter that goes DOWN (stats reset) or
+///     stays flat does NOT count as progress, so a genuinely frozen/dead
+///     RTP stream still plateaus after `plateauInterval` like before.
+///  2. Byte-difference fallback (only when RTP counters are unavailable
+///     for this poll — e.g. `pc.getStats()` itself failed): `captureFrameJpeg()`
+///     returning `nil` (video.videoWidth/videoHeight go to 0 once the
+///     underlying `<video>` element stops receiving frames) or the same
+///     frame repeating for `plateauInterval` is the fallback plateau
+///     signal, exactly as before this fix.
+///
+/// Either signal is treated as the PRIMARY end-of-session trigger; a
+/// `hardTimeout` backstop guards against the poll loop itself somehow
+/// wedging without ever observing a plateau. On either trigger this view
+/// calls `onSessionEnded` exactly once and stops polling — it does NOT call
+/// `session.stop()` itself (that is the owner's job, since the owner is
+/// what constructed the session).
 @MainActor
 final class DoorVideoFrameView: NSView, OverlayShowHideResponding {
     private static let logger = Logger(subsystem: "com.gateopener", category: "door-video-frame")
@@ -62,6 +81,49 @@ final class DoorVideoFrameView: NSView, OverlayShowHideResponding {
     /// lengths (gateopener-12h.4) plus the plateau window, but short enough
     /// that a genuinely stuck session cannot outlive it by much.
     static let hardTimeout: TimeInterval = 35
+
+    /// Inbound-video RTP counters sampled from `pc.getStats()` via the
+    /// page's `window.captureFrameAndStats` bridge (see `Resources/
+    /// door-video.html`). Two counters are tracked, not just one, because
+    /// either can legitimately be the one that increments most reliably
+    /// depending on decoder state — mirrors `DoorVideoSession.
+    /// watchForFirstFrame()`'s analogous preference for `getStats()`-based
+    /// signals over the page's own `requestVideoFrameCallback`, which that
+    /// type's doc comment documents as unreliable in this WKWebView
+    /// context.
+    struct RTPCounters: Equatable {
+        let framesReceived: Int
+        let packetsReceived: Int
+    }
+
+    /// Pure decision, deliberately free of any WKWebView/Date/Task
+    /// plumbing so it can be reasoned about (and exercised) in isolation
+    /// from the live poll loop: does `current` represent genuine forward
+    /// RTP progress relative to `previous`?
+    ///
+    /// - `previous == nil` (no counters observed yet, or the previous poll
+    ///   could not obtain any — see `lastRTPCounters`'s doc comment) counts
+    ///   as progress only if `current` ALREADY shows nonzero traffic. An
+    ///   all-zero baseline sample (e.g. taken right as negotiation
+    ///   completes, before any RTP has actually arrived) must NOT hold the
+    ///   plateau clock open indefinitely on its own — a session that never
+    ///   receives any RTP at all still needs to plateau/hard-timeout
+    ///   normally, exactly as before this fix.
+    /// - A counter that DECREASES relative to `previous` indicates a reset
+    ///   (e.g. the page's stats object reinitializing) rather than genuine
+    ///   progress, and does not by itself count as progress.
+    /// - Otherwise, progress is any STRICT increase in either counter —
+    ///   this is what fixes the false plateau on a static scene (frames
+    ///   are still arriving and being decoded, the picture just isn't
+    ///   changing), while a genuinely frozen/dead RTP stream (counters
+    ///   stay flat poll after poll) still plateaus after `plateauInterval`.
+    static func rtpCountersShowProgress(previous: RTPCounters?, current: RTPCounters) -> Bool {
+        guard let previous else {
+            return current.framesReceived > 0 || current.packetsReceived > 0
+        }
+        return current.framesReceived > previous.framesReceived
+            || current.packetsReceived > previous.packetsReceived
+    }
 
     private let session: DoorVideoSession
     private let imageView: NSImageView
@@ -82,8 +144,19 @@ final class DoorVideoFrameView: NSView, OverlayShowHideResponding {
     var onClickToDismiss: (() -> Void)?
 
     private var pollTask: Task<Void, Never>?
-    private var lastFrameReceivedAt: Date?
+    /// The plateau clock: reset whenever EITHER liveness signal (RTP
+    /// progress, primarily; byte-difference, as a fallback — see the type
+    /// doc comment) fires. `checkForEndOfSession()` plateaus when this is
+    /// more than `plateauInterval` in the past.
+    private var lastProgressAt: Date?
     private var lastFrameData: Data?
+    /// The most recent RTP counters this view has observed, or `nil` if
+    /// none has been observed yet this session. `nil` is also restored
+    /// mid-session (see `pollOnce()`) whenever a poll cannot obtain RTP
+    /// counters at all, so a later poll that CAN obtain them treats that
+    /// as a fresh baseline rather than comparing across a gap with no
+    /// data.
+    private var lastRTPCounters: RTPCounters?
     private var sessionStartedAt: Date?
     private var hasReportedEnded = false
 
@@ -180,8 +253,9 @@ final class DoorVideoFrameView: NSView, OverlayShowHideResponding {
         stopPolling()
         hasReportedEnded = false
         sessionStartedAt = Date()
-        lastFrameReceivedAt = nil
+        lastProgressAt = nil
         lastFrameData = nil
+        lastRTPCounters = nil
 
         // Defence in depth (gateopener-f8w.2): every production call site
         // (`OverlayWindowController.startOpenVideoSessionIfEnabled()`,
@@ -218,22 +292,64 @@ final class DoorVideoFrameView: NSView, OverlayShowHideResponding {
     }
 
     private func pollOnce() async {
+        // Single combined bridge call per poll (not two): the page's
+        // `window.captureFrameAndStats` returns the captured JPEG data URL
+        // AND the current RTP counters together, JSON.stringify()'d —
+        // matching `DoorVideoSession`'s existing stringify-then-
+        // `JSONSerialization` bridging pattern (see `getVideoStats` there)
+        // rather than doubling `callAsyncJavaScript` round trips.
         let raw: Any?
         do {
             raw = try await session.contentView.callAsyncJavaScript(
-                "return window.captureFrameJpeg ? window.captureFrameJpeg(0.85) : null;",
+                "return window.captureFrameAndStats ? await window.captureFrameAndStats(0.85) : null;",
                 contentWorld: .page
             )
         } catch {
             // Transient eval errors are not fatal on their own; the plateau
-            // detector (driven off lastFrameReceivedAt) is what decides
-            // whether this is actually the end of the session.
+            // detector (driven off lastProgressAt) is what decides whether
+            // this is actually the end of the session.
             return
         }
 
-        guard let dataURL = raw as? String,
+        guard let jsonString = raw as? String,
+              let jsonData = jsonString.data(using: .utf8),
+              let payload = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any] else {
+            return
+        }
+
+        let now = Date()
+        var progressed = false
+
+        // PRIMARY liveness signal: RTP progress. `video` is a dictionary
+        // (present, though possibly all-zero) whenever the page could read
+        // `pc.getStats()` at all; it is JSON `null` — which fails this cast
+        // — specifically when it could not, in which case `rtpAvailable`
+        // stays false and the byte-difference fallback below is what
+        // decides progress instead.
+        var rtpAvailable = false
+        if let videoStats = payload["video"] as? [String: Any],
+           let framesReceived = (videoStats["framesReceived"] as? NSNumber)?.intValue,
+           let packetsReceived = (videoStats["packetsReceived"] as? NSNumber)?.intValue {
+            rtpAvailable = true
+            let current = RTPCounters(framesReceived: framesReceived, packetsReceived: packetsReceived)
+            if Self.rtpCountersShowProgress(previous: lastRTPCounters, current: current) {
+                progressed = true
+            }
+            lastRTPCounters = current
+        } else {
+            // RTP counters unavailable this poll — do not compare a FUTURE
+            // available sample against a stale baseline from before this
+            // gap (see `lastRTPCounters`'s doc comment).
+            lastRTPCounters = nil
+        }
+
+        guard let dataURL = payload["jpeg"] as? String,
               let commaIndex = dataURL.firstIndex(of: ","),
               let jpegData = Data(base64Encoded: String(dataURL[dataURL.index(after: commaIndex)...])) else {
+            // No frame captured this poll (e.g. the <video> element has no
+            // natural size yet). RTP progress alone, if any, still resets
+            // the plateau clock.
+            if progressed { lastProgressAt = now }
             return
         }
 
@@ -247,13 +363,23 @@ final class DoorVideoFrameView: NSView, OverlayShowHideResponding {
         // catches that: WebKit's canvas JPEG encoder is deterministic for
         // identical input pixels at a fixed quality (0.85, fixed above), so
         // byte-identical output means the underlying video frame did not
-        // actually change. Only a genuinely NEW frame should reset the
-        // plateau clock (`lastFrameReceivedAt`) — otherwise the plateau
-        // detector can never fire on a frozen-but-still-"decoding" stream
-        // and every session runs out the 35s hard-timeout backstop instead
-        // (observed against real hardware before this fix).
-        guard jpegData != lastFrameData else { return }
+        // actually change. This is now only the FALLBACK plateau signal —
+        // used only when RTP counters were unavailable this poll — because
+        // relying on it alone was exactly what caused a false plateau on a
+        // static scene: a real, live RTP stream decoding an unchanging
+        // picture (e.g. a still hallway) produces byte-identical JPEGs poll
+        // after poll even though the session is genuinely still live.
+        let isNewJPEG = jpegData != lastFrameData
         lastFrameData = jpegData
+        if !rtpAvailable && isNewJPEG {
+            progressed = true
+        }
+
+        if progressed {
+            lastProgressAt = now
+        }
+
+        guard isNewJPEG else { return }
 
         // Decode off the main actor: JPEG decode is real CPU work and this
         // runs every ~125ms for up to ~30s.
@@ -263,7 +389,6 @@ final class DoorVideoFrameView: NSView, OverlayShowHideResponding {
 
         guard let image else { return }
 
-        self.lastFrameReceivedAt = Date()
         self.imageView.image = image
         if !self.connectingLabel.isHidden {
             self.connectingLabel.isHidden = true
@@ -280,11 +405,12 @@ final class DoorVideoFrameView: NSView, OverlayShowHideResponding {
             return
         }
 
-        guard let lastFrameReceivedAt else {
-            // No frame has arrived yet — still connecting, not a plateau.
+        guard let lastProgressAt else {
+            // No liveness signal has arrived yet — still connecting, not a
+            // plateau.
             return
         }
-        if now.timeIntervalSince(lastFrameReceivedAt) >= Self.plateauInterval {
+        if now.timeIntervalSince(lastProgressAt) >= Self.plateauInterval {
             Self.logger.notice("door video frame plateau detected; reporting session ended")
             reportSessionEnded()
         }
