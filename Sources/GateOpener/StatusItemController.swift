@@ -168,19 +168,19 @@ final class StatusItemController: NSObject {
     private func buildMenu() -> NSMenu {
         let menu = NSMenu()
 
-        // "View door" sits ABOVE "Open Gate" — seeing who is there logically
+        // "View" sits ABOVE "Open" — seeing who is there logically
         // precedes deciding to open (gateopener-12h.5). Only added when a
         // `doorVideoOverlayController` was actually injected; under
         // `GATEOPENER_MOCK=1` (no concrete TokenManager/GateClient to build
         // a DoorVideoSession from) it is simply absent from the menu rather
         // than present and silently failing every time.
         if doorVideoOverlayController != nil {
-            let viewDoorItem = NSMenuItem(title: "View Door", action: #selector(menuViewDoor), keyEquivalent: "")
+            let viewDoorItem = NSMenuItem(title: "View", action: #selector(menuViewDoor), keyEquivalent: "")
             viewDoorItem.target = self
             menu.addItem(viewDoorItem)
         }
 
-        let openItem = NSMenuItem(title: "Open Gate", action: #selector(menuOpenGate), keyEquivalent: "")
+        let openItem = NSMenuItem(title: "Open", action: #selector(menuOpenGate), keyEquivalent: "")
         openItem.target = self
         menu.addItem(openItem)
 
@@ -221,7 +221,7 @@ final class StatusItemController: NSObject {
         handleLeftClick()
     }
 
-    /// Handler for the "View Door" menu item. Does NOT call `openGate()` or
+    /// Handler for the "View" menu item. Does NOT call `openGate()` or
     /// touch `observable`/`GateState` in any way — this path only ever
     /// starts a `DoorVideoSession` (an `rtc/offer` PUT), never a gate-power
     /// call. Runs synchronously inside `NSMenu`'s modal tracking loop, same
