@@ -612,22 +612,59 @@ func makeSequencedSession(script: RequestScript, runId: String = UUID().uuidStri
 
 // MARK: - Suite speed: no real sleeping
 
-@Test func retryingTestsCompleteFastNoRealSleeping() async throws {
+/// Thread-safe recorder of every `Duration` the injected `RetryPolicy.sleep`
+/// closure was invoked with. Same `NSLock` + `@unchecked Sendable` idiom as
+/// `RequestScript` above, used here instead of a wall-clock measurement so
+/// the property under test ("retries route delays through the injected
+/// sleep and never really sleep") is verified deterministically rather than
+/// via a timing threshold that flakes under CI/parallel load.
+final class SleepRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _durations: [Duration] = []
+
+    var durations: [Duration] {
+        lock.lock()
+        defer { lock.unlock() }
+        return _durations
+    }
+
+    func record(_ duration: Duration) {
+        lock.lock()
+        _durations.append(duration)
+        lock.unlock()
+    }
+}
+
+@Test func retriesRouteAllDelaysThroughInjectedSleep() async throws {
     let script = RequestScript(statuses: [500, 500, 500])
     let session = makeSequencedSession(script: script)
 
     let (tokenManager, _) = makeTokenManager()
-    let client = GateClient(session: session, tokenManager: tokenManager, retryPolicy: .noDelay(maxAttempts: 3))
+    let recorder = SleepRecorder()
+    // Same attempt/backoff shape as `.noDelay(maxAttempts:)` (base 400ms,
+    // 6s total cap, 3s per-request timeout), but `sleep` records the
+    // requested `Duration` instead of no-op'ing, so this test can assert
+    // real backoff WOULD have slept without ever actually sleeping.
+    let retryPolicy = RetryPolicy(
+        maxAttempts: 3,
+        baseDelay: .milliseconds(400),
+        maxTotalDelay: .seconds(6),
+        requestTimeout: .seconds(3),
+        sleep: { duration in recorder.record(duration) }
+    )
+    let client = GateClient(session: session, tokenManager: tokenManager, retryPolicy: retryPolicy)
 
-    let start = ContinuousClock.now
     await #expect(throws: Error.self) {
         try await client.open(endpointId: "VIP#OD#SB100001.1")
     }
-    let elapsed = ContinuousClock.now - start
 
-    // With real backoff (base 400ms, 3 attempts) this would take well over a
-    // second; with `.noDelay()` it must complete in a small fraction of that.
-    #expect(elapsed < .milliseconds(500))
+    // Exactly 2 sleeps for 3 attempts: one between attempt 1->2 and one
+    // between attempt 2->3, none after the final (failed) attempt.
+    #expect(recorder.durations.count == 2)
+    // Every recorded delay is strictly positive, proving real backoff would
+    // have actually slept -- the deterministic replacement for the old
+    // wall-clock ">1s with real backoff" claim.
+    #expect(recorder.durations.allSatisfy { $0 > .zero })
 }
 
 // MARK: - open: .invalidCredentials is never retried (safety: retrying a
