@@ -66,10 +66,31 @@ final class DoorVideoOverlayController {
         self.makeSession = makeSession
     }
 
-    /// Entry point for the "View door" menu item. Safe to call while a
-    /// session is already in flight: that session is stopped and torn down
-    /// first, so a second selection replaces rather than stacks.
+    /// Entry point for the "View door" menu item.
+    ///
+    /// gateopener-ufk.3: retain-or-replace policy for a repeat "View door"
+    /// selection, mirroring `OverlayWindowController.handleOpening()`'s
+    /// handling of the same rule for the gate-open path. The decision is
+    /// computed once from `currentSession?.state.phase` via
+    /// `DoorVideoSessionRetention.decision(forExistingPhase:)`:
+    ///  - `.retain` (existing session is `.connecting` or `.streaming`):
+    ///    this selection arrived mid-warm-up or mid-stream. Log at notice
+    ///    level and RETURN immediately — no teardown, no new session, and
+    ///    the overlay is left exactly as-is (no `hide()`/`show()`/
+    ///    `setContent`), so the in-flight warm-up (or live stream) is
+    ///    completely undisturbed.
+    ///  - `.replace` (no existing session, or it is `.idle`/`.ended`/
+    ///    `.failed`): existing behaviour — tear down whatever is there (a
+    ///    no-op if nothing is) and start fresh. The "replacing it" log line
+    ///    fires only when there actually was a previous session to replace.
     func start() {
+        let decision = DoorVideoSessionRetention.decision(forExistingPhase: currentSession?.state.phase)
+        if decision == .retain {
+            let phaseDescription = currentSession.map { String(describing: $0.state.phase) } ?? "nil"
+            Self.logger.notice("View door selected while a session is \(phaseDescription, privacy: .public); retaining it")
+            return
+        }
+
         if currentSession != nil {
             Self.logger.notice("View door selected while a session was already in flight; replacing it")
             teardown()
