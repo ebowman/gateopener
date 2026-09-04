@@ -418,12 +418,30 @@ final class OverlayWindowController {
     /// Falls back to the plain HUD placeholder when the bundled clip is
     /// unavailable (unbundled process), exactly like the original default
     /// content — see `makeCannedAnimationContent()`.
+    ///
+    /// gateopener-ufk: when a previous open's video session is still
+    /// `.connecting`/`.streaming`, this open is a RETAINED repeat, not a
+    /// fresh one — see `DoorVideoSessionRetention` in `GateOpenerCore`. In
+    /// that case the canned animation must NOT be re-installed: if the
+    /// session is already `.streaming`, the frame view is the installed
+    /// content and swapping back to the canned animation would yank the
+    /// live video off screen for no reason; if it is still `.connecting`,
+    /// the canned animation is already showing, so re-setting it would just
+    /// restart its playback pointlessly. The retention decision is computed
+    /// ONCE here (before `startOpenVideoSessionIfEnabled` can change
+    /// `openVideoSession`'s state) and threaded through so the two call
+    /// sites can never disagree. `cancelPendingResolve()`, the alpha reset,
+    /// and `show()` still run unconditionally on every opening — they are
+    /// idempotent and are what keep the panel visible for this open too.
     private func handleOpening() {
         cancelPendingResolve()
         panel?.alphaValue = 1
-        setContent(Self.makeCannedAnimationContent())
+        let decision = DoorVideoSessionRetention.decision(forExistingPhase: openVideoSession?.state.phase)
+        if decision == .replace {
+            setContent(Self.makeCannedAnimationContent())
+        }
         show()
-        startOpenVideoSessionIfEnabled()
+        startOpenVideoSessionIfEnabled(decision: decision)
     }
 
     /// Starts a fresh live-video session for THIS open, in parallel with the
@@ -431,19 +449,35 @@ final class OverlayWindowController {
     /// `openVideoSession` doc comment above for why the two run
     /// side by side rather than one replacing the other.
     ///
-    /// Reentrancy: a second `.opening` arriving while a previous open's
-    /// video session is still in flight (e.g. a fast repeated open) must
-    /// not stack two sessions or leave the first one's frame view attached
-    /// — `teardownOpenVideoSession()` stops and clears the previous session
-    /// FIRST, unconditionally, exactly mirroring `DoorVideoOverlayController
-    /// .start()`'s own "replace, don't stack" rule for the separate "View
-    /// door" panel.
+    /// Reentrancy / retention (gateopener-ufk): `decision` is computed ONCE
+    /// by the caller (`handleOpening()`) from `openVideoSession?.state
+    /// .phase`, via `DoorVideoSessionRetention.decision(forExistingPhase:)`
+    /// in `GateOpenerCore`, and passed in here rather than recomputed —
+    /// recomputing after `handleOpening()` may already have changed the
+    /// panel's content would risk the two call sites disagreeing.
+    ///  - `.retain` (existing session is `.connecting` or `.streaming`):
+    ///    this open is a repeat arriving mid-warm-up or mid-stream. Log at
+    ///    notice level and RETURN immediately — no teardown, no new
+    ///    session, no new `DoorVideoFrameView`, and `onStateChange`/
+    ///    `onSessionEnded` are left pointing at the existing session, so the
+    ///    in-flight warm-up (or live stream) is completely undisturbed.
+    ///  - `.replace` (no existing session, or it is `.idle`/`.ended`/
+    ///    `.failed`): existing behaviour — tear down whatever is there
+    ///    (a no-op if nothing is) and start fresh. The "replacing it" log
+    ///    line fires only when there actually was a previous session to
+    ///    replace.
     ///
     /// No-ops (canned-animation-only, today's exact behavior) when either
     /// `autoShowDoorVideoOnOpen` is off or no `makeDoorVideoSession` factory
     /// was injected (mock mode / a caller that opted out) — see those
     /// properties' doc comments.
-    private func startOpenVideoSessionIfEnabled() {
+    private func startOpenVideoSessionIfEnabled(decision: DoorVideoSessionRetention) {
+        if decision == .retain {
+            let phaseDescription = openVideoSession.map { String(describing: $0.state.phase) } ?? "nil"
+            Self.logger.notice("a new open arrived while this open's video session is \(phaseDescription, privacy: .public); retaining it")
+            return
+        }
+
         if openVideoSession != nil {
             Self.logger.notice("a new open arrived while a previous open's video session was still in flight; replacing it")
         }

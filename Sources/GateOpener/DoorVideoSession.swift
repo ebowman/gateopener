@@ -32,6 +32,31 @@ public enum DoorVideoSessionState: Equatable, Sendable {
     case failed(message: String)
 }
 
+extension DoorVideoSessionState {
+    /// Maps this app-layer state down to `GateOpenerCore`'s payload-free
+    /// `DoorVideoSessionPhase`, dropping the `.ended`/`.failed` associated
+    /// values Core has no business knowing about — see that type's doc
+    /// comment in `DoorVideoSessionRetention.swift`.
+    ///
+    /// Deliberately exhaustive with NO `default` clause: a new case added
+    /// to `DoorVideoSessionState` must fail to compile here until it is
+    /// explicitly mapped to a phase.
+    var phase: DoorVideoSessionPhase {
+        switch self {
+        case .idle:
+            return .idle
+        case .connecting:
+            return .connecting
+        case .streaming:
+            return .streaming
+        case .ended:
+            return .ended
+        case .failed:
+            return .failed
+        }
+    }
+}
+
 // MARK: - DoorVideoSession
 
 /// Establishes and owns exactly ONE live WebRTC session against the Comelit
