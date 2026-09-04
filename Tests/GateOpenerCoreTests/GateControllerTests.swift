@@ -255,6 +255,45 @@ private func makeController(
     }())
 }
 
+// MARK: - 3b. A second, SEQUENTIAL openGate() (after the first has resolved)
+// issues its own underlying open call
+
+@Test @MainActor func sequentialOpenGateCallsEachIssueAnUnderlyingOpen() async throws {
+    // No `Task.sleep`/wall-clock wait is needed here, and none is inserted,
+    // for two independent reasons:
+    //  1. `RecordingSleep` (the `sleep` fixture, see `makeController`) is
+    //     injected as `GateControllerSleep` and never actually suspends --
+    //     it just records the requested `Duration` -- so the auto-reset
+    //     Task scheduled by `transition(to:)` after the first `openGate()`
+    //     completes instantly rather than after a real 3s delay.
+    //  2. `openGate()` clears `openTask` synchronously (`openTask = nil`)
+    //     immediately after `await task.value` returns, BEFORE `openGate()`
+    //     itself returns to its caller. So the moment `await
+    //     controller.openGate()` resolves below, there is no in-flight
+    //     `openTask` for a second call to join -- it is free to issue a
+    //     fresh underlying `open`, regardless of whether `state` has
+    //     already auto-reset to `.idle` or is still sitting at
+    //     `.succeeded`. Calling `openGate()` again immediately, with no
+    //     wait, is therefore deterministic rather than racy.
+    let (controller, gateOpening, _, _, _) = makeController()
+
+    await controller.openGate()
+
+    #expect(gateOpening.openCallCount == 1)
+    guard case .succeeded = controller.state else {
+        Issue.record("expected .succeeded after first openGate(), got \(controller.state)")
+        return
+    }
+
+    await controller.openGate()
+
+    #expect(gateOpening.openCallCount == 2)
+    guard case .succeeded = controller.state else {
+        Issue.record("expected .succeeded after second openGate(), got \(controller.state)")
+        return
+    }
+}
+
 // MARK: - 4. .notConfigured routes to .needsSetup, not .failed
 
 @Test @MainActor func notConfiguredRoutesToNeedsSetupNotFailed() async throws {
