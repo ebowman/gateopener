@@ -106,7 +106,7 @@ public enum UpdateInstaller {
     public nonisolated static func verify(
         dmgURL: URL,
         manifest: UpdateManifest,
-        notarizationCheck: (URL) throws -> Bool = defaultNotarizationCheck
+        notarizationCheck: (URL) throws -> Bool = platformDefaultNotarizationCheck
     ) throws {
         try validateManifestDMGURL(manifest.dmgURL)
 
@@ -168,6 +168,10 @@ public enum UpdateInstaller {
     /// This is Apple's documented way to verify that a disk image is both
     /// Developer-ID signed AND notarized — Developer ID signing alone is
     /// not sufficient and does not satisfy `spctl` in this mode.
+    ///
+    /// macOS-only: shells out to `/usr/sbin/spctl` via `Process`, which does
+    /// not exist on iOS.
+    #if os(macOS)
     public nonisolated static func defaultNotarizationCheck(_ dmgURL: URL) throws -> Bool {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/sbin/spctl")
@@ -182,5 +186,25 @@ public enum UpdateInstaller {
         try process.run()
         process.waitUntilExit()
         return process.terminationStatus == 0
+    }
+    #endif
+
+    /// The default value used for `verify(dmgURL:manifest:notarizationCheck:)`'s
+    /// `notarizationCheck` parameter.
+    ///
+    /// On macOS this is `defaultNotarizationCheck`, the real `spctl`-backed
+    /// check. iOS has no `spctl`/notarization concept and no `Process` API
+    /// to shell out with in the first place, so self-update is not a
+    /// meaningful feature there yet; this default is provided purely so
+    /// `GateOpenerCore` compiles for iOS with the same public API shape.
+    /// Any iOS caller of `verify` MUST pass its own `notarizationCheck`
+    /// rather than relying on this placeholder, which always returns
+    /// `false` (fails closed rather than silently "verifying" anything).
+    public nonisolated static func platformDefaultNotarizationCheck(_ dmgURL: URL) throws -> Bool {
+        #if os(macOS)
+        return try defaultNotarizationCheck(dmgURL)
+        #else
+        return false
+        #endif
     }
 }

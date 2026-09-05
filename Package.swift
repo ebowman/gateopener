@@ -4,7 +4,8 @@ import PackageDescription
 let package = Package(
     name: "GateOpener",
     platforms: [
-        .macOS(.v14)
+        .macOS(.v14),
+        .iOS(.v18)
     ],
     products: [
         .executable(name: "GateOpener", targets: ["GateOpener"]),
