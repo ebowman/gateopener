@@ -107,6 +107,38 @@ swift test
   `SIM_ARGS` to pass launch arguments, e.g. `make ios-sim-run
   SIM_ARGS="--signin-debug-attempt user@example.com pass"`.
 
+### iOS app (TestFlight)
+
+Prerequisites:
+
+- `xcodegen` (`brew install xcodegen`).
+- An App Store Connect API key at
+  `~/.appstoreconnect/private_keys/AuthKey_<API_KEY_ID>.p8`.
+- A `.env` file at the repo root (copy `.env.example` and fill in
+  `API_KEY_ID` / `API_ISSUER_ID` — both come from the same App Store
+  Connect API key). `.env` is gitignored; never commit it.
+
+Day-to-day iOS development uses `make ios-build` (fast unsigned compile
+check) or `make ios-sim-run` (signed run on a Simulator). To verify signing
+and archiving without uploading anything, run:
+
+```bash
+./testflight.sh ios --archive-only
+```
+
+This archives the app with automatic signing via the API key
+(`-allowProvisioningUpdates`) and restores `project.yml` afterwards, leaving
+the tree clean. To archive, export, upload to TestFlight, and commit the
+resulting build-number bump, run:
+
+```bash
+./testflight.sh ios
+```
+
+Note: the App Store Connect app record for bundle id `ie.boboco.GateOpener`
+must already exist before the first upload can succeed — creating it is an
+operator step (see bead 672.20).
+
 ## Release flow (maintainers)
 
 Producing and publishing a distributable release is a four-stage pipeline:

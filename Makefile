@@ -1,4 +1,4 @@
-.PHONY: build test run clean release xcodeproj ios-build ios-sim-build ios-sim-run
+.PHONY: build test run clean release xcodeproj ios-build ios-sim-build ios-sim-run testflight-archive
 
 build:
 	swift build
@@ -94,3 +94,11 @@ ios-sim-run: ios-sim-build
 # human operator, runs this.
 release:
 	scripts/publish-release.sh
+
+# Archives the iOS app via testflight.sh in --archive-only mode: verifies
+# automatic signing and provisioning end to end without exporting or
+# uploading anything to App Store Connect, and without committing a
+# build-number bump. See testflight.sh and the README's "iOS app
+# (TestFlight)" section.
+testflight-archive:
+	./testflight.sh ios --archive-only
