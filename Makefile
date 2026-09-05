@@ -1,4 +1,4 @@
-.PHONY: build test run clean release
+.PHONY: build test run clean release xcodeproj ios-build
 
 build:
 	swift build
@@ -12,6 +12,20 @@ run:
 clean:
 	swift package clean
 	rm -rf .build
+
+# Regenerates GateOpener.xcodeproj from project.yml via xcodegen. The
+# generated project is gitignored; regenerate on demand rather than editing
+# it by hand.
+xcodeproj:
+	xcodegen generate --spec project.yml
+
+# Regenerates the Xcode project and builds the iOS app target for the
+# Simulator, without code signing (no team-provisioned device involved).
+# Does not disturb the SwiftPM build of the macOS app (`make build`/`test`).
+ios-build: xcodeproj
+	xcodebuild -project GateOpener.xcodeproj -scheme GateOpener-iOS \
+		-destination 'generic/platform=iOS Simulator' \
+		-derivedDataPath .build/xcode build CODE_SIGNING_ALLOWED=NO
 
 # Publishes a GitHub release: generates the update manifest (appcast.json)
 # describing the just-built, notarized DMG, then uploads both as release

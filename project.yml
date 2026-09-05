@@ -1,0 +1,76 @@
+name: GateOpener
+options:
+  bundleIdPrefix: ie.boboco
+  deploymentTarget:
+    iOS: "18.0"
+  createIntermediateGroups: true
+
+# The repo root is both the xcodegen project directory AND the SwiftPM
+# package directory (Package.swift lives at the repo root, next to this
+# file). Pointing the local package dependency at "." (rather than a
+# subdirectory, as ../FlöDo/project.yml does with FloDoKit) works fine with
+# xcodegen 2.45.3 / Xcode 26.6 — xcodegen resolves the package manifest from
+# the given path and does not require it to differ from the project's own
+# directory. No workaround (symlink, nested checkout, etc.) was needed.
+packages:
+  GateOpenerCore:
+    path: .
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+    MARKETING_VERSION: "0.1.3"
+    CURRENT_PROJECT_VERSION: 1
+    DEVELOPMENT_TEAM: Y5SB82BPYL
+    CODE_SIGN_STYLE: Automatic
+
+targets:
+  GateOpener-iOS:
+    type: application
+    platform: iOS
+    sources:
+      - path: iOS/App
+        excludes:
+          - "*.plist"
+          - "*.xcprivacy"
+          - "*.entitlements"
+      - path: iOS/Shared
+      - path: iOS/Resources/Assets.xcassets
+      - path: iOS/App/PrivacyInfo.xcprivacy
+        buildPhase: resources
+      # Sources/GateOpener/GateControllerObservable.swift is deliberately NOT
+      # included here: despite its "Foundation+Observation only" doc comment,
+      # it references `GlobalHotkey` (Sources/GateOpener/GlobalHotkey.swift),
+      # which imports AppKit + Carbon.HIToolbox and is macOS-only. The iOS
+      # app gets its own observable wrapper in bead 672.7; this file and
+      # GlobalHotkey.swift are untouched.
+    dependencies:
+      - package: GateOpenerCore
+        product: GateOpenerCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ie.boboco.GateOpener
+        PRODUCT_NAME: GateOpener
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_CFBundleDisplayName: GateOpener
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone: UIInterfaceOrientationPortrait
+        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.utilities
+        INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: NO
+        CODE_SIGN_ENTITLEMENTS: iOS/App/GateOpener.entitlements
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+      configs:
+        debug:
+          CODE_SIGN_IDENTITY: "Apple Development"
+
+schemes:
+  GateOpener-iOS:
+    build:
+      targets:
+        GateOpener-iOS: [run, test, profile, archive]
+    run:
+      config: Debug
+    archive:
+      config: Release
