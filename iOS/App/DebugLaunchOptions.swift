@@ -77,6 +77,19 @@ enum DebugLaunchOptions {
         ProcessInfo.processInfo.arguments.contains("--run-intent")
     }
 
+    /// True if `--widget-preview` was passed on the launch command line
+    /// (bead gateopener-672.14 verification step 7): presents
+    /// `WidgetPreviewView` (`iOS/App/WidgetPreviewView.swift`) — a plain
+    /// SwiftUI list rendering `GateWidgetEntryView` (`iOS/Shared
+    /// /GateWidgetViews.swift`, compiled into both the app and the widget
+    /// extension) for every family/state — instead of `RootView`, so a
+    /// screenshot script can capture real evidence that the widget views
+    /// compile and render correctly without needing the (non-automatable)
+    /// widget gallery/Xcode preview canvas.
+    static var widgetPreviewOnLaunch: Bool {
+        ProcessInfo.processInfo.arguments.contains("--widget-preview")
+    }
+
     /// Pre-seeds `appSettings` and the credential store so a `--mock-gate`
     /// run starts in `.idle` (a selected gate + stored credentials) rather
     /// than `.needsSetup`. No-op unless `mockGateMode` is non-nil.

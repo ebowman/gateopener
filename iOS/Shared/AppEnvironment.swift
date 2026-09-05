@@ -40,6 +40,17 @@ public final class AppEnvironment {
     public let controller: GateController
     public let snapshotStore: WidgetSnapshotStore
 
+    /// Reloads widget timelines. Stored (rather than only closed over by the
+    /// `controller.onStateChange` handler installed in `make()`) so
+    /// `publishSnapshot()` can also call it directly on a foreground
+    /// re-publish (`GateOpenerIOSApp`'s `scenePhase == .active` handler),
+    /// which writes a snapshot WITHOUT going through `controller
+    /// .onStateChange` (the phase has not changed, only `updatedAt`) — see
+    /// this bead's NOTES follow-up from 672.7's review: previously this was
+    /// only a constructor parameter that was never stored, so that
+    /// foreground re-publish silently never refreshed the widget.
+    private let timelineReloader: @Sendable () -> Void
+
     /// Additional state observers chained onto `controller.onStateChange`,
     /// beyond the snapshot-publishing subscription installed by `make()`
     /// itself. See `addStateObserver(_:)`.
@@ -182,6 +193,7 @@ public final class AppEnvironment {
         self.gateClient = gateClient
         self.controller = controller
         self.snapshotStore = snapshotStore
+        self.timelineReloader = timelineReloader
     }
 
     /// Re-writes the current `controller.state` as a `WidgetSnapshot` and
@@ -191,6 +203,7 @@ public final class AppEnvironment {
     /// when the phase itself has not changed).
     public func publishSnapshot() {
         publishSnapshot(for: controller.state)
+        timelineReloader()
     }
 
     private func publishSnapshot(for state: GateState) {

@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>$(PRODUCT_NAME)</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleName</key>
+	<string>$(PRODUCT_NAME)</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>$(MARKETING_VERSION)</string>
+	<key>CFBundleVersion</key>
+	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<key>CFBundleIcons</key>
+	<dict>
+		<key>CFBundlePrimaryIcon</key>
+		<dict>
+			<key>CFBundleIconName</key>
+			<string>AppIcon</string>
+		</dict>
+	</dict>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.utilities</string>
+	<key>LSRequiresIPhoneOS</key>
+	<true/>
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
+	<key>NSAccentColorName</key>
+	<string>AccentColor</string>
+	<key>UILaunchScreen</key>
+	<dict/>
+	<key>UISupportedInterfaceOrientations~iphone</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+	</array>
+	<!-- Registers the `gateopener://` URL scheme (bead gateopener-672.14
+	     step 4): tapping a widget's non-button body uses
+	     `.widgetURL(URL(string: "gateopener://main"))`
+	     (`iOS/Shared/GateWidgetViews.swift`) to bring the app to
+	     `MainView` WITHOUT opening the gate —
+	     `GateOpenerIOSApp.onOpenURL` does nothing beyond that; it never
+	     calls `requestOpen()`/`openGate()`. This whole file exists
+	     (rather than `GENERATE_INFOPLIST_FILE: YES` +
+	     `INFOPLIST_KEY_*`, as before this bead) ONLY because
+	     `CFBundleURLTypes` is an array-of-dicts with no
+	     `INFOPLIST_KEY_*` synthesized-key equivalent, and xcodegen's
+	     `info.properties` passthrough requires `info.path` to point at
+	     an file xcodegen itself does not materialize on a plain
+	     `xcodegen generate` (only `--only-plists` does), which is not
+	     compatible with this repo's plain `make xcodeproj`/`ios-build`
+	     flow. -->
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>ie.boboco.GateOpener</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>gateopener</string>
+			</array>
+		</dict>
+	</array>
+</dict>
+</plist>
