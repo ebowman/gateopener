@@ -571,6 +571,21 @@ private func makeController(
     #expect(candidates.map(\.endpointId) == [sampleEndpointLockGeneric.endpointId, sampleEndpointOther.endpointId])
 }
 
+@Test @MainActor func refreshGatesPersistsCachedGates() async throws {
+    let (controller, gateOpening, _, _, settings) = makeController()
+    // Mutation check: confirm the cache starts empty so the post-call
+    // assertion below is proven to distinguish "refreshGates wrote it"
+    // from "it was already populated by some other path".
+    #expect(settings.cachedGates.isEmpty)
+    gateOpening.discoverResult = .success([sampleEndpointOther, sampleEndpointLockGeneric])
+
+    let candidates = try await controller.refreshGates()
+
+    #expect(!candidates.isEmpty)
+    #expect(settings.cachedGates == candidates)
+    #expect(settings.cachedGates.map(\.endpointId) == [sampleEndpointLockGeneric.endpointId, sampleEndpointOther.endpointId])
+}
+
 // MARK: - Additional: initial state derivation
 
 @Test @MainActor func initialStateIsNeedsSetupWithNoCredentials() throws {

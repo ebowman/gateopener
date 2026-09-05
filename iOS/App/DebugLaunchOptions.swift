@@ -27,6 +27,9 @@ import os
 ///     call after the given delay, invoked from `MainView.onAppear`, so
 ///     `.opening`/`.succeeded`/`.failed` states can be screenshotted
 ///     without a human or UI-automation tap.
+///   - `--open-settings`: presents the Settings sheet immediately from
+///     `MainView.onAppear`, so it can be screenshotted without a human or
+///     UI-automation tap (bead gateopener-672.10 verification).
 enum DebugLaunchOptions {
     /// The fake `GateOpening` mode requested by `--mock-gate`, or `nil` if
     /// that argument was not passed (production `GateClient` is used).
@@ -58,6 +61,11 @@ enum DebugLaunchOptions {
         return seconds
     }
 
+    /// True if `--open-settings` was passed on the launch command line.
+    static var openSettingsOnLaunch: Bool {
+        ProcessInfo.processInfo.arguments.contains("--open-settings")
+    }
+
     /// Pre-seeds `appSettings` and the credential store so a `--mock-gate`
     /// run starts in `.idle` (a selected gate + stored credentials) rather
     /// than `.needsSetup`. No-op unless `mockGateMode` is non-nil.
@@ -70,6 +78,27 @@ enum DebugLaunchOptions {
         guard mockGateMode != nil else { return }
         appSettings.selectedEndpointId = "mock"
         appSettings.selectedEndpointName = "Mock Gate"
+        // Also seed a two-entry `cachedGates` list (bead gateopener-672.10
+        // verification) so the Settings gate picker has a real list to
+        // show on a `--mock-gate` run, rather than an empty "Refresh
+        // gates" call-to-action row. "Mock Gate" matches
+        // `selectedEndpointId`/`selectedEndpointName` above so the picker
+        // shows it pre-selected; "Side door" is a second, unselected
+        // candidate so the picker has something to switch between.
+        appSettings.cachedGates = [
+            Endpoint(
+                endpointId: "mock",
+                friendlyName: "Mock Gate",
+                capabilities: ["PowerController"],
+                displayCategories: ["LOCK_GENERIC"]
+            ),
+            Endpoint(
+                endpointId: "mock-side-door",
+                friendlyName: "Side door",
+                capabilities: ["PowerController"],
+                displayCategories: ["LOCK_GENERIC"]
+            ),
+        ]
         // Dummy, throwaway credentials — never real. Safe only because
         // this whole file is `#if DEBUG` and this branch only executes
         // when `--mock-gate` was explicitly passed on the launch command

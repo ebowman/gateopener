@@ -197,4 +197,68 @@ struct AppSettingsTests {
         settingsB.aptId = "apt-999"
         #expect(settingsA.aptId == "apt-999")
     }
+
+    // MARK: - cachedGates (bead gateopener-672.10)
+
+    @Test func cachedGatesRoundTrips() {
+        let (defaults, cleanup) = makeSuite()
+        defer { cleanup() }
+
+        let settings = AppSettings(defaults: defaults)
+        let gates = [
+            Endpoint(endpointId: "id-1", friendlyName: "Front Gate", capabilities: ["PowerController"], displayCategories: ["LOCK_GENERIC"]),
+            Endpoint(endpointId: "id-2", friendlyName: "Side Door", capabilities: ["PowerController"], displayCategories: ["LOCK_GENERIC"]),
+        ]
+
+        settings.cachedGates = gates
+
+        #expect(settings.cachedGates == gates)
+
+        // A second instance over the same suite must see the same value —
+        // proves this is actually persisted to `defaults`, not just held
+        // in an in-memory property (mutation check: an in-memory-only
+        // implementation would fail this second assertion).
+        let settingsB = AppSettings(defaults: defaults)
+        #expect(settingsB.cachedGates == gates)
+    }
+
+    @Test func cachedGatesIsEmptyWhenAbsent() {
+        let (defaults, cleanup) = makeSuite()
+        defer { cleanup() }
+
+        let settings = AppSettings(defaults: defaults)
+
+        #expect(settings.cachedGates == [])
+    }
+
+    @Test func cachedGatesIsEmptyWhenStoredDataIsCorrupt() {
+        let (defaults, cleanup) = makeSuite()
+        defer { cleanup() }
+
+        let settings = AppSettings(defaults: defaults)
+        // Write garbage bytes directly under the same key `cachedGates`
+        // uses, bypassing the property setter, to simulate a corrupt or
+        // foreign-format stored value.
+        defaults.set(Data([0xDE, 0xAD, 0xBE, 0xEF]), forKey: "ie.boboco.GateOpener.cachedGates")
+
+        #expect(settings.cachedGates == [])
+    }
+
+    @Test func resetClearsCachedGates() {
+        let (defaults, cleanup) = makeSuite()
+        defer { cleanup() }
+
+        let settings = AppSettings(defaults: defaults)
+        let gates = [Endpoint(endpointId: "id-1", friendlyName: "Front Gate")]
+        settings.cachedGates = gates
+
+        // Mutation check: confirm the value is actually non-empty BEFORE
+        // reset(), so the post-reset assertion below is proven to
+        // distinguish "reset cleared it" from "it was already empty".
+        #expect(!settings.cachedGates.isEmpty)
+
+        settings.reset()
+
+        #expect(settings.cachedGates == [])
+    }
 }

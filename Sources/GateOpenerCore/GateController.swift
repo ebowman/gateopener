@@ -495,6 +495,7 @@ public final class GateController {
         appSettings.selectedEndpointId = selected.endpointId
         appSettings.selectedEndpointName = selected.friendlyName
         appSettings.lastDiscoveryDate = Date()
+        appSettings.cachedGates = candidates
         if let aptId = GateClient.parseAptId(fromEndpointId: selected.endpointId) {
             appSettings.aptId = aptId
         }
@@ -505,14 +506,19 @@ public final class GateController {
     // MARK: - Gate list refresh (for the Settings gate picker, bead .9)
 
     /// Re-runs discovery and returns the filtered candidate list. Does NOT
-    /// mutate `AppSettings` itself (selection happens via `selectGate(_:)`)
-    /// and must not clear an existing valid selection if discovery fails —
-    /// this method simply propagates the failure and leaves `AppSettings`
-    /// untouched.
+    /// mutate the SELECTION in `AppSettings` (selection happens via
+    /// `selectGate(_:)`) and must not clear an existing valid selection if
+    /// discovery fails — this method simply propagates the failure and
+    /// leaves `AppSettings` untouched in that case. On success, the
+    /// filtered candidate list is persisted to `appSettings.cachedGates`
+    /// (bead gateopener-672.10) so the Settings gate picker has something
+    /// to show without a fresh network round trip on every appearance.
     public func refreshGates() async throws -> [Endpoint] {
         let endpoints = try await gateClient.discover(aptId: appSettings.aptId)
         appSettings.lastDiscoveryDate = Date()
-        return GateClient.candidateGates(from: endpoints)
+        let candidates = GateClient.candidateGates(from: endpoints)
+        appSettings.cachedGates = candidates
+        return candidates
     }
 
     // MARK: - Gate selection

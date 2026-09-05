@@ -69,7 +69,7 @@ struct GateOpenerIOSApp: App {
 
     var body: some Scene {
         WindowGroup {
-            RootView(observable: observable, appSettings: environment.appSettings)
+            RootView(environment: environment, observable: observable, appSettings: environment.appSettings)
         }
         .onChange(of: scenePhase) { _, newPhase in
             guard newPhase == .active else { return }

@@ -7,6 +7,7 @@ import GateOpenerCore
 /// `MainView` (bead gateopener-672.9), the screen the app launches
 /// straight into once configured.
 struct RootView: View {
+    var environment: AppEnvironment
     var observable: GateControllerObservable
     var appSettings: AppSettings
 
@@ -16,7 +17,7 @@ struct RootView: View {
             case .needsSetup:
                 SignInView(observable: observable)
             default:
-                MainView(observable: observable, appSettings: appSettings)
+                MainView(environment: environment, observable: observable, appSettings: appSettings)
             }
         }
     }

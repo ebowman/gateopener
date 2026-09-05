@@ -14,6 +14,7 @@ import UIKit
 /// driven purely by observing `observable.state`, never by awaiting
 /// anything on the tap path itself.
 struct MainView: View {
+    var environment: AppEnvironment
     var observable: GateControllerObservable
 
     /// `GateController.appSettings` is `private` (see that file's field),
@@ -139,7 +140,7 @@ struct MainView: View {
             }
         }
         .sheet(isPresented: $settingsPresented) {
-            SettingsView()
+            SettingsView(environment: environment, observable: observable, appSettings: appSettings)
         }
         .onAppear {
             impactGenerator.prepare()
@@ -147,6 +148,9 @@ struct MainView: View {
             notificationGenerator.prepare()
             #if DEBUG
             scheduleDebugAutoOpenIfNeeded()
+            if DebugLaunchOptions.openSettingsOnLaunch {
+                settingsPresented = true
+            }
             #endif
         }
         .onDisappear {
