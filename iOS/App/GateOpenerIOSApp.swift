@@ -10,9 +10,9 @@ import GateOpenerCore
 /// (`scenePhase == .active`) it prewarms the token manager and re-publishes
 /// the widget snapshot, per bead gateopener-672.7 step 5.
 ///
-/// `RootView` below is a temporary placeholder proving the whole wiring
-/// compiles and runs end to end — the real sign-in/main/settings screens
-/// are later beads (gateopener-672.8, .9, .10).
+/// `RootView` (`iOS/App/RootView.swift`) switches between `SignInView`
+/// (bead gateopener-672.8) and a main-screen stub — the real main/settings
+/// screens are later beads (gateopener-672.9, .10).
 @main
 struct GateOpenerIOSApp: App {
     @State private var environment: AppEnvironment
@@ -48,25 +48,5 @@ struct GateOpenerIOSApp: App {
             Task { await environment.tokenManager.prewarm() }
             environment.publishSnapshot()
         }
-    }
-}
-
-/// Temporary placeholder root view: shows the current `GateState` as text
-/// plus a debug "Request open" button. Replaced by the real main screen in
-/// bead gateopener-672.9.
-private struct RootView: View {
-    var observable: GateControllerObservable
-
-    var body: some View {
-        VStack(spacing: 16) {
-            Text("GateOpener")
-                .font(.title)
-            Text("State: \(String(describing: observable.state))")
-            Button("Request open") {
-                observable.requestOpen()
-            }
-            .buttonStyle(.borderedProminent)
-        }
-        .padding()
     }
 }
