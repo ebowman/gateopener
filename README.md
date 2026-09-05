@@ -92,6 +92,21 @@ Running the test suite:
 swift test
 ```
 
+### iOS (simulator)
+
+- `make ios-build` is the fast compile gate for the iOS app: it builds for
+  a generic Simulator destination with `CODE_SIGNING_ALLOWED=NO`. This is
+  unsigned, so the Keychain is unusable — any code path that touches
+  `KeychainCredentialStore` fails immediately with
+  `KeychainError.saveFailed(status: -34018)` (`errSecMissingEntitlement`).
+  Use it only to confirm the app compiles.
+- `make ios-sim-build` / `make ios-sim-run` build and run the iOS app
+  signed for a concrete Simulator device (`SIM_DEVICE`, default "iPhone 17
+  Pro"), so the app's entitlements (`application-groups`,
+  `keychain-access-groups`) are embedded and the Keychain works. Use
+  `SIM_ARGS` to pass launch arguments, e.g. `make ios-sim-run
+  SIM_ARGS="--signin-debug-attempt user@example.com pass"`.
+
 ## Release flow (maintainers)
 
 Producing and publishing a distributable release is a four-stage pipeline:
