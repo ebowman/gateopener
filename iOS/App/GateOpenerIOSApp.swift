@@ -22,7 +22,35 @@ struct GateOpenerIOSApp: App {
     @Environment(\.scenePhase) private var scenePhase
 
     init() {
+        #if DEBUG
+        // Debug/test seam only (bead gateopener-672.9): `--mock-gate
+        // [ok|fail]` injects a fake `GateOpening` and pre-seeds a fake
+        // account so the main screen's `.opening`/`.succeeded`/`.failed`
+        // states can be exercised on the simulator without touching the
+        // real Comelit cloud. See `DebugLaunchOptions`.
+        //
+        // MUST run before `AppEnvironment.make(...)`: that call
+        // synchronously constructs `GateController`, whose initial `state`
+        // (`.idle` vs `.needsSetup`) is decided from `appSettings
+        // .isConfigured` and `credentialStore.loadCredentials()` at
+        // construction time — seeding afterwards would be too late to
+        // affect the very first render. This uses the same
+        // `SharedContainer` defaults suite / keychain access group
+        // `AppEnvironment.make` itself resolves to, so the seed lands in
+        // the exact store the freshly-constructed `AppEnvironment` reads
+        // from. Both calls are no-ops when `--mock-gate` was not passed.
+        DebugLaunchOptions.seedMockAccountIfNeeded(
+            appSettings: AppSettings(defaults: SharedContainer.sharedDefaults() ?? .standard),
+            credentialStore: KeychainCredentialStore(accessGroup: SharedContainer.keychainAccessGroup)
+        )
+        let environment = AppEnvironment.make(
+            reachability: NWPathMonitorReachability(),
+            gateClient: DebugLaunchOptions.makeGateClientIfNeeded(),
+            tokenResolver: DebugLaunchOptions.makeTokenResolverIfNeeded()
+        )
+        #else
         let environment = AppEnvironment.make(reachability: NWPathMonitorReachability())
+        #endif
         let runner = BackgroundOpenRunner(controller: environment.controller)
         // Registered alongside `GateControllerObservable`'s own observer
         // (both via `addStateObserver`, never by assigning
@@ -41,7 +69,7 @@ struct GateOpenerIOSApp: App {
 
     var body: some Scene {
         WindowGroup {
-            RootView(observable: observable)
+            RootView(observable: observable, appSettings: environment.appSettings)
         }
         .onChange(of: scenePhase) { _, newPhase in
             guard newPhase == .active else { return }

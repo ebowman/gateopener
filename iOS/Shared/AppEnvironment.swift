@@ -36,7 +36,7 @@ public final class AppEnvironment {
     public let credentialStore: KeychainCredentialStore
     public let api: ComelitAPI
     public let tokenManager: TokenManager
-    public let gateClient: GateClient
+    public let gateClient: any GateOpening
     public let controller: GateController
     public let snapshotStore: WidgetSnapshotStore
 
@@ -57,10 +57,36 @@ public final class AppEnvironment {
     ///   - timelineReloader: Injection seam for tests, so they never touch
     ///     the real `WidgetCenter`. Defaults to
     ///     `WidgetCenter.shared.reloadAllTimelines()`.
+    ///   - gateClient: TEST/DEBUG SEAM ONLY. When `nil` (the production
+    ///     default, and the only value ever used in a Release build),
+    ///     resolves to a real `GateClient` wired to the `TokenManager`
+    ///     constructed here. Non-nil only ever comes from
+    ///     `DebugLaunchOptions` (`iOS/App`, `#if DEBUG`-gated) parsing a
+    ///     `--mock-gate` launch argument, so that a fake `GateOpening` can
+    ///     be exercised end to end (including `.opening`/`.succeeded`/
+    ///     `.failed` UI states) on the simulator without ever touching the
+    ///     real Comelit cloud or a physical gate. This parameter carries no
+    ///     runtime `#if DEBUG` guard of its own — the guard lives at the
+    ///     one call site that ever passes a non-nil value.
+    ///   - tokenResolver: TEST/DEBUG SEAM ONLY, paired with `gateClient`.
+    ///     `GateController.performOpen()` calls `tokenManager.accessToken()`
+    ///     BEFORE `gateClient.open(endpointId:)`, so injecting only a fake
+    ///     `GateOpening` is not suficient to exercise `--mock-gate` without
+    ///     the real `TokenManager` attempting a real network login with the
+    ///     debug seam's dummy credentials (and failing/succeeding
+    ///     unpredictably depending on real network conditions). When `nil`
+    ///     (the production default), the real `TokenManager` constructed
+    ///     here is used, unchanged. This does NOT affect
+    ///     `AppEnvironment.tokenManager` (still always the real
+    ///     `TokenManager`, used for `prewarm()` and anything else that
+    ///     needs the concrete type) — it only substitutes what
+    ///     `GateController` itself calls for token resolution.
     public static func make(
         defaults: UserDefaults? = nil,
         reachability: (any ReachabilityProviding)? = nil,
-        timelineReloader: @escaping @Sendable () -> Void = { WidgetCenter.shared.reloadAllTimelines() }
+        timelineReloader: @escaping @Sendable () -> Void = { WidgetCenter.shared.reloadAllTimelines() },
+        gateClient: (any GateOpening)? = nil,
+        tokenResolver: (any TokenResolving)? = nil
     ) -> AppEnvironment {
         let resolvedDefaults: UserDefaults
         if let defaults {
@@ -87,12 +113,14 @@ public final class AppEnvironment {
 
         let api = ComelitAPI()
         let tokenManager = TokenManager(api: api, credentialStore: credentialStore)
-        let gateClient = GateClient(tokenManager: tokenManager)
+        let resolvedGateClient: any GateOpening = gateClient ?? GateClient(tokenManager: tokenManager)
         let resolvedReachability = reachability ?? NWPathMonitorReachability()
 
+        let resolvedTokenResolver: any TokenResolving = tokenResolver ?? tokenManager
+
         let controller = GateController(
-            gateClient: gateClient,
-            tokenManager: tokenManager,
+            gateClient: resolvedGateClient,
+            tokenManager: resolvedTokenResolver,
             credentialStore: credentialStore,
             appSettings: appSettings,
             reachability: resolvedReachability
@@ -106,7 +134,7 @@ public final class AppEnvironment {
             credentialStore: credentialStore,
             api: api,
             tokenManager: tokenManager,
-            gateClient: gateClient,
+            gateClient: resolvedGateClient,
             controller: controller,
             snapshotStore: snapshotStore,
             timelineReloader: timelineReloader
@@ -141,7 +169,7 @@ public final class AppEnvironment {
         credentialStore: KeychainCredentialStore,
         api: ComelitAPI,
         tokenManager: TokenManager,
-        gateClient: GateClient,
+        gateClient: any GateOpening,
         controller: GateController,
         snapshotStore: WidgetSnapshotStore,
         timelineReloader: @escaping @Sendable () -> Void
