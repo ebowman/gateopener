@@ -60,29 +60,80 @@ extension ComelitAPI: TokenIssuing {}
 public actor TokenManager {
     private let api: any TokenIssuing
     private let credentialStore: any CredentialStoring
+    private let now: () -> Date
 
     /// The current in-memory cached token, if any.
     private var cachedToken: TokenSet?
 
-    /// The single in-flight resolution task, if a call to `accessToken()` is
-    /// currently in progress. Concurrent callers await this same task rather
-    /// than starting their own, guaranteeing at most one login/refresh at a
-    /// time.
+    /// The single in-flight resolution task, if a call to `accessToken()` (or
+    /// `prewarm()`) is currently in progress. Concurrent callers await this
+    /// same task rather than starting their own, guaranteeing at most one
+    /// login/refresh at a time -- this is the same coalescing mechanism
+    /// shared by both entry points, not a second one added for `prewarm()`.
     private var inFlightTask: Task<String, Error>?
 
-    public init(api: any TokenIssuing, credentialStore: any CredentialStoring) {
+    public init(
+        api: any TokenIssuing,
+        credentialStore: any CredentialStoring,
+        now: @escaping () -> Date = Date.init
+    ) {
         self.api = api
         self.credentialStore = credentialStore
+        self.now = now
     }
 
     /// Resolve a usable access token, refreshing or logging in as needed.
     /// See the type-level documentation for the full resolution order.
     public func accessToken() async throws -> String {
+        try await coalesced { try await self.resolveAccessToken() }
+    }
+
+    /// Best-effort, best-effort-off-the-critical-path refresh of a
+    /// soon-to-expire token, intended to be called on every app foreground.
+    ///
+    /// - If there are no stored tokens at all, this returns immediately with
+    ///   no network call: `prewarm()` never triggers a login, since signing
+    ///   in is an explicit user action, not something that should happen
+    ///   silently in the background.
+    /// - If the stored token does not expire within `window` of now, this
+    ///   returns immediately with no network call.
+    /// - Otherwise this runs exactly the same refresh path `accessToken()`
+    ///   uses (including its fall-back-to-login-from-stored-credentials
+    ///   behaviour) and persists the result.
+    ///
+    /// Errors are swallowed: `prewarm()` never throws. If the refresh (and
+    /// any fallback login) fails, the previously stored/cached tokens are
+    /// left untouched, and the real `accessToken()` call on the critical
+    /// open path will surface the failure when it is actually needed.
+    ///
+    /// Shares the same single-flight `inFlightTask` as `accessToken()`, so a
+    /// `prewarm()` racing a concurrent `accessToken()` (or another
+    /// `prewarm()`) coalesces into a single refresh/login rather than two.
+    public func prewarm(expiringWithin window: Duration = .seconds(600)) async {
+        guard let stored = (try? credentialStore.loadTokens()) ?? nil else {
+            return
+        }
+
+        let referenceNow = now()
+        let windowSeconds = TimeInterval(window.components.seconds)
+            + TimeInterval(window.components.attoseconds) / 1e18
+        guard stored.expiresAt <= referenceNow.addingTimeInterval(windowSeconds) else {
+            return
+        }
+
+        _ = try? await coalesced { try await self.resolveAccessToken() }
+    }
+
+    /// Runs `operation` as the single in-flight resolution task, or awaits
+    /// the existing one if a call to `accessToken()`/`prewarm()` is already
+    /// in progress. This is the one and only coalescing mechanism used by
+    /// both public entry points.
+    private func coalesced(_ operation: @escaping @Sendable () async throws -> String) async throws -> String {
         if let existing = inFlightTask {
             return try await existing.value
         }
 
-        let task = Task { try await self.resolveAccessToken() }
+        let task = Task { try await operation() }
         inFlightTask = task
 
         defer { inFlightTask = nil }
