@@ -293,3 +293,119 @@ private func uniqueTestService() -> String {
     #expect(try store.loadCredentials() == nil)
     #expect(try store.loadTokens() == nil)
 }
+
+// MARK: - makeBaseQuery / makeAddAttributes (pure, no keychain access)
+
+@Test func makeBaseQueryOmitsAccessGroupWhenNil() {
+    let query = KeychainCredentialStore.makeBaseQuery(
+        service: "svc",
+        account: "acct",
+        accessGroup: nil
+    )
+    #expect(query[kSecAttrAccessGroup as String] == nil)
+    #expect(query.keys.contains(kSecClass as String))
+    #expect(query.keys.contains(kSecAttrService as String))
+    #expect(query.keys.contains(kSecAttrAccount as String))
+}
+
+@Test func makeBaseQueryIncludesAccessGroupWhenSet() {
+    let query = KeychainCredentialStore.makeBaseQuery(
+        service: "svc",
+        account: "acct",
+        accessGroup: "group.ie.boboco.GateOpener"
+    )
+    let value = query[kSecAttrAccessGroup as String] as? String
+    #expect(value == "group.ie.boboco.GateOpener")
+}
+
+@Test func makeAddAttributesMapsAfterFirstUnlockAccessibility() {
+    let attrs = KeychainCredentialStore.makeAddAttributes(accessibility: .afterFirstUnlockThisDeviceOnly)
+    let accessible = attrs[kSecAttrAccessible as String] as! CFString
+    #expect(accessible == kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly)
+    let sync = attrs[kSecAttrSynchronizable as String] as! CFBoolean
+    #expect(sync == kCFBooleanFalse)
+}
+
+@Test func makeAddAttributesMapsWhenUnlockedAccessibility() {
+    let attrs = KeychainCredentialStore.makeAddAttributes(accessibility: .whenUnlockedThisDeviceOnly)
+    let accessible = attrs[kSecAttrAccessible as String] as! CFString
+    #expect(accessible == kSecAttrAccessibleWhenUnlockedThisDeviceOnly)
+    let sync = attrs[kSecAttrSynchronizable as String] as! CFBoolean
+    #expect(sync == kCFBooleanFalse)
+}
+
+// MARK: - rewriteAccessibility
+
+@Test func rewriteAccessibilityRoundTripsStoredCredentialsAndTokens() throws {
+    let service = uniqueTestService()
+    guard probeKeychainUnavailableStatus(service: service) == nil else {
+        return
+    }
+    let store = KeychainCredentialStore(service: service, accessibility: .afterFirstUnlockThisDeviceOnly)
+    defer {
+        try? store.deleteCredentials()
+        try? store.deleteTokens()
+    }
+
+    try store.saveCredentials(username: "alice", password: "s3cret")
+    let tokens = TokenSet(
+        accessToken: "access-rw",
+        refreshToken: "refresh-rw",
+        expiresAt: Date(timeIntervalSince1970: 3_000_000),
+        tokenType: "Bearer"
+    )
+    try store.saveTokens(tokens)
+
+    try store.rewriteAccessibility(to: .whenUnlockedThisDeviceOnly)
+
+    let loadedCredentials = try store.loadCredentials()
+    #expect(loadedCredentials?.username == "alice")
+    #expect(loadedCredentials?.password == "s3cret")
+
+    let loadedTokens = try store.loadTokens()
+    #expect(loadedTokens == tokens)
+}
+
+@Test func rewriteItemPersistsNewDataUnderNewAccessibility() throws {
+    // Exercises the `rewriteItem` seam directly: `rewriteAccessibility`'s
+    // black-box round-trip test above cannot independently prove the
+    // underlying kSecAttrAccessible write happened, because the legacy
+    // file-based macOS login keychain used by unsigned `swift test`
+    // binaries does not return or filter on that attribute via
+    // SecItemCopyMatching (confirmed empirically). What IS observable here
+    // is that `rewriteItem`'s update-or-fallback-to-delete+add logic
+    // actually executes and persists new data — if that method's body were
+    // removed or short-circuited, the reloaded value would stay the OLD
+    // data (or the call would leave nothing stored), not the new payload.
+    let service = uniqueTestService()
+    guard probeKeychainUnavailableStatus(service: service) == nil else {
+        return
+    }
+    let store = KeychainCredentialStore(service: service, accessibility: .afterFirstUnlockThisDeviceOnly)
+    defer {
+        try? store.deleteCredentials()
+        try? store.deleteTokens()
+    }
+
+    try store.saveCredentials(username: "bob", password: "original")
+
+    let newPayload = Data(#"{"username":"bob","password":"rewritten"}"#.utf8)
+    try store.rewriteItem(account: "credentials", data: newPayload, accessibility: .whenUnlockedThisDeviceOnly)
+
+    let loaded = try store.loadCredentials()
+    #expect(loaded?.password == "rewritten")
+    #expect(loaded?.password != "original")
+}
+
+@Test func rewriteAccessibilityIsNoOpOnEmptyStore() throws {
+    let service = uniqueTestService()
+    guard probeKeychainUnavailableStatus(service: service) == nil else {
+        return
+    }
+    let store = KeychainCredentialStore(service: service)
+
+    // Nothing has ever been saved for this fresh, unique service — must not throw.
+    try store.rewriteAccessibility(to: .whenUnlockedThisDeviceOnly)
+    #expect(try store.loadCredentials() == nil)
+    #expect(try store.loadTokens() == nil)
+}
