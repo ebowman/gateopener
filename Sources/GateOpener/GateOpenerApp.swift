@@ -244,7 +244,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     eventLog.logOpenFailed(attempt: 1, of: 1, reason: .unknown)
                 }
                 lastLoggedStateWasOpening = false
-            case .needsSetup, .idle:
+            case .needsSetup, .idle, .queued:
+                // `.queued` (bead .4: `requestOpen()`'s offline queue) is
+                // deliberately NOT treated as an open attempt here: nothing
+                // has physically started yet — the request is merely
+                // waiting for connectivity. The real `logOpenAttempt` fires
+                // when/if state later transitions to `.opening` once the
+                // queued request actually runs.
                 lastLoggedStateWasOpening = false
             }
         }

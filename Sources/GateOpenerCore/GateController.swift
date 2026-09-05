@@ -32,6 +32,13 @@ import Foundation
 ///    "set up" affordance, not an error.
 ///  - `.idle`: ready, nothing in flight.
 ///  - `.opening`: a command is in flight; the icon should show a busy state.
+///  - `.queued`: a `requestOpen()` call (bead .4) arrived while offline and
+///    is being held until connectivity returns (or its TTL elapses). The UI
+///    should treat this identically to `.opening` (same busy icon/overlay/
+///    status text) — the caller has already gotten "your tap registered"
+///    feedback; whether the request is physically in flight yet or merely
+///    waiting for a network path is an internal distinction the UI does not
+///    need to show separately.
 ///  - `.succeeded(at:)`: the open command succeeded at this time — the icon
 ///    can show a checkmark, and this timestamp lets the UI decide how long
 ///    to keep it (independent of the internal auto-reset timer).
@@ -42,6 +49,7 @@ public enum GateState: Equatable, Sendable {
     case needsSetup
     case idle
     case opening
+    case queued
     case succeeded(at: Date)
     case failed(message: String)
 }
@@ -135,13 +143,38 @@ public final class GateController {
     /// following closely after a scheduled success-reset).
     private var resetTask: Task<Void, Never>?
 
+    /// Reachability seam for `requestOpen()` (bead .4). Defaults to
+    /// `AlwaysReachable()` so every existing call site (and existing Mac app
+    /// behavior/tests) is unaffected.
+    private let reachability: any ReachabilityProviding
+
+    /// How long a `requestOpen()` call may sit `.queued` (offline) before it
+    /// is abandoned with `.failed(message: "No network")`. Defaults to 45
+    /// seconds per the bead brief; injectable for tests.
+    private let queueTTL: Duration
+
+    /// Identifies the currently-queued `requestOpen()` request, if any.
+    /// Compared by reference identity (a fresh `NSObject`-free token) so a
+    /// stale TTL task from a PREVIOUS queued request — one that has already
+    /// been cleared, e.g. because reachability flipped true and the request
+    /// fired — can recognize it is stale and no-op rather than clobbering a
+    /// newer queued request or double-firing.
+    private var queuedRequestToken: UUID?
+
+    /// Tracks the scheduled TTL task for the currently-queued request, so it
+    /// can be cancelled the moment the request fires (reachability flip) or
+    /// is dropped (`signOut()`).
+    private var queueTTLTask: Task<Void, Never>?
+
     public init(
         gateClient: any GateOpening,
         tokenManager: any TokenResolving,
         credentialStore: any CredentialStoring,
         appSettings: AppSettings,
         autoResetDelay: Duration = .seconds(3),
-        sleep: @escaping GateControllerSleep = { try await Task.sleep(for: $0) }
+        sleep: @escaping GateControllerSleep = { try await Task.sleep(for: $0) },
+        reachability: any ReachabilityProviding = AlwaysReachable(),
+        queueTTL: Duration = .seconds(45)
     ) {
         self.gateClient = gateClient
         self.tokenManager = tokenManager
@@ -149,6 +182,8 @@ public final class GateController {
         self.appSettings = appSettings
         self.autoResetDelay = autoResetDelay
         self.sleep = sleep
+        self.reachability = reachability
+        self.queueTTL = queueTTL
 
         // Initial state: `.needsSetup` when there are no stored credentials
         // or no selected gate; otherwise `.idle`. `AppSettings.isConfigured`
@@ -160,6 +195,18 @@ public final class GateController {
             self.state = .idle
         } else {
             self.state = .needsSetup
+        }
+
+        // Registered once, here, for the controller's lifetime (per the
+        // bead's "registered once" requirement). The handler hops to the
+        // main actor before touching any state (reachability callbacks may
+        // arrive on any thread — see `ReachabilityProviding`'s THREADING
+        // note) and ignores callbacks when nothing is queued.
+        self.reachability.setOnChange { [weak self] isReachable in
+            guard isReachable else { return }
+            Task { @MainActor [weak self] in
+                self?.handleReachabilityBecameTrue()
+            }
         }
     }
 
@@ -202,6 +249,86 @@ public final class GateController {
         openTask = task
         await task.value
         openTask = nil
+    }
+
+    // MARK: - requestOpen (non-blocking entry point, bead .4)
+
+    /// Non-blocking entry point for the widget/background-task use case:
+    /// unlike `openGate()`, this never suspends the caller. It always
+    /// returns synchronously.
+    ///
+    /// Semantics:
+    ///  - If a request is already `.opening` or `.queued`, this is a no-op
+    ///    (coalescing: a burst of taps must never result in more than one
+    ///    physical open).
+    ///  - If `reachability.isReachable`, starts `openGate()` in a detached
+    ///    `Task` (fire-and-forget) and returns immediately — behaviorally
+    ///    identical to today's "tap -> `Task { await controller.openGate()
+    ///    }`" call sites, just moved inside the controller.
+    ///  - Otherwise, transitions to `.queued`, remembers this request via a
+    ///    fresh token, and starts a bounded TTL timer (`queueTTL`, default
+    ///    45s, via the injected `sleep` seam so tests never wait). If
+    ///    reachability flips true before the TTL elapses, the request fires
+    ///    (`openGate()`) on the FIRST such flip — a later flip back to
+    ///    `false` must not cancel an already-fired request, and this method
+    ///    only ever needs to react to a flip TO true. If the TTL elapses
+    ///    first, the request is abandoned: `transition(to: .failed(message:
+    ///    "No network"))`, which reuses the existing auto-reset-to-`.idle`
+    ///    path. A subsequent flip to true after the TTL has already fired
+    ///    (or expired) must NOT fire a stale request — enforced by
+    ///    comparing `queuedRequestToken` by identity everywhere it is
+    ///    consulted.
+    public func requestOpen() {
+        if state == .opening || state == .queued {
+            return
+        }
+
+        if reachability.isReachable {
+            Task { [weak self] in
+                await self?.openGate()
+            }
+            return
+        }
+
+        let token = UUID()
+        queuedRequestToken = token
+        state = .queued
+
+        queueTTLTask = Task { [weak self, queueTTL, sleep] in
+            do {
+                try await sleep(queueTTL)
+            } catch {
+                return
+            }
+            self?.handleQueueTTLElapsed(for: token)
+        }
+    }
+
+    /// Invoked (on the main actor) when the queue TTL timer fires for
+    /// `token`. A no-op if `token` is no longer the current queued request
+    /// (it already fired via a reachability flip, or was dropped by
+    /// `signOut()`), so a stale timer can never clobber newer state.
+    private func handleQueueTTLElapsed(for token: UUID) {
+        guard queuedRequestToken == token else { return }
+        queuedRequestToken = nil
+        queueTTLTask = nil
+        transition(to: .failed(message: "No network"))
+    }
+
+    /// Invoked (on the main actor) whenever the injected `reachability`
+    /// reports a flip to `true`. A no-op if nothing is currently queued
+    /// (either there was never a queued request, or it already fired/
+    /// expired) — this is what makes a stale/late `true` callback after TTL
+    /// expiry harmless, and what makes an extra `true` callback with
+    /// nothing queued harmless too.
+    private func handleReachabilityBecameTrue() {
+        guard queuedRequestToken != nil else { return }
+        queuedRequestToken = nil
+        queueTTLTask?.cancel()
+        queueTTLTask = nil
+        Task { [weak self] in
+            await self?.openGate()
+        }
     }
 
     private func performOpen() async {
@@ -437,6 +564,9 @@ public final class GateController {
         cancelPendingReset()
         openTask?.cancel()
         openTask = nil
+        queueTTLTask?.cancel()
+        queueTTLTask = nil
+        queuedRequestToken = nil
         try? credentialStore.deleteCredentials()
         try? credentialStore.deleteTokens()
         appSettings.reset()
