@@ -71,6 +71,7 @@ struct SettingsView: View {
             Form {
                 defaultGateSection
                 videoSection
+                quickAccessSection
                 lockScreenSection
                 accountSection
                 aboutSection
@@ -187,6 +188,30 @@ struct SettingsView: View {
                 refreshToken += 1
             }
         )
+    }
+
+    // MARK: - Quick access
+
+    /// Text-only hint row (bead gateopener-672.15 step 3) pointing the
+    /// operator at the three one-tap surfaces `OpenGateIntent` powers:
+    /// the Control Center control (`GateControl`), the Action Button, and
+    /// the Home/Lock Screen widget (`GateWidget`). Deliberately its own
+    /// section — named "Quick access" rather than folded into "Lock
+    /// Screen" — so gateopener-672.16's "Allow opening while locked"
+    /// toggle can still land in `lockScreenSection` without reshuffling
+    /// this content.
+    private var quickAccessSection: some View {
+        Section {
+            Text("Control Center: tap + in Control Center, then Add a Control → GateOpener → Open Gate.")
+            Text("Action Button: Settings → Action Button → Controls → Open Gate.")
+            Text("Home Screen: touch and hold the Home Screen, tap +, then add the GateOpener widget.")
+        } header: {
+            Text("Quick access")
+        } footer: {
+            Text("Open the gate from Control Center, the Action Button, or a Home Screen widget without opening this app.")
+        }
+        .font(.footnote)
+        .foregroundStyle(.secondary)
     }
 
     // MARK: - Lock Screen (reserved for bead gateopener-672.16)
