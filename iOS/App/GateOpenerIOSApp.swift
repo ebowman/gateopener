@@ -1,5 +1,8 @@
 import SwiftUI
 import GateOpenerCore
+#if DEBUG
+import os
+#endif
 
 /// The iOS app's `@main` entry point.
 ///
@@ -70,6 +73,28 @@ struct GateOpenerIOSApp: App {
     var body: some Scene {
         WindowGroup {
             RootView(environment: environment, observable: observable, appSettings: environment.appSettings)
+                #if DEBUG
+                // `--run-intent` (bead gateopener-672.13 verification):
+                // drives `OpenGateIntent` directly, without any
+                // AppIntents/Siri/Shortcuts/widget infrastructure, so a
+                // screenshot script can confirm the SAME snapshot the
+                // widget would read gets written by the intent path. This
+                // constructs its OWN `AppEnvironment` (matching what a real
+                // `OpenGateIntent` invocation from a separate extension
+                // process would do) rather than reusing `environment`
+                // above — see `OpenGateIntent.runFlow()`'s doc comment.
+                .task {
+                    guard DebugLaunchOptions.runIntentOnLaunch else { return }
+                    // Reuses the app's OWN `environment` (built above,
+                    // possibly with a `--mock-gate`-injected fake
+                    // `GateOpening`/`TokenResolving`) rather than letting
+                    // `runFlow()` construct a fresh, unmocked one — see
+                    // `OpenGateIntent.runFlow(environment:)`'s doc comment.
+                    let outcome = await OpenGateIntent.runFlow(environment: environment)
+                    Logger(subsystem: "ie.boboco.GateOpener", category: "DebugLaunchOptions")
+                        .notice("--run-intent finished: \(String(describing: outcome), privacy: .public)")
+                }
+                #endif
         }
         .onChange(of: scenePhase) { _, newPhase in
             guard newPhase == .active else { return }

@@ -648,6 +648,30 @@ private struct WeirdError: Error {}
     #expect(message == "Wrong username or password")
 }
 
+/// `errSecInteractionNotAllowed` (-25308) is the status a locked-device
+/// App Intent invocation surfaces when it tries to read a keychain item
+/// before first unlock (bead gateopener-672.13 step 6). This must map to
+/// an explicit, actionable message rather than the generic fallback.
+@Test @MainActor func keychainInteractionNotAllowedMapsToUnlockMessage() throws {
+    let loadMessage = GateController.shortMessage(for: KeychainError.loadFailed(status: errSecInteractionNotAllowed))
+    #expect(loadMessage == "Unlock iPhone to open the gate")
+
+    let saveMessage = GateController.shortMessage(for: KeychainError.saveFailed(status: errSecInteractionNotAllowed))
+    #expect(saveMessage == "Unlock iPhone to open the gate")
+
+    let deleteMessage = GateController.shortMessage(for: KeychainError.deleteFailed(status: errSecInteractionNotAllowed))
+    #expect(deleteMessage == "Unlock iPhone to open the gate")
+}
+
+/// A DIFFERENT `KeychainError` status must NOT be mapped to the unlock
+/// message — distinguishes this from a vacuous "any KeychainError ->
+/// unlock message" mapping.
+@Test @MainActor func keychainOtherStatusDoesNotMapToUnlockMessage() throws {
+    let message = GateController.shortMessage(for: KeychainError.loadFailed(status: errSecItemNotFound))
+    #expect(message != "Unlock iPhone to open the gate")
+    #expect(message == "Could not open the gate")
+}
+
 // MARK: - requestOpen() (bead .4: non-blocking entry point, offline queue, TTL, coalescing)
 
 /// Polls (no fixed sleep) until `controller.state` matches `predicate`, or a

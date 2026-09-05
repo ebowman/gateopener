@@ -66,6 +66,17 @@ enum DebugLaunchOptions {
         ProcessInfo.processInfo.arguments.contains("--open-settings")
     }
 
+    /// True if `--run-intent` was passed on the launch command line (bead
+    /// gateopener-672.13 verification step): drives `OpenGateIntent`
+    /// directly from `GateOpenerIOSApp.init()` without any UI automation,
+    /// since the intent itself is not otherwise triggerable outside of
+    /// Siri/Shortcuts/widget infrastructure the simulator cannot easily
+    /// drive from a test script. Combine with `--mock-gate [ok|fail]` to
+    /// exercise the intent end to end against the fake `GateOpening`.
+    static var runIntentOnLaunch: Bool {
+        ProcessInfo.processInfo.arguments.contains("--run-intent")
+    }
+
     /// Pre-seeds `appSettings` and the credential store so a `--mock-gate`
     /// run starts in `.idle` (a selected gate + stored credentials) rather
     /// than `.needsSetup`. No-op unless `mockGateMode` is non-nil.
