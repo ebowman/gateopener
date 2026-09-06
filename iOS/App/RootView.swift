@@ -10,6 +10,7 @@ struct RootView: View {
     var environment: AppEnvironment
     var observable: GateControllerObservable
     var appSettings: AppSettings
+    var doorVideoCoordinator: DoorVideoCoordinator
 
     var body: some View {
         NavigationStack {
@@ -17,7 +18,12 @@ struct RootView: View {
             case .needsSetup:
                 SignInView(observable: observable)
             default:
-                MainView(environment: environment, observable: observable, appSettings: appSettings)
+                MainView(
+                    environment: environment,
+                    observable: observable,
+                    appSettings: appSettings,
+                    doorVideoCoordinator: doorVideoCoordinator
+                )
             }
         }
     }

@@ -106,6 +106,19 @@ enum DebugLaunchOptions {
         ProcessInfo.processInfo.arguments.contains("--video-harness")
     }
 
+    /// True if `--mock-video` was passed on the launch command line (bead
+    /// gateopener-672.12 verification): `DoorVideoCoordinator`'s session
+    /// factory builds `DoorVideoSession.debugStub()` instead of a real
+    /// `DoorVideoSession`. Needed because `--mock-gate ok`'s
+    /// `cachedGates` (see `seedMockAccountIfNeeded`) has no camera
+    /// endpoint, so a real `DoorVideoSession` would fail immediately with
+    /// "No camera" — `--mock-video` instead runs a canned
+    /// connecting -> streaming -> ended timeline with no network at all,
+    /// so the door-video panel itself can be screenshotted.
+    static var mockVideoOnLaunch: Bool {
+        ProcessInfo.processInfo.arguments.contains("--mock-video")
+    }
+
     /// Pre-seeds `appSettings` and the credential store so a `--mock-gate`
     /// run starts in `.idle` (a selected gate + stored credentials) rather
     /// than `.needsSetup`. No-op unless `mockGateMode` is non-nil.

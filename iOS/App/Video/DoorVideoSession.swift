@@ -164,6 +164,15 @@ public final class DoorVideoSession: NSObject {
     /// timeout; cancelled by `stop()`.
     private var livenessTask: Task<Void, Never>?
 
+    #if DEBUG
+    /// Set only by `debugStub(connectingDelay:streamingDuration:)` below.
+    /// When non-`nil`, `start()` skips ALL real work (no network, no
+    /// WKWebView page load, no token resolution) and instead runs this
+    /// canned `.connecting` -> `.streaming` -> `.ended` timeline — see that
+    /// factory's doc comment.
+    private var debugStubTimeline: (connectingDelay: TimeInterval, streamingDuration: TimeInterval)?
+    #endif
+
     /// - Parameter appSettings: Supplies `cachedGates` — the last
     ///   locally-persisted discovery result (`GateController.discover()`
     ///   writes it; see that type and `AppSettings.cachedGates`'s doc
@@ -252,6 +261,13 @@ public final class DoorVideoSession: NSObject {
         lastFrameAt = nil
         livenessTask?.cancel()
         livenessTask = nil
+
+        #if DEBUG
+        if let timeline = debugStubTimeline {
+            await runDebugStubTimeline(timeline)
+            return
+        }
+        #endif
 
         state = .connecting
 
@@ -649,6 +665,79 @@ public final class DoorVideoSession: NSObject {
         throw lastError
     }
 }
+
+#if DEBUG
+extension DoorVideoSession {
+    /// Builds a `DoorVideoSession` that never touches the network or loads
+    /// `door-video.html`: `start()` instead runs a canned
+    /// `.connecting` -> `.streaming` -> `.ended` timeline, driven purely by
+    /// `Task.sleep`. Used by `--mock-video` (`DebugLaunchOptions`) so the
+    /// door-video panel (bead gateopener-672.12) can be exercised on the
+    /// simulator, where `--mock-gate`'s `cachedGates` has no camera
+    /// endpoint and a real `DoorVideoSession` would fail fast with "No
+    /// camera".
+    ///
+    /// The real dependencies (`tokenManager`, `gateClient`, `appSettings`)
+    /// are still required by `init` but are never exercised by the stub
+    /// timeline, so throwaway-but-real instances are constructed here
+    /// rather than widening `init`'s parameters to optionals for a
+    /// DEBUG-only path.
+    ///
+    /// - Parameters:
+    ///   - connectingDelay: How long `state` stays `.connecting` before
+    ///     flipping to `.streaming`. Defaults to 2s.
+    ///   - streamingDuration: How long `state` stays `.streaming` before
+    ///     flipping to `.ended`. Defaults to 8s.
+    public static func debugStub(
+        connectingDelay: TimeInterval = 2,
+        streamingDuration: TimeInterval = 8
+    ) -> DoorVideoSession {
+        let session = DoorVideoSession(
+            tokenManager: TokenManager(api: ComelitAPI(), credentialStore: DebugStubNullCredentialStore()),
+            gateClient: DebugStubNullGateOpening(),
+            appSettings: AppSettings(defaults: UserDefaults(suiteName: "ie.boboco.GateOpener.debugStub") ?? .standard)
+        )
+        session.debugStubTimeline = (connectingDelay: connectingDelay, streamingDuration: streamingDuration)
+        return session
+    }
+
+    /// Runs the canned timeline installed by `debugStub`. Never touches
+    /// `webView`/network/JS bridging — `state` transitions are the only
+    /// observable effect, matching what `DoorVideoView` needs to render the
+    /// "Connecting…" overlay and then the (blank, since no real page is
+    /// loaded) streaming state.
+    fileprivate func runDebugStubTimeline(_ timeline: (connectingDelay: TimeInterval, streamingDuration: TimeInterval)) async {
+        state = .connecting
+        try? await Task.sleep(for: .seconds(timeline.connectingDelay))
+        guard !hasStopped else { return }
+
+        state = .streaming
+        try? await Task.sleep(for: .seconds(timeline.streamingDuration))
+        guard !hasStopped else { return }
+
+        hasStopped = true
+        state = .ended
+    }
+}
+
+/// Throwaway `CredentialStoring` used only by `debugStub` — never actually
+/// called, since the stub timeline never resolves a token.
+private struct DebugStubNullCredentialStore: CredentialStoring {
+    func saveCredentials(username: String, password: String) throws {}
+    func loadCredentials() throws -> (username: String, password: String)? { nil }
+    func deleteCredentials() throws {}
+    func saveTokens(_ tokens: TokenSet) throws {}
+    func loadTokens() throws -> TokenSet? { nil }
+    func deleteTokens() throws {}
+}
+
+/// Throwaway `GateOpening` used only by `debugStub` — never actually called,
+/// since the stub timeline never discovers or opens anything.
+private struct DebugStubNullGateOpening: GateOpening {
+    func discover(aptId: String?) async throws -> [Endpoint] { [] }
+    func open(endpointId: String) async throws {}
+}
+#endif
 
 // MARK: - Errors
 
