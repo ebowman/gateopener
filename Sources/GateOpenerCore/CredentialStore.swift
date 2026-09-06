@@ -46,6 +46,33 @@ public enum KeychainError: Error, Equatable {
     case decodeFailed
 }
 
+/// The accessibility class applied to items saved by `KeychainCredentialStore`.
+///
+/// Both cases restrict the item to this device only (never migrates via
+/// iCloud Keychain backup/restore to a different device) — see
+/// `KeychainCredentialStore.makeAddAttributes(accessibility:)`, which also
+/// sets `kSecAttrSynchronizable` to `false` for the same reason, belt and
+/// braces.
+public enum KeychainAccessibility: Sendable {
+    /// Item is readable once the device has been unlocked at least once
+    /// since boot, including while subsequently locked again (e.g. for a
+    /// headless background refresh). This is the default.
+    case afterFirstUnlockThisDeviceOnly
+    /// Item is only readable while the device is unlocked. Appropriate for
+    /// an "allow while locked" opt-out setting.
+    case whenUnlockedThisDeviceOnly
+
+    /// The `kSecAttrAccessible` value corresponding to this case.
+    var secAttr: CFString {
+        switch self {
+        case .afterFirstUnlockThisDeviceOnly:
+            return kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        case .whenUnlockedThisDeviceOnly:
+            return kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+        }
+    }
+}
+
 /// Keychain-backed implementation of `CredentialStoring`.
 ///
 /// ## Storage design
@@ -89,14 +116,31 @@ public final class KeychainCredentialStore: CredentialStoring, Sendable {
     private static let tokensAccount = "tokens"
 
     private let service: String
+    private let accessGroup: String?
+    private let accessibility: KeychainAccessibility
 
-    /// - Parameter service: The `kSecAttrService` value scoping all keychain
-    ///   items created by this instance. Defaults to the production service
-    ///   string. Tests should pass a unique value (e.g. including a UUID) so
-    ///   that concurrent test runs never collide with each other or with the
-    ///   real app's stored credentials.
-    public init(service: String = KeychainCredentialStore.defaultService) {
+    /// - Parameters:
+    ///   - service: The `kSecAttrService` value scoping all keychain
+    ///     items created by this instance. Defaults to the production service
+    ///     string. Tests should pass a unique value (e.g. including a UUID) so
+    ///     that concurrent test runs never collide with each other or with the
+    ///     real app's stored credentials.
+    ///   - accessGroup: The `kSecAttrAccessGroup` value used to share items
+    ///     between the iOS app and its widget extension. Defaults to `nil`,
+    ///     which omits the attribute entirely — required on macOS and in the
+    ///     unsigned `swift test` binary, both of which lack an access-group
+    ///     entitlement and would fail every keychain call if one were forced.
+    ///   - accessibility: The `kSecAttrAccessible` class applied to saved
+    ///     items. Defaults to `.afterFirstUnlockThisDeviceOnly`, matching the
+    ///     store's previous, unconfigurable behaviour.
+    public init(
+        service: String = KeychainCredentialStore.defaultService,
+        accessGroup: String? = nil,
+        accessibility: KeychainAccessibility = .afterFirstUnlockThisDeviceOnly
+    ) {
         self.service = service
+        self.accessGroup = accessGroup
+        self.accessibility = accessibility
     }
 
     // MARK: - Credentials
@@ -151,14 +195,101 @@ public final class KeychainCredentialStore: CredentialStoring, Sendable {
         try delete(account: Self.tokensAccount)
     }
 
+    // MARK: - Accessibility rewrite
+
+    /// Re-saves any currently-stored credentials and tokens under a new
+    /// `KeychainAccessibility` class, in place.
+    ///
+    /// This only rewrites items that already exist in the keychain — it is a
+    /// no-op (does not throw) if nothing is stored. It does NOT change this
+    /// instance's own `accessibility` for future `saveCredentials`/
+    /// `saveTokens` calls: those keep using the accessibility this instance
+    /// was constructed with. Callers that want subsequent saves to use the
+    /// new class too (e.g. after flipping an "allow while locked" setting)
+    /// must construct a new `KeychainCredentialStore` with the new
+    /// `accessibility` value and use that store going forward.
+    public func rewriteAccessibility(to newAccessibility: KeychainAccessibility) throws {
+        if let data = try load(account: Self.credentialsAccount) {
+            try rewriteItem(account: Self.credentialsAccount, data: data, accessibility: newAccessibility)
+        }
+        if let data = try load(account: Self.tokensAccount) {
+            try rewriteItem(account: Self.tokensAccount, data: data, accessibility: newAccessibility)
+        }
+    }
+
+    /// Rewrites a single existing item's `kSecAttrAccessible` (and re-applies
+    /// its data) using `SecItemUpdate`. `kSecAttrAccessible` cannot always be
+    /// changed via update in every keychain configuration, so on failure this
+    /// falls back to delete + add with the new attributes.
+    ///
+    /// `internal` (rather than `private`) so `@testable import` tests can
+    /// verify it builds its update/add dictionaries from
+    /// `makeBaseQuery`/`makeAddAttributes` — the underlying
+    /// `kSecAttrAccessible` value it writes is not independently observable
+    /// via `SecItemCopyMatching` on every keychain configuration (notably
+    /// the legacy file-based macOS login keychain used by unsigned
+    /// `swift test` binaries does not return or filter on that attribute),
+    /// so this is the most direct non-vacuous test seam available.
+    func rewriteItem(account: String, data: Data, accessibility: KeychainAccessibility) throws {
+        let query = Self.makeBaseQuery(service: service, account: account, accessGroup: accessGroup)
+        var attributesToUpdate = Self.makeAddAttributes(accessibility: accessibility)
+        attributesToUpdate[kSecValueData as String] = data
+
+        let updateStatus = SecItemUpdate(query as CFDictionary, attributesToUpdate as CFDictionary)
+        if updateStatus == errSecSuccess {
+            return
+        }
+
+        // Fall back to delete + add with the new attributes.
+        let deleteStatus = SecItemDelete(query as CFDictionary)
+        guard deleteStatus == errSecSuccess || deleteStatus == errSecItemNotFound else {
+            throw KeychainError.deleteFailed(status: deleteStatus)
+        }
+
+        var addQuery = Self.makeBaseQuery(service: service, account: account, accessGroup: accessGroup)
+        addQuery.merge(Self.makeAddAttributes(accessibility: accessibility)) { _, new in new }
+        addQuery[kSecValueData as String] = data
+
+        let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
+        guard addStatus == errSecSuccess else {
+            throw KeychainError.saveFailed(status: addStatus)
+        }
+    }
+
     // MARK: - Generic keychain plumbing
 
-    private func baseQuery(account: String) -> [String: Any] {
-        [
+    /// Builds the base `SecItemXxx` query dictionary shared by add, update,
+    /// copy-matching and delete calls for a given `service`/`account` pair.
+    ///
+    /// `kSecAttrAccessGroup` is included ONLY when `accessGroup` is non-nil:
+    /// on macOS (and in the unsigned SwiftPM test binary) the process has no
+    /// access-group entitlement, and forcing the attribute in unconditionally
+    /// would make every keychain call fail there.
+    static func makeBaseQuery(service: String, account: String, accessGroup: String?) -> [String: Any] {
+        var query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account
         ]
+        if let accessGroup {
+            query[kSecAttrAccessGroup as String] = accessGroup
+        }
+        return query
+    }
+
+    /// Builds the attributes applied when adding (or rewriting) a keychain
+    /// item: the requested accessibility class, and `kSecAttrSynchronizable`
+    /// forced to `false` so the item never syncs via iCloud Keychain to
+    /// another device, regardless of the user's iCloud Keychain setting.
+    static func makeAddAttributes(accessibility: KeychainAccessibility) -> [String: Any] {
+        [
+            kSecAttrAccessible as String: accessibility.secAttr,
+            kSecAttrSynchronizable as String: kCFBooleanFalse as Any
+        ]
+    }
+
+    private func baseQuery(account: String) -> [String: Any] {
+        Self.makeBaseQuery(service: service, account: account, accessGroup: accessGroup)
     }
 
     /// Adds a new keychain item, or updates the existing one in place if an
@@ -167,8 +298,8 @@ public final class KeychainCredentialStore: CredentialStoring, Sendable {
     /// `saveTokens` overwrite rather than fail with `errSecDuplicateItem`.
     private func save(account: String, data: Data) throws {
         var addQuery = baseQuery(account: account)
+        addQuery.merge(Self.makeAddAttributes(accessibility: accessibility)) { _, new in new }
         addQuery[kSecValueData as String] = data
-        addQuery[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
 
         let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
         if addStatus == errSecSuccess {
@@ -176,10 +307,8 @@ public final class KeychainCredentialStore: CredentialStoring, Sendable {
         }
         if addStatus == errSecDuplicateItem {
             let query = baseQuery(account: account)
-            let attributesToUpdate: [String: Any] = [
-                kSecValueData as String: data,
-                kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock
-            ]
+            var attributesToUpdate = Self.makeAddAttributes(accessibility: accessibility)
+            attributesToUpdate[kSecValueData as String] = data
             let updateStatus = SecItemUpdate(query as CFDictionary, attributesToUpdate as CFDictionary)
             guard updateStatus == errSecSuccess else {
                 throw KeychainError.saveFailed(status: updateStatus)

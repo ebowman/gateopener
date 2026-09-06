@@ -351,13 +351,19 @@ final class OverlayWindowController {
         let showOverlay = appSettings.showOpenConfirmationOverlay
 
         switch state {
-        case .opening:
+        case .opening, .queued:
             // Only block bringing up a brand-new panel. If a panel already
             // exists (e.g. a fast re-open racing a toggle-off — see the
             // edge-case doc above), let it proceed exactly like the setting
             // was never touched; this mirrors reentrancy rule (a) elsewhere
             // in this type, which does not special-case a mid-flight
             // panel's origin.
+            //
+            // `.queued` (bead .4: `requestOpen()`'s offline queue) is
+            // treated identically to `.opening` here — from the overlay's
+            // perspective both mean "an open is in progress, show the busy
+            // state", regardless of whether the underlying request has
+            // physically started yet or is still waiting for connectivity.
             guard showOverlay || panel != nil else { return }
             handleOpening()
         case .succeeded:

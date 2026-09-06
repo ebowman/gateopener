@@ -34,6 +34,13 @@ final class MockTokenIssuing: TokenIssuing, @unchecked Sendable {
     private var loginGateEnabled = false
     private var loginGateOpen = false
 
+    /// Same mechanism as `loginGate`, but for `refresh` calls. Used to make
+    /// the prewarm/accessToken coalescing test deterministic rather than
+    /// timing-dependent.
+    private var refreshGateContinuations: [CheckedContinuation<Void, Never>] = []
+    private var refreshGateEnabled = false
+    private var refreshGateOpen = false
+
     enum TestError: Error, Equatable {
         case unconfigured
     }
@@ -99,8 +106,46 @@ final class MockTokenIssuing: TokenIssuing, @unchecked Sendable {
         }
     }
 
+    /// Call before use to enable gating of `refresh` calls.
+    func enableRefreshGate() {
+        withLock { refreshGateEnabled = true }
+    }
+
+    /// Release any (current or future) call to `refresh` that is waiting on
+    /// the gate.
+    func openRefreshGate() {
+        let continuations: [CheckedContinuation<Void, Never>] = withLock {
+            let waiting = refreshGateContinuations
+            refreshGateContinuations = []
+            refreshGateOpen = true
+            return waiting
+        }
+        for continuation in continuations {
+            continuation.resume()
+        }
+    }
+
     func refresh(_ tokens: TokenSet) async throws -> TokenSet {
-        withLock { refreshCallCount += 1 }
+        let shouldWait: Bool = withLock {
+            refreshCallCount += 1
+            return refreshGateEnabled && !refreshGateOpen
+        }
+
+        if shouldWait {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                let resumeImmediately: Bool = withLock {
+                    if refreshGateOpen {
+                        return true
+                    } else {
+                        refreshGateContinuations.append(continuation)
+                        return false
+                    }
+                }
+                if resumeImmediately {
+                    continuation.resume()
+                }
+            }
+        }
 
         switch refreshResult {
         case .success(let tokens):
@@ -332,5 +377,121 @@ private func makeTokenSet(
 
     #expect(token == "comfortable-token")
     #expect(issuing.refreshCallCount == 0)
+    #expect(issuing.loginCallCount == 0)
+}
+
+// MARK: - prewarm() tests
+
+@Test func prewarmWithFreshTokenMakesNoNetworkCall() async throws {
+    let store = MockCredentialStore()
+    let issuing = MockTokenIssuing()
+    let fixedNow = Date()
+    // Expires in 1h -- well outside the default 600s prewarm window.
+    let fresh = makeTokenSet(accessToken: "fresh-token", expiresIn: 3600)
+    try store.saveCredentials(username: "alice", password: "s3cret")
+    try store.saveTokens(fresh)
+
+    let manager = TokenManager(api: issuing, credentialStore: store, now: { fixedNow })
+
+    await manager.prewarm()
+
+    #expect(issuing.refreshCallCount == 0)
+    #expect(issuing.loginCallCount == 0)
+
+    // The stored token must be untouched.
+    let persisted = try store.loadTokens()
+    #expect(persisted?.accessToken == "fresh-token")
+}
+
+@Test func prewarmWithSoonToExpireTokenRefreshesExactlyOnce() async throws {
+    let store = MockCredentialStore()
+    let issuing = MockTokenIssuing()
+    let fixedNow = Date()
+    // Expires in 5 minutes -- inside the default 600s (10 min) prewarm window.
+    let soonToExpire = makeTokenSet(accessToken: "soon-to-expire", expiresIn: 300)
+    let refreshed = makeTokenSet(accessToken: "refreshed-token", expiresIn: 3600)
+    try store.saveCredentials(username: "alice", password: "s3cret")
+    try store.saveTokens(soonToExpire)
+    issuing.refreshResult = .success(refreshed)
+
+    let manager = TokenManager(api: issuing, credentialStore: store, now: { fixedNow })
+
+    await manager.prewarm()
+
+    #expect(issuing.refreshCallCount == 1)
+    #expect(issuing.loginCallCount == 0)
+
+    let persisted = try store.loadTokens()
+    #expect(persisted?.accessToken == "refreshed-token")
+}
+
+@Test func prewarmWithNoStoredTokensMakesNoNetworkCall() async throws {
+    let store = MockCredentialStore()
+    let issuing = MockTokenIssuing()
+    #expect(store.isEmpty)
+
+    let manager = TokenManager(api: issuing, credentialStore: store)
+
+    await manager.prewarm()
+
+    #expect(issuing.loginCallCount == 0)
+    #expect(issuing.refreshCallCount == 0)
+}
+
+@Test func prewarmSwallowsFailureAndLeavesOldTokensStored() async throws {
+    let store = MockCredentialStore()
+    let issuing = MockTokenIssuing()
+    let fixedNow = Date()
+    let soonToExpire = makeTokenSet(accessToken: "soon-to-expire", expiresIn: 300)
+    try store.saveTokens(soonToExpire)
+    // No stored credentials, so the fallback-to-login path cannot succeed
+    // either: refresh fails, then login fails with .notConfigured.
+    issuing.refreshResult = .failure(ComelitError.missingRefreshToken)
+
+    let manager = TokenManager(api: issuing, credentialStore: store, now: { fixedNow })
+
+    await manager.prewarm() // must not throw
+
+    #expect(issuing.refreshCallCount == 1)
+    #expect(issuing.loginCallCount == 0)
+
+    // The old token set must remain stored, untouched by the failed attempt.
+    let persisted = try store.loadTokens()
+    #expect(persisted?.accessToken == "soon-to-expire")
+}
+
+@Test func concurrentPrewarmAndAccessTokenCoalesceToOneRefresh() async throws {
+    let store = MockCredentialStore()
+    let issuing = MockTokenIssuing()
+    let fixedNow = Date()
+    let soonToExpire = makeTokenSet(accessToken: "soon-to-expire", expiresIn: 300)
+    let refreshed = makeTokenSet(accessToken: "refreshed-token", expiresIn: 3600)
+    try store.saveCredentials(username: "alice", password: "s3cret")
+    try store.saveTokens(soonToExpire)
+    issuing.refreshResult = .success(refreshed)
+    issuing.enableRefreshGate()
+
+    let manager = TokenManager(api: issuing, credentialStore: store, now: { fixedNow })
+
+    async let prewarmed: Void = manager.prewarm()
+    async let accessed = manager.accessToken()
+
+    // Give both callers a genuine chance to reach (and suspend inside)
+    // refresh before releasing the gate, so this isn't a lucky race: if
+    // coalescing is broken, both `prewarm()` and `accessToken()` will have
+    // independently called `refresh()` and be waiting on the gate here.
+    while issuing.refreshCallCount < 1 {
+        await Task.yield()
+    }
+    for _ in 0..<50 {
+        await Task.yield()
+    }
+    issuing.openRefreshGate()
+
+    let token = try await accessed
+    await prewarmed
+
+    #expect(token == "refreshed-token")
+    #expect(issuing.refreshCallCount == 1)
     #expect(issuing.loginCallCount == 0)
 }

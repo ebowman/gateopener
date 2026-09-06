@@ -135,6 +135,123 @@ final class RecordingSleep: @unchecked Sendable {
     }
 }
 
+/// A controllable sleep for TTL tests: every call to the returned
+/// `GateControllerSleep` suspends until the test explicitly calls
+/// `advance()`. This is essential for test (b)/(c) below: an
+/// immediate-return sleep (like `RecordingSleep`) would let the TTL "elapse"
+/// before the test ever gets a chance to flip reachability, making it
+/// impossible to distinguish "fired because of the flip" from "fired
+/// because the TTL raced ahead and won" -- i.e. it would make the test
+/// vacuous (see the gateopener-vacuous-assertion-failure-mode memory).
+///
+/// Holds pending continuations in an array (not a single slot) for the same
+/// reason `MockGateOpening` does: a second overlapping `sleep` call must
+/// never orphan a waiter.
+final class GatedSleep: @unchecked Sendable {
+    private let lock = NSLock()
+    private var pendingContinuations: [CheckedContinuation<Void, Never>] = []
+    private(set) var requestedDurations: [Duration] = []
+
+    var fn: GateControllerSleep {
+        { [weak self] duration in
+            guard let self else { return }
+            self.record(duration)
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                self.enqueue(continuation)
+            }
+        }
+    }
+
+    private func record(_ duration: Duration) {
+        lock.lock()
+        defer { lock.unlock() }
+        requestedDurations.append(duration)
+    }
+
+    private func enqueue(_ continuation: CheckedContinuation<Void, Never>) {
+        lock.lock()
+        defer { lock.unlock() }
+        pendingContinuations.append(continuation)
+    }
+
+    /// Resumes every `sleep` call currently suspended, letting the TTL
+    /// "elapse" for all of them. Safe to call when nothing is waiting yet.
+    func advance() {
+        lock.lock()
+        let toResume = pendingContinuations
+        pendingContinuations.removeAll()
+        lock.unlock()
+        for continuation in toResume {
+            continuation.resume()
+        }
+    }
+
+    /// Number of `sleep` calls currently suspended, waiting for `advance()`.
+    /// Used to deterministically wait until the TTL timer has actually
+    /// started before flipping reachability or calling `advance()`.
+    func waitingCount() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return pendingContinuations.count
+    }
+}
+
+/// A settable, test-controlled `ReachabilityProviding` conformer.
+/// `flip(_:)` both updates `isReachable` and synchronously invokes the
+/// currently-installed handler (if any), mirroring what a real reachability
+/// framework's callback would do -- letting tests exercise
+/// `GateController`'s "fire on the first true" / "ignore a later true after
+/// TTL expiry" logic deterministically.
+final class FakeReachability: ReachabilityProviding, @unchecked Sendable {
+    private let lock = NSLock()
+    private var _isReachable: Bool
+    private var handler: (@Sendable (Bool) -> Void)?
+    private var _isReachableReadCount = 0
+
+    init(isReachable: Bool = true) {
+        self._isReachable = isReachable
+    }
+
+    var isReachable: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        _isReachableReadCount += 1
+        return _isReachable
+    }
+
+    /// Number of times `isReachable` has been READ (not merely set). Used
+    /// to distinguish `requestOpen()`'s OWN coalescing guard (which must
+    /// short-circuit on `.opening`/`.queued` BEFORE ever consulting
+    /// `reachability.isReachable` again) from `openGate()`'s pre-existing,
+    /// unrelated idempotency mechanism -- without this signal, a test that
+    /// only asserts the final open-call-count would pass even if
+    /// `requestOpen()`'s own guard were deleted, because a second spawned
+    /// `Task { await openGate() }` would still be swallowed by `openGate()`'s
+    /// own `openTask` check. See the gateopener-vacuous-assertion-failure-mode
+    /// memory: "the only reliable check is mutation testing".
+    func isReachableReadCount() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return _isReachableReadCount
+    }
+
+    func setOnChange(_ handler: (@Sendable (Bool) -> Void)?) {
+        lock.lock()
+        self.handler = handler
+        lock.unlock()
+    }
+
+    /// Sets `isReachable` to `newValue` and invokes the installed handler
+    /// with that value, exactly as a real framework's callback would.
+    func flip(_ newValue: Bool) {
+        lock.lock()
+        _isReachable = newValue
+        let currentHandler = handler
+        lock.unlock()
+        currentHandler?(newValue)
+    }
+}
+
 // MARK: - Test helpers
 
 private let sampleEndpointLockGeneric = Endpoint(
@@ -158,7 +275,10 @@ private func makeController(
     tokenResolving: MockTokenResolving = MockTokenResolving(),
     defaultsSuiteName: String = UUID().uuidString,
     preconfigured: Bool = true,
-    sleep: RecordingSleep = RecordingSleep()
+    sleep: RecordingSleep = RecordingSleep(),
+    sleepFn: GateControllerSleep? = nil,
+    reachability: any ReachabilityProviding = AlwaysReachable(),
+    queueTTL: Duration = .seconds(45)
 ) -> (GateController, MockGateOpening, MockTokenResolving, MockCredentialStore, AppSettings) {
     let defaults = UserDefaults(suiteName: defaultsSuiteName)!
     let settings = AppSettings(defaults: defaults)
@@ -175,7 +295,9 @@ private func makeController(
         credentialStore: credentialStore,
         appSettings: settings,
         autoResetDelay: .seconds(3),
-        sleep: sleep.fn
+        sleep: sleepFn ?? sleep.fn,
+        reachability: reachability,
+        queueTTL: queueTTL
     )
     return (controller, gateOpening, tokenResolving, credentialStore, settings)
 }
@@ -449,6 +571,21 @@ private func makeController(
     #expect(candidates.map(\.endpointId) == [sampleEndpointLockGeneric.endpointId, sampleEndpointOther.endpointId])
 }
 
+@Test @MainActor func refreshGatesPersistsCachedGates() async throws {
+    let (controller, gateOpening, _, _, settings) = makeController()
+    // Mutation check: confirm the cache starts empty so the post-call
+    // assertion below is proven to distinguish "refreshGates wrote it"
+    // from "it was already populated by some other path".
+    #expect(settings.cachedGates.isEmpty)
+    gateOpening.discoverResult = .success([sampleEndpointOther, sampleEndpointLockGeneric])
+
+    let candidates = try await controller.refreshGates()
+
+    #expect(!candidates.isEmpty)
+    #expect(settings.cachedGates == candidates)
+    #expect(settings.cachedGates.map(\.endpointId) == [sampleEndpointLockGeneric.endpointId, sampleEndpointOther.endpointId])
+}
+
 // MARK: - Additional: initial state derivation
 
 @Test @MainActor func initialStateIsNeedsSetupWithNoCredentials() throws {
@@ -509,4 +646,250 @@ private struct WeirdError: Error {}
 @Test @MainActor func invalidCredentialsMapsToShortMessage() throws {
     let message = GateController.shortMessage(for: ComelitError.invalidCredentials)
     #expect(message == "Wrong username or password")
+}
+
+/// `errSecInteractionNotAllowed` (-25308) is the status a locked-device
+/// App Intent invocation surfaces when it tries to read a keychain item
+/// before first unlock (bead gateopener-672.13 step 6). This must map to
+/// an explicit, actionable message rather than the generic fallback.
+@Test @MainActor func keychainInteractionNotAllowedMapsToUnlockMessage() throws {
+    let loadMessage = GateController.shortMessage(for: KeychainError.loadFailed(status: errSecInteractionNotAllowed))
+    #expect(loadMessage == "Unlock iPhone to open the gate")
+
+    let saveMessage = GateController.shortMessage(for: KeychainError.saveFailed(status: errSecInteractionNotAllowed))
+    #expect(saveMessage == "Unlock iPhone to open the gate")
+
+    let deleteMessage = GateController.shortMessage(for: KeychainError.deleteFailed(status: errSecInteractionNotAllowed))
+    #expect(deleteMessage == "Unlock iPhone to open the gate")
+}
+
+/// A DIFFERENT `KeychainError` status must NOT be mapped to the unlock
+/// message — distinguishes this from a vacuous "any KeychainError ->
+/// unlock message" mapping.
+@Test @MainActor func keychainOtherStatusDoesNotMapToUnlockMessage() throws {
+    let message = GateController.shortMessage(for: KeychainError.loadFailed(status: errSecItemNotFound))
+    #expect(message != "Unlock iPhone to open the gate")
+    #expect(message == "Could not open the gate")
+}
+
+// MARK: - requestOpen() (bead .4: non-blocking entry point, offline queue, TTL, coalescing)
+
+/// Polls (no fixed sleep) until `controller.state` matches `predicate`, or a
+/// bounded number of yields elapses. Since `requestOpen()` returns
+/// synchronously and the actual open (and TTL-elapse handling) runs in a
+/// detached `Task`, tests need a deterministic way to await the eventual
+/// terminal state without a wall-clock sleep -- mirrors the existing
+/// polling pattern used by `autoResetActuallyReturnsToIdleWithInjectedNoDelaySleep`
+/// above.
+@MainActor
+private func waitUntil(_ predicate: () -> Bool, maxYields: Int = 500) async {
+    for _ in 0..<maxYields {
+        if predicate() { return }
+        await Task.yield()
+    }
+}
+
+// MARK: - (a) reachable -> requestOpen leads to .opening then .succeeded, exactly ONE open call
+
+@Test @MainActor func requestOpenWhenReachableOpensImmediatelyAndSucceeds() async throws {
+    let (controller, gateOpening, _, _, _) = makeController(reachability: FakeReachability(isReachable: true))
+
+    var observedStates: [GateState] = []
+    controller.onStateChange = { observedStates.append($0) }
+
+    controller.requestOpen()
+
+    await waitUntil {
+        if case .succeeded = controller.state { return true }
+        return false
+    }
+
+    #expect(gateOpening.openCallCount == 1)
+    #expect(observedStates.contains(.opening))
+    guard case .succeeded = controller.state else {
+        Issue.record("expected .succeeded, got \(controller.state)")
+        return
+    }
+}
+
+// MARK: - (b) unreachable -> .queued, ZERO open calls; flip(true) -> exactly one open call, terminal .succeeded
+
+@Test @MainActor func requestOpenWhenUnreachableQueuesThenFiresOnReachabilityFlip() async throws {
+    let reachability = FakeReachability(isReachable: false)
+    let gatedSleep = GatedSleep()
+    let (controller, gateOpening, _, _, _) = makeController(
+        sleepFn: gatedSleep.fn,
+        reachability: reachability
+    )
+
+    controller.requestOpen()
+
+    #expect(controller.state == .queued)
+    #expect(gateOpening.openCallCount == 0)
+
+    // Wait until the TTL timer has actually started (entered `sleep`)
+    // before flipping reachability, so this proves the flip -- not a race
+    // won by an immediate-return sleep -- is what fires the request. This
+    // is exactly the vacuousness trap called out in the bead brief: an
+    // immediate-return sleep would let the TTL "elapse" before the flip
+    // ever runs, and this assertion would then pass whether or not the
+    // reachability-flip branch exists at all.
+    while gatedSleep.waitingCount() < 1 {
+        await Task.yield()
+    }
+
+    reachability.flip(true)
+
+    await waitUntil {
+        if case .succeeded = controller.state { return true }
+        return false
+    }
+
+    #expect(gateOpening.openCallCount == 1)
+    guard case .succeeded = controller.state else {
+        Issue.record("expected .succeeded after reachability flip, got \(controller.state)")
+        return
+    }
+}
+
+// MARK: - (c) unreachable, TTL elapses -> .failed("No network"), zero open calls; then flip(true) -> still zero open calls
+
+@Test @MainActor func requestOpenTTLElapsesFailsAndIgnoresLateReachabilityFlip() async throws {
+    let reachability = FakeReachability(isReachable: false)
+    let gatedSleep = GatedSleep()
+    let (controller, gateOpening, _, _, _) = makeController(
+        sleepFn: gatedSleep.fn,
+        reachability: reachability
+    )
+
+    controller.requestOpen()
+
+    #expect(controller.state == .queued)
+
+    while gatedSleep.waitingCount() < 1 {
+        await Task.yield()
+    }
+
+    // Advance the (fake) clock: the TTL elapses before any flip.
+    gatedSleep.advance()
+
+    await waitUntil {
+        if case .failed = controller.state { return true }
+        return false
+    }
+
+    guard case .failed(let message) = controller.state else {
+        Issue.record("expected .failed, got \(controller.state)")
+        return
+    }
+    #expect(message == "No network")
+    #expect(gateOpening.openCallCount == 0)
+
+    // A LATE flip to true, after the TTL has already fired, must not
+    // resurrect the stale request.
+    reachability.flip(true)
+    await Task.yield()
+    await Task.yield()
+
+    #expect(gateOpening.openCallCount == 0)
+}
+
+// MARK: - (d) three requestOpen() calls while queued -> one open call after flip
+
+@Test @MainActor func threeRequestOpenCallsWhileQueuedCoalesceToOneOpenAfterFlip() async throws {
+    let reachability = FakeReachability(isReachable: false)
+    let gatedSleep = GatedSleep()
+    let (controller, gateOpening, _, _, _) = makeController(
+        sleepFn: gatedSleep.fn,
+        reachability: reachability
+    )
+
+    controller.requestOpen()
+    controller.requestOpen()
+    controller.requestOpen()
+
+    #expect(controller.state == .queued)
+    #expect(gateOpening.openCallCount == 0)
+
+    while gatedSleep.waitingCount() < 1 {
+        await Task.yield()
+    }
+
+    reachability.flip(true)
+
+    await waitUntil {
+        if case .succeeded = controller.state { return true }
+        return false
+    }
+
+    #expect(gateOpening.openCallCount == 1)
+}
+
+// MARK: - (e) signOut while queued -> flip(true) -> zero open calls
+
+@Test @MainActor func signOutWhileQueuedDropsRequestAndIgnoresLaterFlip() async throws {
+    let reachability = FakeReachability(isReachable: false)
+    let gatedSleep = GatedSleep()
+    let (controller, gateOpening, _, credentialStore, _) = makeController(
+        sleepFn: gatedSleep.fn,
+        reachability: reachability
+    )
+
+    controller.requestOpen()
+
+    #expect(controller.state == .queued)
+
+    while gatedSleep.waitingCount() < 1 {
+        await Task.yield()
+    }
+
+    controller.signOut()
+
+    #expect(controller.state == .needsSetup)
+    #expect(credentialStore.isEmpty)
+
+    reachability.flip(true)
+    await Task.yield()
+    await Task.yield()
+
+    #expect(gateOpening.openCallCount == 0)
+    // State must still reflect signOut(), not a resurrected queued request.
+    #expect(controller.state == .needsSetup)
+}
+
+// MARK: - (f) requestOpen while .opening is a no-op (one open call total)
+
+@Test @MainActor func requestOpenWhileOpeningIsANoOp() async throws {
+    let reachability = FakeReachability(isReachable: true)
+    let (controller, gateOpening, _, _, _) = makeController(reachability: reachability)
+    gateOpening.gateOpenCalls = true
+
+    controller.requestOpen()
+
+    while gateOpening.waitingCount() < 1 {
+        await Task.yield()
+    }
+    #expect(controller.state == .opening)
+
+    let readCountBeforeSecondCall = reachability.isReachableReadCount()
+
+    // A second requestOpen() call while the first is genuinely in flight
+    // must be a no-op: no second underlying open call, AND it must
+    // short-circuit on the `.opening` check BEFORE ever consulting
+    // `reachability.isReachable` again (see `isReachableReadCount()`'s doc
+    // comment for why this second assertion is the one that actually
+    // distinguishes `requestOpen()`'s own guard from `openGate()`'s
+    // unrelated, pre-existing idempotency).
+    controller.requestOpen()
+
+    #expect(reachability.isReachableReadCount() == readCountBeforeSecondCall)
+
+    gateOpening.releaseOpen()
+
+    await waitUntil {
+        if case .succeeded = controller.state { return true }
+        return false
+    }
+
+    #expect(gateOpening.openCallCount == 1)
 }

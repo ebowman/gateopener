@@ -26,13 +26,14 @@ public final class AppSettings: @unchecked Sendable {
         static let shortcutPreference = "ie.boboco.GateOpener.shortcutPreference"
         static let showOpenConfirmationOverlay = "ie.boboco.GateOpener.showOpenConfirmationOverlay"
         static let autoShowDoorVideoOnOpen = "ie.boboco.GateOpener.autoShowDoorVideoOnOpen"
+        static let cachedGates = "ie.boboco.GateOpener.cachedGates"
 
         /// All keys owned by `AppSettings`. Used by `reset()` so unrelated
         /// UserDefaults keys (e.g. from other parts of the app, or the test
         /// suite) are never touched.
         static let all = [
             aptId, selectedEndpointId, selectedEndpointName, lastDiscoveryDate, shortcutPreference,
-            showOpenConfirmationOverlay, autoShowDoorVideoOnOpen,
+            showOpenConfirmationOverlay, autoShowDoorVideoOnOpen, cachedGates,
         ]
     }
 
@@ -156,6 +157,29 @@ public final class AppSettings: @unchecked Sendable {
                 : defaults.bool(forKey: Keys.autoShowDoorVideoOnOpen)
         }
         set { defaults.set(newValue, forKey: Keys.autoShowDoorVideoOnOpen) }
+    }
+
+    /// The most recent successful discovery result, already filtered to
+    /// candidate gates (see `GateClient.candidateGates(from:)`), for the
+    /// Settings gate picker (bead gateopener-672.10) to show without
+    /// needing a fresh network round trip on every screen appearance.
+    ///
+    /// Stored as JSON-encoded `Data` since `[Endpoint]` is not a native
+    /// property-list type `UserDefaults` can store directly (mirrors the
+    /// `shortcutPreference` pattern above). A missing key, or data that
+    /// fails to decode (corrupt/foreign format), reads back as `[]` rather
+    /// than throwing or crashing — an empty picker with a "Refresh gates"
+    /// call to action is always a safe fallback, whereas surfacing a
+    /// decode error here would have no good UI to show it in.
+    public var cachedGates: [Endpoint] {
+        get {
+            guard let data = defaults.data(forKey: Keys.cachedGates) else { return [] }
+            return (try? JSONDecoder().decode([Endpoint].self, from: data)) ?? []
+        }
+        set {
+            guard let data = try? JSONEncoder().encode(newValue) else { return }
+            defaults.set(data, forKey: Keys.cachedGates)
+        }
     }
 
     /// True if and only if a non-empty `selectedEndpointId` is present.

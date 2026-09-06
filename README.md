@@ -92,6 +92,61 @@ Running the test suite:
 swift test
 ```
 
+### iOS (simulator)
+
+- `make ios-build` is the fast compile gate for the iOS app: it builds for
+  a generic Simulator destination with `CODE_SIGNING_ALLOWED=NO`. This is
+  unsigned, so the Keychain is unusable — any code path that touches
+  `KeychainCredentialStore` fails immediately with
+  `KeychainError.saveFailed(status: -34018)` (`errSecMissingEntitlement`).
+  Use it only to confirm the app compiles.
+- `make ios-sim-build` / `make ios-sim-run` build and run the iOS app
+  signed for a concrete Simulator device (`SIM_DEVICE`, default "iPhone 17
+  Pro"), so the app's entitlements (`application-groups`,
+  `keychain-access-groups`) are embedded and the Keychain works. Use
+  `SIM_ARGS` to pass launch arguments, e.g. `make ios-sim-run
+  SIM_ARGS="--signin-debug-attempt user@example.com pass"`.
+
+### iOS app (TestFlight)
+
+Prerequisites:
+
+- `xcodegen` (`brew install xcodegen`).
+- An App Store Connect API key at
+  `~/.appstoreconnect/private_keys/AuthKey_<API_KEY_ID>.p8`.
+- A `.env` file at the repo root (copy `.env.example` and fill in
+  `API_KEY_ID` / `API_ISSUER_ID` — both come from the same App Store
+  Connect API key). `.env` is gitignored; never commit it.
+
+Day-to-day iOS development uses `make ios-build` (fast unsigned compile
+check) or `make ios-sim-run` (signed run on a Simulator). To verify signing
+and archiving without uploading anything, run:
+
+```bash
+./testflight.sh ios --archive-only
+```
+
+This archives the app with automatic signing via the API key
+(`-allowProvisioningUpdates`) and restores `project.yml` afterwards, leaving
+the tree clean. To archive, export, upload to TestFlight, and commit the
+resulting build-number bump, run:
+
+```bash
+./testflight.sh ios
+```
+
+Note: the App Store Connect app record for bundle id `ie.boboco.GateOpener`
+must already exist before the first upload can succeed — creating it is an
+operator step (see bead 672.20).
+
+The export (`ExportOptions.plist`) uses **manual** signing with the local
+"Apple Distribution" certificate and two App Store provisioning profiles,
+"GateOpener AppStore ios" and "GateOpener AppStore widget", which must be
+installed in `~/Library/MobileDevice/Provisioning Profiles`. Both were
+created through the App Store Connect API and can be re-downloaded from the
+developer portal if missing. Automatic/cloud signing is not used because
+the API key configured above lacks cloud-signing permission.
+
 ## Release flow (maintainers)
 
 Producing and publishing a distributable release is a four-stage pipeline:

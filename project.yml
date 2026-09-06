@@ -1,0 +1,126 @@
+name: GateOpener
+options:
+  bundleIdPrefix: ie.boboco
+  deploymentTarget:
+    iOS: "18.0"
+  createIntermediateGroups: true
+
+# The repo root is both the xcodegen project directory AND the SwiftPM
+# package directory (Package.swift lives at the repo root, next to this
+# file). Pointing the local package dependency at "." (rather than a
+# subdirectory, as ../FlöDo/project.yml does with FloDoKit) works fine with
+# xcodegen 2.45.3 / Xcode 26.6 — xcodegen resolves the package manifest from
+# the given path and does not require it to differ from the project's own
+# directory. No workaround (symlink, nested checkout, etc.) was needed.
+packages:
+  GateOpenerCore:
+    path: .
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+    MARKETING_VERSION: "0.1.3"
+    CURRENT_PROJECT_VERSION: 2
+    DEVELOPMENT_TEAM: Y5SB82BPYL
+    CODE_SIGN_STYLE: Automatic
+
+targets:
+  GateOpener-iOS:
+    type: application
+    platform: iOS
+    sources:
+      - path: iOS/App
+        excludes:
+          - "*.plist"
+          - "*.xcprivacy"
+          - "*.entitlements"
+      - path: iOS/Shared
+      - path: iOS/Resources/Assets.xcassets
+      - path: iOS/App/PrivacyInfo.xcprivacy
+        buildPhase: resources
+      # Sources/GateOpener/GateControllerObservable.swift is deliberately NOT
+      # included here: despite its "Foundation+Observation only" doc comment,
+      # it references `GlobalHotkey` (Sources/GateOpener/GlobalHotkey.swift),
+      # which imports AppKit + Carbon.HIToolbox and is macOS-only. The iOS
+      # app gets its own observable wrapper in bead 672.7; this file and
+      # GlobalHotkey.swift are untouched.
+    dependencies:
+      - package: GateOpenerCore
+        product: GateOpenerCore
+      - target: GateOpenerWidget
+        embed: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ie.boboco.GateOpener
+        PRODUCT_NAME: GateOpener
+        # Explicit Info.plist (`iOS/App/Info.plist`), NOT
+        # GENERATE_INFOPLIST_FILE: registering the `gateopener://` URL
+        # scheme (bead gateopener-672.14 step 4 — tapping a widget's
+        # non-button body uses `.widgetURL(URL(string:
+        # "gateopener://main"))`, `iOS/Shared/GateWidgetViews.swift`, to
+        # bring the app to `MainView` WITHOUT opening the gate;
+        # `GateOpenerIOSApp.onOpenURL` does nothing beyond that) needs
+        # `CFBundleURLTypes`, an array-of-dicts with no `INFOPLIST_KEY_*`
+        # synthesized-key equivalent. xcodegen's `info.properties`
+        # passthrough (tried first) requires `info.path` to point at a
+        # file xcodegen itself only materializes via a separate `xcodegen
+        # generate --only-plists` step, which this repo's plain `make
+        # xcodeproj`/`ios-build` never runs — so `info.properties` silently
+        # produced an Info.plist with NO CFBundleURLTypes at all on a
+        # normal `xcodegen generate`. An explicit, checked-in
+        # `iOS/App/Info.plist` (mirroring every key the previous
+        # `GENERATE_INFOPLIST_FILE` + `INFOPLIST_KEY_*` settings produced,
+        # confirmed by diffing the generated binary Info.plist before/after
+        # this change) avoids that failure mode entirely — the same
+        # approach already used for `GateOpenerWidget` below.
+        INFOPLIST_FILE: iOS/App/Info.plist
+        CODE_SIGN_ENTITLEMENTS: iOS/App/GateOpener.entitlements
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        TARGETED_DEVICE_FAMILY: "1"
+      configs:
+        debug:
+          CODE_SIGN_IDENTITY: "Apple Development"
+
+  GateOpenerWidget:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: iOS/Widget
+        excludes:
+          - "*.plist"
+          - "*.entitlements"
+      - path: iOS/Shared
+    dependencies:
+      - package: GateOpenerCore
+        product: GateOpenerCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ie.boboco.GateOpener.widget
+        PRODUCT_NAME: GateOpenerWidget
+        # Explicit Info.plist (not GENERATE_INFOPLIST_FILE): xcodegen's
+        # `info:` passthrough (used above for the app's CFBundleURLTypes)
+        # only ADDS keys to a synthesized plist and cannot express the
+        # NSExtension dict's required exact shape reliably alongside
+        # GENERATE_INFOPLIST_FILE; ../FlöDo/project.yml's own app-extension
+        # target (FlöDo-NotificationContent) uses a plain INFOPLIST_FILE
+        # for the same reason (see that file's own NSExtension dict). This
+        # is the proven-working approach for THIS xcodegen setup.
+        INFOPLIST_FILE: iOS/Widget/Info.plist
+        INFOPLIST_KEY_CFBundleDisplayName: GateOpener
+        CODE_SIGN_ENTITLEMENTS: iOS/Widget/GateOpenerWidget.entitlements
+        SKIP_INSTALL: YES
+      configs:
+        debug:
+          CODE_SIGN_IDENTITY: "Apple Development"
+
+schemes:
+  GateOpener-iOS:
+    build:
+      targets:
+        GateOpener-iOS: [run, test, profile, archive]
+    run:
+      config: Debug
+    archive:
+      config: Release

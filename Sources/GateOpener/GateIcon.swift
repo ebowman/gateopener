@@ -17,7 +17,7 @@ enum GateIcon {
             return "questionmark.circle"
         case .idle:
             return "lock.fill"
-        case .opening:
+        case .opening, .queued:
             return "arrow.triangle.2.circlepath"
         case .succeeded:
             return "checkmark.circle.fill"
@@ -37,7 +37,7 @@ enum GateIcon {
             return "GateOpener — set up your account"
         case .idle:
             return "GateOpener — click to open the gate"
-        case .opening:
+        case .opening, .queued:
             return stillTryingAfterEscalation ? "GateOpener — still trying…" : "GateOpener — opening…"
         case .succeeded:
             return "GateOpener — gate opened"
