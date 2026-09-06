@@ -1,6 +1,7 @@
 import AVFoundation
 import Foundation
 import GateOpenerCore
+import Network
 import WebKit
 import os
 
@@ -301,10 +302,10 @@ public final class DoorVideoSession: NSObject {
 
         guard !hasStopped else { return }
 
-        let stunIPs = Self.resolveStunIPs(host: Self.stunHost)
-        let iceServerURLs = stunIPs.isEmpty
-            ? ["stun:\(Self.stunHost):\(Self.stunPort)"]
-            : stunIPs.map { "stun:\($0):\(Self.stunPort)" }
+        let resolvedStunAddresses = Self.resolveStunAddresses(host: Self.stunHost)
+        let iceServerURLs = Self.iceServerURLs(host: Self.stunHost, port: Self.stunPort, resolved: resolvedStunAddresses)
+        let pathSummary = Self.currentPathSummary()
+        Self.logger.info("STUN ICE servers: \(iceServerURLs, privacy: .public); path: \(pathSummary, privacy: .public)")
 
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             self.pageLoadContinuation = continuation
@@ -460,31 +461,79 @@ public final class DoorVideoSession: NSObject {
 
     // MARK: - STUN pre-resolution
 
-    /// Resolves `host` to its IP addresses via `getaddrinfo`, so the page
-    /// can be handed real `stun:<ip>:3478` URLs instead of a hostname the
-    /// door's signaling backend may reject. Returns `[]` (never throws) on
-    /// any resolution failure — the caller falls back to the hostname
-    /// form. Mirrors macOS's `DoorVideoSession.resolveStunIPs` exactly.
-    private static func resolveStunIPs(host: String) -> [String] {
+    /// Resolves `host` to its addresses via `getaddrinfo`, so the page can
+    /// be handed real `stun:<ip>:3478`/`stun:[<ip6>]:3478` URLs alongside
+    /// the hostname form. Unlike macOS's IPv4-only
+    /// `DoorVideoSession.resolveStunIPs`, this resolves with
+    /// `ai_family = AF_UNSPEC` and `ai_flags = AI_DEFAULT`
+    /// (`AI_V4MAPPED_CFG | AI_ADDRCONFIG` on iOS): on an IPv6-only/NAT64
+    /// cellular network, this makes the resolver SYNTHESIZE an IPv6 address
+    /// for this IPv4-only host, giving WKWebView's ICE gathering a route to
+    /// an actual STUN response where a bare IPv4 literal would silently
+    /// fail (root cause of bead gateopener-672.28: video works over
+    /// STUN-only on IPv4 Wi-Fi/hotel networks but fails on cellular).
+    /// Returns `[]` (never throws) on any resolution failure — the caller
+    /// still injects the hostname-form entry regardless (see
+    /// `iceServerURLs`).
+    private nonisolated static func resolveStunAddresses(host: String) -> [(family: Int32, address: String)] {
         var hints = addrinfo(
-            ai_flags: 0, ai_family: AF_UNSPEC, ai_socktype: SOCK_DGRAM,
+            ai_flags: AI_DEFAULT, ai_family: AF_UNSPEC, ai_socktype: SOCK_DGRAM,
             ai_protocol: 0, ai_addrlen: 0, ai_canonname: nil, ai_addr: nil, ai_next: nil
         )
         var result: UnsafeMutablePointer<addrinfo>?
-        var ips: [String] = []
+        var addresses: [(family: Int32, address: String)] = []
         let status = getaddrinfo(host, nil, &hints, &result)
-        guard status == 0, let first = result else { return ips }
+        guard status == 0, let first = result else { return addresses }
         defer { freeaddrinfo(first) }
         var ptr: UnsafeMutablePointer<addrinfo>? = first
         while let p = ptr {
             var buf = [CChar](repeating: 0, count: Int(NI_MAXHOST))
             if getnameinfo(p.pointee.ai_addr, p.pointee.ai_addrlen, &buf, socklen_t(buf.count), nil, 0, NI_NUMERICHOST) == 0 {
-                let ip = String(decoding: buf.prefix(while: { $0 != 0 }).map { UInt8(bitPattern: $0) }, as: UTF8.self)
-                if !ip.isEmpty, !ips.contains(ip) { ips.append(ip) }
+                let address = String(decoding: buf.prefix(while: { $0 != 0 }).map { UInt8(bitPattern: $0) }, as: UTF8.self)
+                let family = p.pointee.ai_family
+                if !address.isEmpty, !addresses.contains(where: { $0.family == family && $0.address == address }) {
+                    addresses.append((family: family, address: address))
+                }
             }
             ptr = p.pointee.ai_next
         }
-        return ips
+        return addresses
+    }
+
+    /// Pure formatting/ordering helper (unit-tested directly in
+    /// `IceServerURLTests`): builds the final `stun:` URL list injected as
+    /// `window.__ICE_SERVERS__`. Order is significant only insofar as the
+    /// hostname form is tried first (WebKit resolves it itself, including
+    /// NAT64 synthesis — the HTTP-500-on-hostname problem documented in bd
+    /// memory `gateopener-yjn-spike-*` was Chromium-specific and was never
+    /// observed in WKWebView), then IPv6/synthesized literals (bracketed
+    /// per RFC 3986), then IPv4 literals — never empty, since the hostname
+    /// entry is unconditional.
+    nonisolated static func iceServerURLs(host: String, port: Int, resolved: [(family: Int32, address: String)]) -> [String] {
+        var urls: [String] = ["stun:\(host):\(port)"]
+
+        for entry in resolved where entry.family == AF_INET6 {
+            let url = "stun:[\(entry.address)]:\(port)"
+            if !urls.contains(url) { urls.append(url) }
+        }
+        for entry in resolved where entry.family == AF_INET {
+            let url = "stun:\(entry.address):\(port)"
+            if !urls.contains(url) { urls.append(url) }
+        }
+
+        return urls
+    }
+
+    /// One-shot, cheap `NWPath` snapshot for the ICE-server log line only
+    /// (optional per this bead's brief). `NWPathMonitor.currentPath` is a
+    /// synchronous, non-blocking read of whatever path the monitor already
+    /// knows about at construction time — unlike `NWPathMonitorReachability`
+    /// (this app's long-lived reachability source elsewhere), there is no
+    /// `start(queue:)`/handler/wait here, so this can safely run on the
+    /// main actor inside `start()`.
+    private static func currentPathSummary() -> String {
+        let path = NWPathMonitor().currentPath
+        return "ipv4=\(path.supportsIPv4) ipv6=\(path.supportsIPv6)"
     }
 
     // MARK: - Page bridging (all async calls MUST use callAsyncJavaScript,
