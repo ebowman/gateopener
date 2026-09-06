@@ -223,7 +223,7 @@ struct MainView: View {
     /// session (idempotent) and clears it immediately (no animation delay
     /// — the button itself IS the explicit dismiss action).
     private func videoPanel(session: DoorVideoSession) -> some View {
-        DoorVideoView(session: session, state: session.state)
+        DoorVideoView(session: session, state: doorVideoCoordinator.sessionState)
             .overlay(alignment: .topTrailing) {
                 Button {
                     doorVideoCoordinator.dismiss()

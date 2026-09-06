@@ -42,6 +42,17 @@ final class DoorVideoCoordinator {
     /// the panel can animate out rather than disappearing instantly).
     private(set) var isPanelVisible: Bool = false
 
+    /// Mirrors the current session's `state` so `MainView` (which observes
+    /// this coordinator, not the plain, non-`@Observable` `DoorVideoSession`
+    /// itself) re-renders on every connecting -> streaming -> ended/failed
+    /// transition. Fixes bead gateopener-672.29: passing `session.state`
+    /// directly to `DoorVideoView` never triggered a SwiftUI re-render
+    /// because `DoorVideoSession` is not `@Observable`, leaving the panel
+    /// stuck showing "Connecting…" even once frames were actually
+    /// streaming. Reset to `.idle` on `dismiss()` and whenever the
+    /// auto-clear timer nils `session` out.
+    private(set) var sessionState: DoorVideoSession.State = .idle
+
     /// Number of times `makeSession()` has actually been invoked (i.e. a
     /// NEW session was created, as opposed to an existing one being
     /// retained). `internal` (not `private`) so a unit test (bead
@@ -104,6 +115,7 @@ final class DoorVideoCoordinator {
         session?.stop()
         session = nil
         isPanelVisible = false
+        sessionState = .idle
     }
 
     /// Shared retain-or-replace policy for `startForOpen()`/`viewDoor()`:
@@ -143,6 +155,8 @@ final class DoorVideoCoordinator {
     private func handleStateChange(_ state: DoorVideoSession.State, for changedSession: DoorVideoSession) {
         guard session === changedSession else { return }
 
+        sessionState = state
+
         switch state {
         case .idle:
             isPanelVisible = false
@@ -169,6 +183,7 @@ final class DoorVideoCoordinator {
             guard !Task.isCancelled else { return }
             guard let self, self.session === changedSession else { return }
             self.session = nil
+            self.sessionState = .idle
         }
     }
 }

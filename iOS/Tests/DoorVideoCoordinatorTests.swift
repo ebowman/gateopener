@@ -87,4 +87,35 @@ struct DoorVideoCoordinatorTests {
         #expect(coordinator.sessionStartCount == 1)
         #expect(factoryCallCount.value == 1)
     }
+
+    // MARK: - sessionState publishes the connecting -> streaming transition
+
+    /// Bead gateopener-672.29: the video panel stayed on "Connecting…"
+    /// after the underlying session actually started streaming, because
+    /// `MainView` read `session.state` directly — `DoorVideoSession` is a
+    /// plain (non-`@Observable`) class, so SwiftUI never re-rendered on
+    /// that transition. `DoorVideoCoordinator.sessionState` is the fix:
+    /// it mirrors `session.state` on the `@Observable` coordinator itself.
+    ///
+    /// MUTATION CHECK: removing `sessionState = state` from
+    /// `DoorVideoCoordinator.handleStateChange(_:for:)` makes
+    /// `coordinator.sessionState` stay `.idle` forever, so the poll loop
+    /// below times out and the final `#expect(... == .streaming)` fails.
+    @Test func sessionStatePublishesStreamingTransition() async {
+        let coordinator = DoorVideoCoordinator(
+            makeSession: { DoorVideoSession.debugStub(connectingDelay: 0.05, streamingDuration: 10) },
+            isEnabled: { true }
+        )
+
+        coordinator.startForOpen()
+
+        let deadline = Date().addingTimeInterval(2)
+        while coordinator.sessionState != .streaming, Date() < deadline {
+            await Task.yield()
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+
+        #expect(coordinator.sessionState == .streaming)
+        #expect(coordinator.isPanelVisible == true)
+    }
 }
