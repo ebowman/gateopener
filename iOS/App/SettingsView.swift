@@ -1,6 +1,7 @@
 import SwiftUI
 import GateOpenerCore
 import Security
+import UIKit
 
 /// The Settings screen presented from `MainView`'s gear button (bead
 /// gateopener-672.10).
@@ -37,6 +38,16 @@ struct SettingsView: View {
     @State private var refreshErrorMessage: String?
     @State private var isConfirmingSignOut = false
     @State private var lockScreenErrorMessage: String?
+
+    /// The full text of the last persisted `VideoDiagnostics` log (bead
+    /// gateopener-672.27), or `nil` if none has ever been persisted. Loaded
+    /// via `reloadVideoDiagnostics()` on appear and whenever `refreshToken`
+    /// changes, since a video session run from elsewhere in the app (the
+    /// door-video overlay) persists to the shared app-group defaults
+    /// out-of-process from this view's perspective within the same process
+    /// but not observed by any `@State`/`@Observable` wiring this view
+    /// already has.
+    @State private var videoDiagnosticsText: String?
 
     private var username: String? {
         (try? environment.credentialStore.loadCredentials())?.username
@@ -76,6 +87,7 @@ struct SettingsView: View {
                 quickAccessSection
                 lockScreenSection
                 accountSection
+                videoDiagnosticsSection
                 aboutSection
             }
             // Reading `refreshToken` here (even though its value is never
@@ -92,6 +104,8 @@ struct SettingsView: View {
                     Button("Done") { dismiss() }
                 }
             }
+            .onAppear { reloadVideoDiagnostics() }
+            .onChange(of: refreshToken) { _, _ in reloadVideoDiagnostics() }
         }
     }
 
@@ -291,6 +305,54 @@ struct SettingsView: View {
         } message: {
             Text("This removes your stored credentials from the Keychain. You will need to sign in again to open the gate.")
         }
+    }
+
+    // MARK: - Video diagnostics
+
+    /// Bead gateopener-672.27: the operator-facing surface for the release-
+    /// build diagnostics `DoorVideoSession`/`VideoDiagnostics` collect on
+    /// every session attempt, so an off-LAN failure that only reproduces on
+    /// a TestFlight build can still be captured and sent back. Shows the
+    /// last session's TERMINAL line only (never the full text inline —
+    /// that would make this row an unbounded-height wall of text); the full
+    /// text is only surfaced via Share/Copy.
+    private var videoDiagnosticsSection: some View {
+        Section {
+            Text(videoDiagnosticsSummary)
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+
+            if let videoDiagnosticsText {
+                ShareLink("Share log", item: videoDiagnosticsText)
+                Button("Copy") {
+                    UIPasteboard.general.string = videoDiagnosticsText
+                }
+            }
+        } header: {
+            Text("Video diagnostics")
+        } footer: {
+            Text("Captures ICE candidate types and the failure stage from the last door-camera video attempt, so it can be shared for troubleshooting.")
+        }
+    }
+
+    /// The last line of `videoDiagnosticsText` (the terminal "state:" or
+    /// "terminal reason:" line — every session's log ends with one, per
+    /// `DoorVideoSession`'s `state` `didSet` and `stop()`/
+    /// `endDueToLiveness(reason:)`), or a placeholder if no session has ever
+    /// run.
+    private var videoDiagnosticsSummary: String {
+        guard let videoDiagnosticsText, let lastLine = videoDiagnosticsText.split(separator: "\n").last else {
+            return "No video session yet"
+        }
+        return String(lastLine)
+    }
+
+    /// Reloads `videoDiagnosticsText` from the shared app-group defaults
+    /// (falling back to `.standard`, matching `DoorVideoSession`'s own
+    /// fallback — see `VideoDiagnostics.persist(to:)`'s call site).
+    private func reloadVideoDiagnostics() {
+        let defaults = SharedContainer.sharedDefaults() ?? .standard
+        videoDiagnosticsText = VideoDiagnostics.loadLast(from: defaults)
     }
 
     // MARK: - About

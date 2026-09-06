@@ -131,12 +131,33 @@ public final class DoorVideoSession: NSObject {
     public private(set) var state: State = .idle {
         didSet {
             guard oldValue != state else { return }
+            diagnostics.append("[\(Self.diagTimestamp())] state: \(oldValue) -> \(state)")
+            switch state {
+            case .ended, .failed:
+                // Covers early-return failure paths inside `start()` that
+                // set `state` directly rather than going through
+                // `stop()`/`endDueToLiveness(reason:)` (e.g. "No camera",
+                // "Sign-in required") -- those two call sites ALSO persist,
+                // redundantly but harmlessly, so every terminal transition
+                // is guaranteed to leave a persisted log regardless of
+                // which code path produced it.
+                persistDiagnostics()
+            case .idle, .connecting, .streaming:
+                break
+            }
             onStateChange?(state)
         }
     }
 
     /// Invoked on every state transition. Always invoked on the main actor.
     public var onStateChange: ((State) -> Void)?
+
+    /// Release-build diagnostics for THIS session attempt (bead
+    /// gateopener-672.27) -- see `VideoDiagnostics`'s doc comment. Exposed
+    /// so callers (or tests) can inspect the in-flight log, though the
+    /// canonical read path for the UI is `VideoDiagnostics.loadLast(from:)`
+    /// against the persisted app-group defaults, not this live instance.
+    public let diagnostics = VideoDiagnostics()
 
     private let tokenManager: TokenManager
     private let gateClient: any GateOpening
@@ -222,6 +243,14 @@ public final class DoorVideoSession: NSObject {
         // `self`) that only `removeScriptMessageHandler` breaks, which
         // nothing before this class would ever call.
         contentController.add(ScriptMessageForwarder(target: self), name: "frame")
+        // Second forwarder instance (same weak-referencing shim, different
+        // registered name) for the page's "diag" diagnostics channel -- see
+        // `DiagScriptMessageForwarder` below and `door-video.html`'s
+        // `diag()` helper. Purely additive: a page that never calls
+        // `window.webkit.messageHandlers.diag.postMessage` (impossible here
+        // since this handler now always exists once this initializer has
+        // run) simply never triggers it.
+        contentController.add(DiagScriptMessageForwarder(target: self), name: "diag")
     }
 
     deinit {
@@ -270,6 +299,8 @@ public final class DoorVideoSession: NSObject {
         }
         #endif
 
+        diagnostics.append("[\(Self.diagTimestamp())] session start, network path: \(await Self.currentNetworkPathDescription())")
+
         state = .connecting
 
         guard let endpointId = try? await resolveCameraEndpointId() else {
@@ -282,6 +313,7 @@ public final class DoorVideoSession: NSObject {
             state = .failed("No camera")
             return
         }
+        diagnostics.append("[\(Self.diagTimestamp())] camera endpoint chosen: \(endpointId)")
 
         guard let pageURL = Bundle.main.url(forResource: "door-video", withExtension: "html") else {
             Self.logger.notice("door-video.html not found in bundle; DoorVideoSession cannot start")
@@ -313,6 +345,13 @@ public final class DoorVideoSession: NSObject {
         }
 
         guard !hasStopped else { return }
+
+        // Diagnostics only (bead gateopener-672.27): log the array exactly
+        // as it is about to be injected into the page, whatever upstream
+        // logic (see `resolveStunIPs`/`iceServerURLs` above -- concurrently
+        // evolving under bead gateopener-672.28) produced it. This never
+        // reads or duplicates that logic, only the resulting variable.
+        diagnostics.append("[\(Self.diagTimestamp())] injecting ICE servers: \(iceServerURLs)")
 
         do {
             try await injectIceServers(iceServerURLs)
@@ -372,6 +411,9 @@ public final class DoorVideoSession: NSObject {
         guard !hasStopped else { return }
         hasStopped = true
 
+        diagnostics.append("[\(Self.diagTimestamp())] terminal reason: stopped")
+        persistDiagnostics()
+
         livenessTask?.cancel()
         livenessTask = nil
 
@@ -393,6 +435,7 @@ public final class DoorVideoSession: NSObject {
         webView.navigationDelegate = nil
         webView.loadHTMLString("", baseURL: nil)
         webView.configuration.userContentController.removeScriptMessageHandler(forName: "frame")
+        webView.configuration.userContentController.removeScriptMessageHandler(forName: "diag")
 
         if case .failed = state {
             // Preserve a failure reason already reported rather than
@@ -588,7 +631,7 @@ public final class DoorVideoSession: NSObject {
                 let now = Date()
                 if let startedAt = self.sessionStartedAt, now.timeIntervalSince(startedAt) >= Self.hardTimeout {
                     Self.logger.notice("hard timeout (\(Self.hardTimeout, privacy: .public)s) reached; ending session")
-                    self.endDueToLiveness()
+                    self.endDueToLiveness(reason: "hard timeout after \(Self.hardTimeout)s")
                     return
                 }
 
@@ -605,7 +648,7 @@ public final class DoorVideoSession: NSObject {
                 }
                 if now.timeIntervalSince(lastFrameAt) >= Self.plateauInterval {
                     Self.logger.notice("no new frame for \(Self.plateauInterval, privacy: .public)s; ending session (stall)")
-                    self.endDueToLiveness()
+                    self.endDueToLiveness(reason: "stall after \(Self.plateauInterval)s")
                     return
                 }
             }
@@ -616,9 +659,16 @@ public final class DoorVideoSession: NSObject {
     /// same JS teardown/blank as `stop()` and transitions to `.ended`
     /// (never `.failed` — the door closing its own ~28-30s window, or a
     /// genuine stall, is a NORMAL end of session, not an error).
-    private func endDueToLiveness() {
+    ///
+    /// - Parameter reason: A short, human-readable terminal reason (e.g.
+    ///   "stall after 6.0s" or "hard timeout after 35.0s") appended to
+    ///   `diagnostics` and persisted before `state` transitions to `.ended`.
+    private func endDueToLiveness(reason: String) {
         guard !hasStopped else { return }
         hasStopped = true
+
+        diagnostics.append("[\(Self.diagTimestamp())] terminal reason: \(reason)")
+        persistDiagnostics()
 
         pageLoadContinuation?.resume()
         pageLoadContinuation = nil
@@ -635,6 +685,7 @@ public final class DoorVideoSession: NSObject {
         webView.navigationDelegate = nil
         webView.loadHTMLString("", baseURL: nil)
         webView.configuration.userContentController.removeScriptMessageHandler(forName: "frame")
+        webView.configuration.userContentController.removeScriptMessageHandler(forName: "diag")
 
         state = .ended
     }
@@ -689,11 +740,15 @@ public final class DoorVideoSession: NSObject {
         var lastError: Error = DoorVideoSessionError.network
         for attempt in 1...policy.maxAttempts {
             let sessionId = UUID().uuidString.lowercased()
+            let attemptStart = Date()
             do {
                 let answer = try await putOffer(endpointId: endpointId, token: token, sdp: sdp, sessionId: sessionId)
+                let latencyMs = Int(Date().timeIntervalSince(attemptStart) * 1000)
                 Self.logger.notice("rtc/offer attempt \(attempt, privacy: .public)/\(policy.maxAttempts, privacy: .public) succeeded")
+                diagnostics.append("[\(Self.diagTimestamp())] rtc/offer attempt \(attempt)/\(policy.maxAttempts) status=200 latencyMs=\(latencyMs)")
                 return answer
             } catch {
+                let latencyMs = Int(Date().timeIntervalSince(attemptStart) * 1000)
                 lastError = error
                 let retryable: Bool
                 if case DoorVideoSessionError.server(let status) = error, status == 500 {
@@ -704,6 +759,13 @@ public final class DoorVideoSession: NSObject {
                     retryable = false
                 }
                 Self.logger.notice("rtc/offer attempt \(attempt, privacy: .public)/\(policy.maxAttempts, privacy: .public) failed: \(String(describing: error), privacy: .public), retryable=\(retryable, privacy: .public)")
+                let statusDescription: String
+                if case DoorVideoSessionError.server(let status) = error {
+                    statusDescription = "\(status)"
+                } else {
+                    statusDescription = "network-error"
+                }
+                diagnostics.append("[\(Self.diagTimestamp())] rtc/offer attempt \(attempt)/\(policy.maxAttempts) status=\(statusDescription) latencyMs=\(latencyMs) retryable=\(retryable)")
 
                 guard retryable, attempt < policy.maxAttempts else {
                     throw error
@@ -712,6 +774,77 @@ public final class DoorVideoSession: NSObject {
             }
         }
         throw lastError
+    }
+
+    // MARK: - Diagnostics (bead gateopener-672.27)
+
+    /// A monotonic-enough, human-readable timestamp for `diagnostics` lines:
+    /// milliseconds since epoch, matching the format `door-video.html`'s own
+    /// `diag()` helper uses for its page-side lines, so Swift- and page-
+    /// originated lines in the merged log sort/compare consistently.
+    private static func diagTimestamp() -> Int {
+        Int(Date().timeIntervalSince1970 * 1000)
+    }
+
+    /// One-shot snapshot of the current network path via a short-lived
+    /// `NWPathMonitor`, for the "session start" diagnostics line. Never logs
+    /// anything more specific than interface types and IPv4/IPv6/expensive
+    /// support -- no addresses. `NWPathMonitor` only delivers its first path
+    /// asynchronously (there is no synchronous "current path" API without
+    /// starting one), so this `await`s its first delivery (or a short
+    /// timeout, via a `race` against `Task.sleep`, so a session can never
+    /// hang waiting on this) rather than blocking any thread synchronously
+    /// -- `start()` is `@MainActor`, and a blocking wait here would freeze
+    /// the whole app's UI for up to the timeout on every session start.
+    private static func currentNetworkPathDescription() async -> String {
+        await withTaskGroup(of: String?.self) { group in
+            group.addTask {
+                await withCheckedContinuation { (continuation: CheckedContinuation<String, Never>) in
+                    let monitor = NWPathMonitor()
+                    let queue = DispatchQueue(label: "ie.boboco.GateOpener.video.diag.pathmonitor")
+                    monitor.pathUpdateHandler = { path in
+                        let interfaceTypes = path.availableInterfaces.map { "\($0.type)" }
+                        let description = "interfaces=\(interfaceTypes) ipv4=\(path.supportsIPv4) ipv6=\(path.supportsIPv6) expensive=\(path.isExpensive)"
+                        monitor.cancel()
+                        continuation.resume(returning: description)
+                    }
+                    monitor.start(queue: queue)
+                }
+            }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                return "unknown"
+            }
+            // First finisher wins; cancel the other (the timeout task if the
+            // path arrived first, or -- harmlessly, since the continuation
+            // is one-shot and NWPathMonitor.cancel() is idempotent -- the
+            // monitor task if the timeout fired first).
+            guard let first = await group.next() ?? nil else { return "unknown" }
+            group.cancelAll()
+            return first
+        }
+    }
+
+    /// Persists `diagnostics.text` to the app-group shared defaults (falling
+    /// back to `.standard` if the App Group entitlement is unavailable, e.g.
+    /// a plain SPM test target with no entitlements at all -- see
+    /// `SharedContainer.sharedDefaults()`'s doc comment), so a Release
+    /// (TestFlight) build still leaves a shareable log after every session,
+    /// not just failures.
+    private func persistDiagnostics() {
+        diagnostics.persist(to: SharedContainer.sharedDefaults() ?? .standard)
+    }
+
+    /// Called (on the main actor) by `DiagScriptMessageForwarder` on every
+    /// "diag" message from `door-video.html`'s `diag()` helper -- see that
+    /// type's doc comment. Appends the page's own already-timestamped line
+    /// verbatim (it is prefixed with `[<page-side-ms>]` by the page itself,
+    /// distinguishable from this file's Swift-side lines only by the
+    /// magnitude of the timestamp if ever compared -- both are epoch-ish
+    /// millisecond counters).
+    fileprivate func recordDiagMessage(_ line: String) {
+        guard !hasStopped else { return }
+        diagnostics.append("[page] \(line)")
     }
 }
 
@@ -865,6 +998,32 @@ extension DoorVideoSession {
         lastFrameAt = Date()
         if state == .connecting {
             state = .streaming
+        }
+    }
+}
+
+// MARK: - "diag" diagnostics channel (bead gateopener-672.27)
+
+/// Receives "diag" messages on behalf of a `DoorVideoSession`, mirroring
+/// `ScriptMessageForwarder` above exactly (same weak-referencing shim
+/// rationale — see `DoorVideoSession.init`'s doc comment). A second,
+/// separate forwarder type (rather than making `ScriptMessageForwarder`
+/// handle multiple names) so each message name's routing stays a trivial,
+/// obviously-correct one-liner.
+private final class DiagScriptMessageForwarder: NSObject, WKScriptMessageHandler {
+    private weak var target: DoorVideoSession?
+
+    init(target: DoorVideoSession) {
+        self.target = target
+    }
+
+    func userContentController(
+        _ userContentController: WKUserContentController,
+        didReceive message: WKScriptMessage
+    ) {
+        guard message.name == "diag", let line = message.body as? String else { return }
+        Task { @MainActor [weak target] in
+            target?.recordDiagMessage(line)
         }
     }
 }

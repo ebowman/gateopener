@@ -38,6 +38,62 @@ function logMsg(msg) {
   console.log(line);
 }
 
+// Release-build diagnostics recorder (bead gateopener-672.27). Entirely
+// additive and independent of logMsg/window.__state.log above -- this exists
+// so an off-LAN failure can be diagnosed from a TestFlight (Release) build,
+// where there is no debug console attached. ALWAYS records into
+// window.__diag (capped at 200 lines, like window.__state.log), regardless
+// of platform; only POSTS each line to Swift via the "diag"
+// WKScriptMessageHandler when that handler exists, so the macOS path (which
+// registers no such handler) is completely unaffected beyond the negligible
+// cost of appending to this array. NEVER logs a full IP address of the
+// phone or door -- only candidate type (host/srflx/prflx/relay), transport
+// protocol, and address family (v4/v6) are recorded, per the bead's privacy
+// requirement.
+window.__diag = [];
+function diag(line) {
+  const withTs = `[${Date.now()}] ${line}`;
+  window.__diag.push(withTs);
+  if (window.__diag.length > 200) {
+    window.__diag.splice(0, window.__diag.length - 200);
+  }
+  if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.diag) {
+    try {
+      window.webkit.messageHandlers.diag.postMessage(withTs);
+    } catch (err) {
+      // Best-effort only; never let a diagnostics post throw into caller code.
+    }
+  }
+}
+
+// Address-family classifier used only for diagnostics summaries below --
+// NEVER returns or logs the address itself, only "v4"/"v6"/"unknown".
+function addressFamily(address) {
+  if (!address) return "unknown";
+  return address.indexOf(":") !== -1 ? "v6" : "v4";
+}
+
+// Summarizes one SDP's worth of "a=candidate:" lines to exactly
+// {type, family, port} triples -- used both for our own local candidates
+// (via pc.onicecandidate) and for the remote answer's candidate lines. SDP
+// candidate line shape: "candidate:<foundation> <component> <proto> <prio>
+// <address> <port> typ <type> ...". Never logs the address field itself.
+function summarizeCandidateLine(candidateLine) {
+  const parts = candidateLine.trim().split(/\s+/);
+  // parts[0] may be "a=candidate:..." (SDP) or "candidate:..." (RTCIceCandidate.candidate).
+  const proto = parts[2] ? parts[2].toLowerCase() : "unknown";
+  const address = parts[4] || "";
+  const port = parts[5] || "unknown";
+  const typIndex = parts.indexOf("typ");
+  const type = typIndex !== -1 && parts[typIndex + 1] ? parts[typIndex + 1] : "unknown";
+  return { type, protocol: proto, family: addressFamily(address), port };
+}
+
+function summarizeRemoteCandidates(answerSdp) {
+  const lines = answerSdp.split(/\r?\n/).filter((l) => l.indexOf("a=candidate:") === 0);
+  return lines.map((l) => summarizeCandidateLine(l.substring(2)));
+}
+
 // Builds the RTCPeerConnection, wires up ontrack and the recvonly
 // audio+video transceivers (audio first -- the door's answer generation is
 // m-line-order sensitive), creates the offer, and waits for non-trickle ICE
@@ -67,17 +123,35 @@ async function negotiate() {
     iceCandidatePoolSize: 0,
   });
   logMsg("Created RTCPeerConnection with comelit STUN server(s): " + JSON.stringify(iceServerUrls));
+  diag("pc created, iceServerUrls.length=" + iceServerUrls.length);
   window.__state.pc = pc;
 
-  pc.oniceconnectionstatechange = () => logMsg("iceConnectionState=" + pc.iceConnectionState);
-  pc.onconnectionstatechange = () => logMsg("connectionState=" + pc.connectionState);
-  pc.onsignalingstatechange = () => logMsg("signalingState=" + pc.signalingState);
-  pc.onicegatheringstatechange = () => logMsg("iceGatheringState=" + pc.iceGatheringState);
+  pc.oniceconnectionstatechange = () => { logMsg("iceConnectionState=" + pc.iceConnectionState); diag("iceConnectionState=" + pc.iceConnectionState); };
+  pc.onconnectionstatechange = () => {
+    logMsg("connectionState=" + pc.connectionState);
+    diag("connectionState=" + pc.connectionState);
+    if (pc.connectionState === "connected") {
+      startSelectedPairPolling(pc);
+    }
+  };
+  pc.onsignalingstatechange = () => { logMsg("signalingState=" + pc.signalingState); diag("signalingState=" + pc.signalingState); };
+  pc.onicegatheringstatechange = () => { logMsg("iceGatheringState=" + pc.iceGatheringState); diag("iceGatheringState=" + pc.iceGatheringState); };
   pc.onicecandidateerror = (e) => logMsg("iceCandidateError: " + JSON.stringify({errorCode: e.errorCode, errorText: e.errorText, url: e.url}));
+
+  // Local candidates as they are gathered (never logs the phone's actual
+  // address -- only type/protocol/family/port, per this bead's privacy
+  // requirement). event.candidate is null once gathering completes, which
+  // this deliberately does not log as a "candidate" line.
+  pc.onicecandidate = (event) => {
+    if (!event.candidate || !event.candidate.candidate) return;
+    const summary = summarizeCandidateLine(event.candidate.candidate);
+    diag("local candidate: type=" + summary.type + " proto=" + summary.protocol + " family=" + summary.family + " port=" + summary.port);
+  };
 
   pc.ontrack = (event) => {
     window.__state.ontrackFired = true;
     logMsg("ontrack fired, kind=" + event.track.kind + " id=" + event.track.id);
+    diag("ontrack kind=" + event.track.kind);
     if (event.track.kind === "video") {
       const video = document.getElementById("v");
       if (event.streams && event.streams[0]) {
@@ -98,6 +172,7 @@ async function negotiate() {
         const onFrame = (now) => {
           if (!window.__state.hasVideoFrame) {
             logMsg("first video frame natural size: " + video.videoWidth + "x" + video.videoHeight);
+            diag("first video frame " + video.videoWidth + "x" + video.videoHeight);
           }
           window.__state.hasVideoFrame = true;
           if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.frame) {
@@ -150,6 +225,8 @@ async function negotiate() {
 // reaches page JS).
 window.applyAnswer = async function (answerSdp) {
   const pc = window.__state.pc;
+  const remoteCandidates = summarizeRemoteCandidates(answerSdp);
+  diag("remote answer candidates: " + JSON.stringify(remoteCandidates));
   await pc.setRemoteDescription({ type: 'answer', sdp: answerSdp });
   logMsg("setRemoteDescription(answer) done, signalingState=" + pc.signalingState);
   return true;
@@ -261,9 +338,50 @@ window.captureFrameAndStats = async function (quality) {
   return JSON.stringify({jpeg: jpeg, video: video});
 };
 
+// Diagnostics only (bead gateopener-672.27): once `pc.connectionState` first
+// reaches "connected" (see the onconnectionstatechange handler in
+// negotiate() above), polls pc.getStats() every ~2s for the transport's
+// selectedCandidatePairId and logs the local/remote candidate types,
+// address families, transport state, and bytesReceived for that pair. Never
+// logs an address itself. `window.__diagPairTimer` holds the interval
+// handle so closeSession() below can stop it; harmless (a no-op re-poll on
+// an already-closed pc) if it ever fires after teardown, since getStats()
+// on a closed RTCPeerConnection simply resolves with the last-known report
+// set or rejects, both handled here.
+window.__diagPairTimer = null;
+function startSelectedPairPolling(pc) {
+  if (window.__diagPairTimer) return;
+  window.__diagPairTimer = setInterval(async () => {
+    try {
+      const stats = await pc.getStats();
+      let transport = null;
+      stats.forEach((report) => {
+        if (report.type === 'transport') transport = report;
+      });
+      if (!transport || !transport.selectedCandidatePairId) return;
+      const pair = stats.get(transport.selectedCandidatePairId);
+      if (!pair) return;
+      const local = stats.get(pair.localCandidateId);
+      const remote = stats.get(pair.remoteCandidateId);
+      diag("selected pair: local(type=" + (local ? local.candidateType : "?") + " family=" + addressFamily(local ? local.address : null) +
+        ") remote(type=" + (remote ? remote.candidateType : "?") + " family=" + addressFamily(remote ? remote.address : null) +
+        ") state=" + pair.state + " bytesReceived=" + (pair.bytesReceived || 0));
+    } catch (err) {
+      // Best-effort diagnostics only; never let a polling failure surface.
+    }
+  }, 2000);
+}
+function stopSelectedPairPolling() {
+  if (window.__diagPairTimer) {
+    clearInterval(window.__diagPairTimer);
+    window.__diagPairTimer = null;
+  }
+}
+
 // Tears down the RTCPeerConnection. Idempotent: safe to call even if no
 // session was ever started, or if called more than once.
 window.closeSession = function () {
+  stopSelectedPairPolling();
   const pc = window.__state.pc;
   if (pc) {
     try {
