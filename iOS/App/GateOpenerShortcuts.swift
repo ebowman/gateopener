@@ -19,12 +19,11 @@ struct GateOpenerShortcuts: AppShortcutsProvider {
                 "Open my gate in \(.applicationName)",
             ],
             shortTitle: "Open Gate",
-            // Matches `GateIcon.symbolName(for: .idle)`
-            // (`Sources/GateOpener/GateIcon.swift`) — the resting/"ready to
-            // open" icon used elsewhere in this app, so the Shortcuts/Siri
-            // surface for this action stays visually consistent with the
-            // menu-bar icon.
-            systemImageName: "lock.fill"
+            // `systemImageName:` requires a compile-time string literal (the
+            // App Shortcuts macro extracts it statically), so it cannot take
+            // `GateSymbol.name` directly — keep this literal in sync with
+            // `iOS/Shared/GateSymbol.swift` by hand.
+            systemImageName: "door.left.hand.open"
         )
     }
 }

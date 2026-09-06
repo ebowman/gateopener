@@ -20,7 +20,7 @@ struct GateControl: ControlWidget {
     var body: some ControlWidgetConfiguration {
         StaticControlConfiguration(kind: "ie.boboco.GateOpener.control") {
             ControlWidgetButton(action: OpenGateIntent()) {
-                Label("Open Gate", systemImage: "lock.fill")
+                Label("Open Gate", systemImage: GateSymbol.name)
             }
             .tint(.accentColor)
         }

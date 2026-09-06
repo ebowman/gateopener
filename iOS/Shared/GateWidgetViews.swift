@@ -160,7 +160,7 @@ public struct GateWidgetEntryView: View {
     private var openButton: some View {
         Button(intent: OpenGateIntent()) {
             VStack(spacing: 6) {
-                Image(systemName: "lock.fill")
+                Image(systemName: GateSymbol.name)
                     .font(.title)
                 Text("Open")
                     .font(.headline)
@@ -216,7 +216,7 @@ public struct GateWidgetEntryView: View {
 
     private var accessoryCircularBody: some View {
         Button(intent: OpenGateIntent()) {
-            Image(systemName: "lock.fill")
+            Image(systemName: GateSymbol.name)
         }
         .disabled(isNeedsSetup)
         .containerBackground(for: .widget) {
@@ -228,7 +228,7 @@ public struct GateWidgetEntryView: View {
 
     private var accessoryRectangularBody: some View {
         HStack(spacing: 6) {
-            Image(systemName: "lock.fill")
+            Image(systemName: GateSymbol.name)
                 .foregroundStyle(tint)
             VStack(alignment: .leading, spacing: 2) {
                 Text(gateDisplayName)
