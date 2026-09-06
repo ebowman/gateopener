@@ -88,6 +88,41 @@ targets:
         debug:
           CODE_SIGN_IDENTITY: "Apple Development"
 
+  GateOpener-iOSTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: iOS/Tests
+    dependencies:
+      - target: GateOpener-iOS
+      - package: GateOpenerCore
+        product: GateOpenerCore
+    settings:
+      base:
+        # xcodegen DOES set TEST_HOST/BUNDLE_LOADER automatically for a
+        # bundle.unit-test target that depends on an application target,
+        # but it derives BOTH the app bundle name and the executable name
+        # from $(TARGET_NAME) ("GateOpener-iOS") — verified by inspecting
+        # the generated pbxproj. The GateOpener-iOS target's actual
+        # PRODUCT_NAME (and therefore both its .app bundle's name AND its
+        # executable's name inside that bundle) is "GateOpener" (see that
+        # target's own PRODUCT_NAME setting above), not "GateOpener-iOS" —
+        # confirmed by inspecting a built product:
+        # .build/xcode/Build/Products/Debug-iphonesimulator/GateOpener.app/GateOpener.
+        # xcodegen's auto-generated TEST_HOST
+        # ("$(BUILT_PRODUCTS_DIR)/GateOpener-iOS.app/GateOpener-iOS") therefore
+        # points at a path that does not exist and xcodebuild fails with
+        # "Could not find test host for GateOpener-iOSTests" before this
+        # override was added. Overriding both explicitly here, using the
+        # real PRODUCT_NAME for both path components, fixes that.
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/GateOpener.app/GateOpener"
+        BUNDLE_LOADER: "$(TEST_HOST)"
+        PRODUCT_BUNDLE_IDENTIFIER: ie.boboco.GateOpener.tests
+        GENERATE_INFOPLIST_FILE: YES
+      configs:
+        debug:
+          CODE_SIGN_IDENTITY: "Apple Development"
+
   GateOpenerWidget:
     type: app-extension
     platform: iOS
@@ -125,7 +160,12 @@ schemes:
     build:
       targets:
         GateOpener-iOS: [run, test, profile, archive]
+        GateOpener-iOSTests: [test]
     run:
       config: Debug
+    test:
+      config: Debug
+      targets:
+        - GateOpener-iOSTests
     archive:
       config: Release
