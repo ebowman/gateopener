@@ -377,45 +377,13 @@ public final class GateController {
     /// description (and, structurally, never a token/password/credential:
     /// none of the cases below ever interpolate the underlying error's
     /// associated values into the returned string).
+    ///
+    /// The mapping itself now lives in `GateErrorMessage.short(for:)` (the
+    /// single canonical mapping shared with the app layers); this stays as
+    /// a one-line forwarder so existing internal callers/tests are
+    /// unaffected.
     static func shortMessage(for error: Error) -> String {
-        if let comelitError = error as? ComelitError {
-            switch comelitError {
-            case .invalidCredentials:
-                return "Wrong username or password"
-            case .network, .server, .missingRefreshToken:
-                return "Could not reach the gate"
-            case .decoding:
-                return "Could not reach the gate"
-            }
-        }
-        if let gateClientError = error as? GateClientError {
-            switch gateClientError {
-            case .noEndpointsFound, .noGateFound:
-                return "No gate found"
-            }
-        }
-        // `errSecInteractionNotAllowed` (-25308): the keychain item's
-        // accessibility class requires the device to have been unlocked
-        // (see `KeychainAccessibility`), but the current process cannot
-        // prompt for/perform that interaction right now — this is the
-        // status a locked-device App Intent / widget invocation surfaces
-        // when it tries to read credentials/tokens before first unlock.
-        // Mapped to an explicit, actionable message rather than falling
-        // through to the generic one below.
-        if let keychainError = error as? KeychainError {
-            switch keychainError {
-            case .loadFailed(let status), .saveFailed(let status), .deleteFailed(let status):
-                if status == errSecInteractionNotAllowed {
-                    return "Unlock iPhone to open the gate"
-                }
-            case .decodeFailed:
-                break
-            }
-        }
-        // Unknown error type: a generic short message, never the raw
-        // description (which could contain a URL, status body fragment, or
-        // other implementation detail unsuitable for end-user display).
-        return "Could not open the gate"
+        GateErrorMessage.short(for: error)
     }
 
     // MARK: - Terminal-state transition + auto-reset

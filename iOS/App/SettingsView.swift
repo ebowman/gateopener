@@ -308,30 +308,24 @@ struct SettingsView: View {
     }
 }
 
-// MARK: - Short, human-readable error mapping (view-layer copy)
+// MARK: - Short, human-readable error mapping (view-layer wrapper)
 //
-// `GateController.shortMessage(for:)` (`Sources/GateOpenerCore/
-// GateController.swift`) implements the canonical short-message mapping,
-// including the `errSecInteractionNotAllowed` -> "Unlock iPhone to open
-// the gate" case this Lock Screen toggle can hit (rewriting keychain items
-// while the device is locked), but it is `internal` to `GateOpenerCore`,
-// not `public`, so it is not visible from this target. This is a small,
-// deliberate duplication of that mapping — mirroring the existing
-// `Sources/GateOpener/SettingsView.swift` (macOS) and
-// `iOS/App/SignInView.swift` view-layer copies — so this view never
-// surfaces a raw `Error` description (which could contain a status code or
-// other implementation detail unsuitable for end-user display). Keep in
-// sync with `GateController.shortMessage(for:)` if either changes.
+// `GateErrorMessage.short(for:)` (`Sources/GateOpenerCore/
+// GateErrorMessage.swift`) is the single canonical mapping, including the
+// `errSecInteractionNotAllowed` -> "Unlock iPhone to open the gate" case
+// this Lock Screen toggle can hit (rewriting keychain items while the
+// device is locked). Its generic fallback text ("Could not open the
+// gate") is tailored to the gate-opening context, though, which is wrong
+// here — this toggle updates a setting, not the gate — so this thin
+// wrapper keeps the settings-specific fallback wording
+// ("Could not update this setting") while still deferring to the shared
+// mapping for the unlock-message case. This never surfaces a raw `Error`
+// description (which could contain a status code or other implementation
+// detail unsuitable for end-user display).
 private func shortErrorMessage(for error: Error) -> String {
-    if let keychainError = error as? KeychainError {
-        switch keychainError {
-        case .loadFailed(let status), .saveFailed(let status), .deleteFailed(let status):
-            if status == errSecInteractionNotAllowed {
-                return "Unlock iPhone to open the gate"
-            }
-        case .decodeFailed:
-            break
-        }
+    let mapped = GateErrorMessage.short(for: error)
+    guard error is KeychainError else {
+        return "Could not update this setting"
     }
-    return "Could not update this setting"
+    return mapped == "Unlock iPhone to open the gate" ? mapped : "Could not update this setting"
 }
