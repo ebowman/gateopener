@@ -39,6 +39,11 @@ targets:
       - path: iOS/Resources/Assets.xcassets
       - path: iOS/App/PrivacyInfo.xcprivacy
         buildPhase: resources
+      # Shared verbatim with the macOS target (Sources/GateOpener) — see
+      # DoorVideoSession.swift (iOS/App/Video) — so it is referenced by
+      # path here rather than copied into iOS/Resources.
+      - path: Resources/door-video.html
+        buildPhase: resources
       # Sources/GateOpener/GateControllerObservable.swift is deliberately NOT
       # included here: despite its "Foundation+Observation only" doc comment,
       # it references `GlobalHotkey` (Sources/GateOpener/GlobalHotkey.swift),

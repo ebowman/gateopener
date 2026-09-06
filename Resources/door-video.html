@@ -22,6 +22,10 @@ window.__state = {
   offerSdp: null,
   ontrackFired: false,
   hasVideoFrame: false,
+  // iOS liveness channel (gateopener-672.11): timestamp (ms, from
+  // requestVideoFrameCallback's `now`) of the last "frame" message posted
+  // to Swift; see the throttle in pc.ontrack below.
+  lastFramePostMs: 0,
   log: [],
 };
 
@@ -83,13 +87,28 @@ async function negotiate() {
       }
       video.play().catch(err => logMsg("video.play() error: " + err));
       if (video.requestVideoFrameCallback) {
-        const onFrame = () => {
+        // iOS liveness channel (gateopener-672.11): posts a frame
+        // timestamp to Swift's WKScriptMessageHandler named "frame" at
+        // most ~2Hz (>= 500ms since the last post), so DoorVideoSession's
+        // liveness watchdog can detect a genuine stall (no new frame for
+        // several seconds) off real per-frame callbacks. Guarded on
+        // `window.webkit?.messageHandlers?.frame` existing so the macOS
+        // path (which has no such handler registered) is completely
+        // untouched -- this is purely additive.
+        const onFrame = (now) => {
           if (!window.__state.hasVideoFrame) {
             logMsg("first video frame natural size: " + video.videoWidth + "x" + video.videoHeight);
           }
           window.__state.hasVideoFrame = true;
+          if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.frame) {
+            if (now - window.__state.lastFramePostMs >= 500) {
+              window.__state.lastFramePostMs = now;
+              window.webkit.messageHandlers.frame.postMessage(now);
+            }
+          }
           video.requestVideoFrameCallback(onFrame);
         };
+        window.__state.lastFramePostMs = 0;
         video.requestVideoFrameCallback(onFrame);
       }
     }

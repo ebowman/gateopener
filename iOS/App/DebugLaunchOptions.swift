@@ -90,6 +90,22 @@ enum DebugLaunchOptions {
         ProcessInfo.processInfo.arguments.contains("--widget-preview")
     }
 
+    /// True if `--video-harness` was passed on the launch command line
+    /// (bead gateopener-672.11 verification): after launch,
+    /// `GateOpenerIOSApp` creates a `DoorVideoSession` and logs every
+    /// `onStateChange` transition via `os.Logger` (subsystem
+    /// `ie.boboco.GateOpener`, category `video`) — the same subsystem/
+    /// category `DoorVideoSession` itself logs to — so a verification
+    /// script can grep the device/simulator log for the session's state
+    /// machine running end to end (or, on the simulator where the door
+    /// hardware is unreachable, at least reaching `.failed` cleanly rather
+    /// than crashing). Deliberately NOT wired into `MainView` — that is
+    /// bead gateopener-672.12's job; this harness exists purely to exercise
+    /// `DoorVideoSession` in isolation.
+    static var videoHarnessOnLaunch: Bool {
+        ProcessInfo.processInfo.arguments.contains("--video-harness")
+    }
+
     /// Pre-seeds `appSettings` and the credential store so a `--mock-gate`
     /// run starts in `.idle` (a selected gate + stored credentials) rather
     /// than `.needsSetup`. No-op unless `mockGateMode` is non-nil.

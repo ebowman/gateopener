@@ -22,6 +22,14 @@ struct GateOpenerIOSApp: App {
     @State private var observable: GateControllerObservable
     private let backgroundOpenRunner: BackgroundOpenRunner
 
+    #if DEBUG
+    /// `--video-harness` (bead gateopener-672.11 verification): held
+    /// strongly here (rather than a local inside a `.task`) so the session
+    /// survives the closure that starts it. `nil` unless `--video-harness`
+    /// was passed. See `DebugLaunchOptions.videoHarnessOnLaunch`.
+    @State private var videoHarnessSession: DoorVideoSession?
+    #endif
+
     @Environment(\.scenePhase) private var scenePhase
 
     init() {
@@ -89,7 +97,17 @@ struct GateOpenerIOSApp: App {
             #endif
         }
         .onChange(of: scenePhase) { _, newPhase in
-            guard newPhase == .active else { return }
+            guard newPhase == .active else {
+                #if DEBUG
+                // Backgrounding always stops an in-flight `--video-harness`
+                // session (WebRTC would be suspended by the system anyway,
+                // and this mirrors the stop-on-background requirement any
+                // real door-video screen must also honor — see bead
+                // gateopener-672.12).
+                videoHarnessSession?.stop()
+                #endif
+                return
+            }
             Task { await environment.tokenManager.prewarm() }
             environment.publishSnapshot()
         }
@@ -137,5 +155,28 @@ struct GateOpenerIOSApp: App {
                 // Intentionally empty otherwise: opening the URL itself
                 // already brought the app to the foreground/MainView.
             }
+            #if DEBUG
+            // `--video-harness` (bead gateopener-672.11 verification):
+            // creates a `DoorVideoSession` and logs every state
+            // transition via os.Logger. Not wired into any visible UI —
+            // bead gateopener-672.12 does that; this exists purely so a
+            // verification script can grep the log for the session's
+            // state machine running end to end.
+            .task {
+                guard DebugLaunchOptions.videoHarnessOnLaunch, videoHarnessSession == nil else { return }
+                let logger = Logger(subsystem: "ie.boboco.GateOpener", category: "video")
+                let session = DoorVideoSession(
+                    tokenManager: environment.tokenManager,
+                    gateClient: environment.gateClient,
+                    appSettings: environment.appSettings
+                )
+                session.onStateChange = { newState in
+                    logger.notice("--video-harness state: \(String(describing: newState), privacy: .public)")
+                }
+                videoHarnessSession = session
+                logger.notice("--video-harness: starting session")
+                await session.start()
+            }
+            #endif
     }
 }
