@@ -36,10 +36,16 @@
 	<string>AccentColor</string>
 	<key>UILaunchScreen</key>
 	<dict/>
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+	</array>
 	<key>UISupportedInterfaceOrientations~iphone</key>
 	<array>
 		<string>UIInterfaceOrientationPortrait</string>
 	</array>
+	<key>UIRequiresFullScreen</key>
+	<true/>
 	<!-- Registers the `gateopener://` URL scheme (bead gateopener-672.14
 	     step 4): tapping a widget's non-button body uses
 	     `.widgetURL(URL(string: "gateopener://main"))`

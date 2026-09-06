@@ -78,6 +78,7 @@ targets:
         CODE_SIGN_ENTITLEMENTS: iOS/App/GateOpener.entitlements
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        TARGETED_DEVICE_FAMILY: "1"
       configs:
         debug:
           CODE_SIGN_IDENTITY: "Apple Development"

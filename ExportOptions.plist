@@ -7,7 +7,16 @@
     <key>teamID</key>
     <string>Y5SB82BPYL</string>
     <key>signingStyle</key>
-    <string>automatic</string>
+    <string>manual</string>
+    <key>signingCertificate</key>
+    <string>Apple Distribution</string>
+    <key>provisioningProfiles</key>
+    <dict>
+        <key>ie.boboco.GateOpener</key>
+        <string>GateOpener AppStore ios</string>
+        <key>ie.boboco.GateOpener.widget</key>
+        <string>GateOpener AppStore widget</string>
+    </dict>
     <key>uploadSymbols</key>
     <true/>
     <key>destination</key>

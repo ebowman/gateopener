@@ -139,6 +139,14 @@ Note: the App Store Connect app record for bundle id `ie.boboco.GateOpener`
 must already exist before the first upload can succeed — creating it is an
 operator step (see bead 672.20).
 
+The export (`ExportOptions.plist`) uses **manual** signing with the local
+"Apple Distribution" certificate and two App Store provisioning profiles,
+"GateOpener AppStore ios" and "GateOpener AppStore widget", which must be
+installed in `~/Library/MobileDevice/Provisioning Profiles`. Both were
+created through the App Store Connect API and can be re-downloaded from the
+developer portal if missing. Automatic/cloud signing is not used because
+the API key configured above lacks cloud-signing permission.
+
 ## Release flow (maintainers)
 
 Producing and publishing a distributable release is a four-stage pipeline:
