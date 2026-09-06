@@ -442,6 +442,32 @@ private func makeController(
     #expect(settings.isConfigured == false)
 }
 
+// MARK: - 5b. setCredentialStore() routes signOut()'s deletes to the new store
+
+/// Covers bead gateopener-672.25: after `AppEnvironment
+/// .updateKeychainAccessibility(allowWhileLocked:)` swaps in a freshly
+/// -accessibility-configured store, `GateController.signOut()` must delete
+/// from the NEW store, not the one the controller was originally
+/// constructed with.
+@Test @MainActor func setCredentialStoreRoutesSignOutDeletesToTheNewStore() async throws {
+    let oldStore = MockCredentialStore()
+    let (controller, _, _, _, settings) = makeController(credentialStore: oldStore)
+    let newStore = MockCredentialStore()
+    try newStore.saveCredentials(username: "alice", password: "s3cret")
+    try newStore.saveTokens(TokenSet(accessToken: "tok", refreshToken: "r", expiresIn: 3600, tokenType: "bearer"))
+
+    controller.setCredentialStore(newStore)
+    controller.signOut()
+
+    #expect(controller.state == .needsSetup)
+    #expect(newStore.deleteCredentialsCallCount == 1)
+    #expect(newStore.deleteTokensCallCount == 1)
+    #expect(newStore.isEmpty)
+    #expect(oldStore.deleteCredentialsCallCount == 0)
+    #expect(oldStore.deleteTokensCallCount == 0)
+    #expect(settings.selectedEndpointId == nil)
+}
+
 // MARK: - 6. Auto-reset to .idle uses the injected delay, not a real sleep
 
 @Test @MainActor func autoResetUsesInjectedDelayNotRealSleep() async throws {

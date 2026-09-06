@@ -117,7 +117,7 @@ public final class GateController {
 
     private let gateClient: any GateOpening
     private let tokenManager: any TokenResolving
-    private let credentialStore: any CredentialStoring
+    private var credentialStore: any CredentialStoring
     private let appSettings: AppSettings
 
     /// How long after `.succeeded`/`.failed` to auto-return to `.idle`.
@@ -584,6 +584,18 @@ public final class GateController {
 
     /// Clears keychain credentials AND tokens, clears `AppSettings`, and
     /// returns to `.needsSetup`.
+    /// Swaps in a new `CredentialStoring` backend for all FUTURE reads
+    /// (there are none after init) and writes (currently only `signOut()`'s
+    /// deletes): mirrors `TokenManager.setCredentialStore(_:)`, so a caller
+    /// that rebuilds its `CredentialStoring` mid-session (e.g.
+    /// `AppEnvironment.updateKeychainAccessibility(allowWhileLocked:)`) can
+    /// keep this controller's identity (state machine, in-flight open/queue
+    /// tracking) while ensuring `signOut()` deletes from the NEW store
+    /// rather than a stale reference to the old one.
+    public func setCredentialStore(_ store: any CredentialStoring) {
+        credentialStore = store
+    }
+
     public func signOut() {
         cancelPendingReset()
         openTask?.cancel()

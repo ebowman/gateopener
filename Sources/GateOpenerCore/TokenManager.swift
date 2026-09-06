@@ -59,7 +59,7 @@ extension ComelitAPI: TokenIssuing {}
 /// completion re-evaluates the cache from scratch.
 public actor TokenManager {
     private let api: any TokenIssuing
-    private let credentialStore: any CredentialStoring
+    private var credentialStore: any CredentialStoring
     private let now: () -> Date
 
     /// The current in-memory cached token, if any.
@@ -156,6 +156,31 @@ public actor TokenManager {
     /// error) when a plain refresh would have sufficed.
     public func invalidate() {
         cachedToken = nil
+    }
+
+    /// Swaps in a new `CredentialStoring` backend for all FUTURE loads/saves:
+    /// the next `accessToken()`/`prewarm()` call that needs to read stored
+    /// tokens/credentials, and every subsequent `saveTokens`/`saveTokens`
+    /// call made by a refresh or login, go through `store` rather than
+    /// whatever backend this actor was constructed with.
+    ///
+    /// This exists so a caller that rebuilds its `CredentialStoring` mid-
+    /// session (e.g. `AppEnvironment.updateKeychainAccessibility(allowWhileLocked:)`,
+    /// which constructs a freshly-accessibility-configured
+    /// `KeychainCredentialStore`) can keep this actor's already-in-flight
+    /// identity (its in-memory `cachedToken` and single-flight
+    /// `inFlightTask` coalescing) while still ensuring the NEW accessibility
+    /// class applies to the very next token persisted, instead of only
+    /// taking effect on the next app launch.
+    ///
+    /// Does NOT touch `cachedToken`: an in-memory token already resolved
+    /// under the old store remains valid and is not reloaded or invalidated
+    /// by this call. Single-flight coalescing (`inFlightTask`) is likewise
+    /// unaffected — an in-flight resolution started before this call
+    /// completes normally against whichever store was current when it
+    /// started reading/writing.
+    public func setCredentialStore(_ store: any CredentialStoring) {
+        credentialStore = store
     }
 
     // MARK: - Resolution

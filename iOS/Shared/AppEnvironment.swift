@@ -37,8 +37,10 @@ public final class AppEnvironment {
     /// below, which swaps in a freshly-constructed `KeychainCredentialStore`
     /// after rewriting existing items so all FUTURE saves through this
     /// property also use the new accessibility class. See that method's doc
-    /// comment for why `tokenManager`/`gateClient`/`controller` are
-    /// deliberately NOT rebuilt alongside it.
+    /// comment for why `tokenManager`/`gateClient`/`controller` are NOT
+    /// rebuilt as new instances alongside it — they instead have the new
+    /// store pushed into them via `TokenManager.setCredentialStore(_:)` /
+    /// `GateController.setCredentialStore(_:)`.
     public private(set) var credentialStore: KeychainCredentialStore
     public let api: ComelitAPI
     public let tokenManager: TokenManager
@@ -263,11 +265,8 @@ public final class AppEnvironment {
     /// which only ever rewrites items that already exist and never changes
     /// the instance's own accessibility for later saves.
     ///
-    /// CHOSEN OPTION (documented per this bead's brief, which required
-    /// picking the simpler safe alternative if a mid-session rebuild of
-    /// `GateController`/`TokenManager` was not safe): `tokenManager`,
-    /// `gateClient`, and `controller` are intentionally left UNCHANGED here.
-    /// `GateController` is `@MainActor`, holds live in-flight-open
+    /// `tokenManager` and `controller` are NOT rebuilt as new instances
+    /// here: `GateController` is `@MainActor`, holds live in-flight-open
     /// coalescing state, has its `onStateChange` handler wired by `make()`,
     /// and its identity is captured directly by call sites outside this
     /// type (e.g. `GateControllerObservable.controller = environment
@@ -275,37 +274,32 @@ public final class AppEnvironment {
     /// a new instance mid-session would silently strand those references
     /// and their observers. `TokenManager` is an `actor` with its own
     /// in-flight-task coalescing and is likewise held by reference
-    /// elsewhere. Since both were constructed with `credentialStore` (the
-    /// OLD instance) baked in as a `let`, they keep using that old
-    /// instance's fixed accessibility for token saves for the rest of this
-    /// process's lifetime. The new accessibility therefore applies
-    /// immediately to (a) any credentials/tokens rewritten by this call and
-    /// (b) any saves made through `environment.credentialStore` directly
-    /// (e.g. `SettingsView`'s "Sign Out" reads, a future explicit re-save),
-    /// but a token refresh performed by the existing `tokenManager` during
-    /// this same app session will still persist under the OLD accessibility
-    /// until the next app launch reconstructs the whole `AppEnvironment`
-    /// (and therefore `tokenManager`) via `make()`. This is judged
-    /// acceptable: it is a narrow, session-scoped inconsistency (fully
-    /// self-correcting on next launch) traded for NOT risking a broken
-    /// `GateController` mid-session, which would be a much worse user-
-    /// facing regression than one setting change needing an app relaunch to
-    /// fully "stick" for background-refreshed tokens.
+    /// elsewhere. Instead, once the rewrite and the new `credentialStore`
+    /// both succeed, the NEW store is pushed into both existing instances
+    /// via `TokenManager.setCredentialStore(_:)` and
+    /// `GateController.setCredentialStore(_:)`, so a token refresh
+    /// performed later in this same app session persists under the NEW
+    /// accessibility immediately, without waiting for the next app launch
+    /// to reconstruct `AppEnvironment` (and therefore `tokenManager`) via
+    /// `make()`.
     ///
     /// - Parameter allowWhileLocked: The new "Allow opening while locked"
     ///   value (already persisted to `AppSettings` by the caller).
     /// - Throws: Whatever `KeychainCredentialStore.rewriteAccessibility(to:)`
     ///   throws (a `KeychainError`) if rewriting existing items fails.
-    ///   `credentialStore` is NOT swapped when this throws, so the
-    ///   environment is left exactly as it was before the call — callers
-    ///   (`SettingsView`) should revert their toggle's displayed value on
-    ///   error.
-    public func updateKeychainAccessibility(allowWhileLocked: Bool) throws {
+    ///   `credentialStore`/`tokenManager`/`controller` are NOT swapped when
+    ///   this throws, so the environment is left exactly as it was before
+    ///   the call — callers (`SettingsView`) should revert their toggle's
+    ///   displayed value on error.
+    public func updateKeychainAccessibility(allowWhileLocked: Bool) async throws {
         let newAccessibility = Self.keychainAccessibility(allowWhileLocked: allowWhileLocked)
         try credentialStore.rewriteAccessibility(to: newAccessibility)
-        credentialStore = KeychainCredentialStore(
+        let newStore = KeychainCredentialStore(
             accessGroup: SharedContainer.keychainAccessGroup,
             accessibility: newAccessibility
         )
+        credentialStore = newStore
+        await tokenManager.setCredentialStore(newStore)
+        controller.setCredentialStore(newStore)
     }
 }

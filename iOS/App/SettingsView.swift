@@ -250,13 +250,15 @@ struct SettingsView: View {
                 let previousValue = appSettings.allowOpenWhileLocked
                 lockScreenErrorMessage = nil
                 appSettings.allowOpenWhileLocked = newValue
-                do {
-                    try environment.updateKeychainAccessibility(allowWhileLocked: newValue)
-                } catch {
-                    appSettings.allowOpenWhileLocked = previousValue
-                    lockScreenErrorMessage = shortErrorMessage(for: error)
+                Task {
+                    do {
+                        try await environment.updateKeychainAccessibility(allowWhileLocked: newValue)
+                    } catch {
+                        appSettings.allowOpenWhileLocked = previousValue
+                        lockScreenErrorMessage = shortErrorMessage(for: error)
+                    }
+                    refreshToken += 1
                 }
-                refreshToken += 1
             }
         )
     }
