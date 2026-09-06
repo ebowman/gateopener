@@ -33,7 +33,13 @@ public final class AppEnvironment {
 
     public let defaults: UserDefaults
     public let appSettings: AppSettings
-    public let credentialStore: KeychainCredentialStore
+    /// `private(set)`: mutated ONLY by `updateKeychainAccessibility(allowWhileLocked:)`
+    /// below, which swaps in a freshly-constructed `KeychainCredentialStore`
+    /// after rewriting existing items so all FUTURE saves through this
+    /// property also use the new accessibility class. See that method's doc
+    /// comment for why `tokenManager`/`gateClient`/`controller` are
+    /// deliberately NOT rebuilt alongside it.
+    public private(set) var credentialStore: KeychainCredentialStore
     public let api: ComelitAPI
     public let tokenManager: TokenManager
     public let gateClient: any GateOpening
@@ -92,6 +98,25 @@ public final class AppEnvironment {
     ///     `TokenManager`, used for `prewarm()` and anything else that
     ///     needs the concrete type) — it only substitutes what
     ///     `GateController` itself calls for token resolution.
+    /// Maps the "Allow opening while locked" setting
+    /// (`AppSettings.allowOpenWhileLocked`) to the `KeychainAccessibility`
+    /// class `make()` constructs `credentialStore` with. A small, pure,
+    /// synchronous function (no `UserDefaults`/Keychain access of its own)
+    /// so it is unit-testable in isolation from the rest of the composition
+    /// root.
+    ///
+    /// - `true` (the default) → `.afterFirstUnlockThisDeviceOnly`: items
+    ///   remain readable once the device has been unlocked at least once
+    ///   since boot, including while subsequently re-locked — this is what
+    ///   lets the Control Center / Lock Screen / Home Screen widget button
+    ///   open the gate without first unlocking the phone.
+    /// - `false` → `.whenUnlockedThisDeviceOnly`: items are only readable
+    ///   while the device is actively unlocked, so those same one-tap
+    ///   surfaces only work after an interactive unlock.
+    static func keychainAccessibility(allowWhileLocked: Bool) -> KeychainAccessibility {
+        allowWhileLocked ? .afterFirstUnlockThisDeviceOnly : .whenUnlockedThisDeviceOnly
+    }
+
     public static func make(
         defaults: UserDefaults? = nil,
         reachability: (any ReachabilityProviding)? = nil,
@@ -111,15 +136,14 @@ public final class AppEnvironment {
 
         let appSettings = AppSettings(defaults: resolvedDefaults)
 
-        // The lock-screen "Allow opening while locked" setting (default on)
-        // selects `.afterFirstUnlockThisDeviceOnly` vs
-        // `.whenUnlockedThisDeviceOnly`; that wiring is a later bead
-        // (gateopener-672.16). For now this always uses
-        // `.afterFirstUnlockThisDeviceOnly`, matching the store's own
-        // default.
+        // The lock-screen "Allow opening while locked" setting (default on,
+        // bead gateopener-672.16) selects `.afterFirstUnlockThisDeviceOnly`
+        // vs `.whenUnlockedThisDeviceOnly` for every keychain item this
+        // store creates or updates going forward. See
+        // `keychainAccessibility(allowWhileLocked:)` below.
         let credentialStore = KeychainCredentialStore(
             accessGroup: SharedContainer.keychainAccessGroup,
-            accessibility: .afterFirstUnlockThisDeviceOnly
+            accessibility: Self.keychainAccessibility(allowWhileLocked: appSettings.allowOpenWhileLocked)
         )
 
         let api = ComelitAPI()
@@ -227,5 +251,61 @@ public final class AppEnvironment {
     /// through here rather than assigning `onStateChange` a second time.
     public func addStateObserver(_ observer: @escaping (GateState) -> Void) {
         additionalObservers.append(observer)
+    }
+
+    /// Applies a new "Allow opening while locked" choice to the Keychain:
+    /// rewrites any credentials/tokens ALREADY stored to the corresponding
+    /// `KeychainAccessibility` class in place, then swaps `credentialStore`
+    /// for a freshly-constructed `KeychainCredentialStore` built with that
+    /// same accessibility, so every FUTURE `saveCredentials`/`saveTokens`
+    /// call (e.g. from a token refresh) also uses the new class — see
+    /// `KeychainCredentialStore.rewriteAccessibility(to:)`'s doc comment,
+    /// which only ever rewrites items that already exist and never changes
+    /// the instance's own accessibility for later saves.
+    ///
+    /// CHOSEN OPTION (documented per this bead's brief, which required
+    /// picking the simpler safe alternative if a mid-session rebuild of
+    /// `GateController`/`TokenManager` was not safe): `tokenManager`,
+    /// `gateClient`, and `controller` are intentionally left UNCHANGED here.
+    /// `GateController` is `@MainActor`, holds live in-flight-open
+    /// coalescing state, has its `onStateChange` handler wired by `make()`,
+    /// and its identity is captured directly by call sites outside this
+    /// type (e.g. `GateControllerObservable.controller = environment
+    /// .controller`, `BackgroundOpenRunner(controller:)`) — swapping it for
+    /// a new instance mid-session would silently strand those references
+    /// and their observers. `TokenManager` is an `actor` with its own
+    /// in-flight-task coalescing and is likewise held by reference
+    /// elsewhere. Since both were constructed with `credentialStore` (the
+    /// OLD instance) baked in as a `let`, they keep using that old
+    /// instance's fixed accessibility for token saves for the rest of this
+    /// process's lifetime. The new accessibility therefore applies
+    /// immediately to (a) any credentials/tokens rewritten by this call and
+    /// (b) any saves made through `environment.credentialStore` directly
+    /// (e.g. `SettingsView`'s "Sign Out" reads, a future explicit re-save),
+    /// but a token refresh performed by the existing `tokenManager` during
+    /// this same app session will still persist under the OLD accessibility
+    /// until the next app launch reconstructs the whole `AppEnvironment`
+    /// (and therefore `tokenManager`) via `make()`. This is judged
+    /// acceptable: it is a narrow, session-scoped inconsistency (fully
+    /// self-correcting on next launch) traded for NOT risking a broken
+    /// `GateController` mid-session, which would be a much worse user-
+    /// facing regression than one setting change needing an app relaunch to
+    /// fully "stick" for background-refreshed tokens.
+    ///
+    /// - Parameter allowWhileLocked: The new "Allow opening while locked"
+    ///   value (already persisted to `AppSettings` by the caller).
+    /// - Throws: Whatever `KeychainCredentialStore.rewriteAccessibility(to:)`
+    ///   throws (a `KeychainError`) if rewriting existing items fails.
+    ///   `credentialStore` is NOT swapped when this throws, so the
+    ///   environment is left exactly as it was before the call — callers
+    ///   (`SettingsView`) should revert their toggle's displayed value on
+    ///   error.
+    public func updateKeychainAccessibility(allowWhileLocked: Bool) throws {
+        let newAccessibility = Self.keychainAccessibility(allowWhileLocked: allowWhileLocked)
+        try credentialStore.rewriteAccessibility(to: newAccessibility)
+        credentialStore = KeychainCredentialStore(
+            accessGroup: SharedContainer.keychainAccessGroup,
+            accessibility: newAccessibility
+        )
     }
 }

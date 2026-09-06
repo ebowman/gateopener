@@ -1,5 +1,6 @@
 import SwiftUI
 import GateOpenerCore
+import Security
 
 /// The Settings screen presented from `MainView`'s gear button (bead
 /// gateopener-672.10).
@@ -35,6 +36,7 @@ struct SettingsView: View {
     @State private var isRefreshing = false
     @State private var refreshErrorMessage: String?
     @State private var isConfirmingSignOut = false
+    @State private var lockScreenErrorMessage: String?
 
     private var username: String? {
         (try? environment.credentialStore.loadCredentials())?.username
@@ -214,20 +216,49 @@ struct SettingsView: View {
         .foregroundStyle(.secondary)
     }
 
-    // MARK: - Lock Screen (reserved for bead gateopener-672.16)
+    // MARK: - Lock Screen
 
     private var lockScreenSection: some View {
-        // Reserved for bead gateopener-672.16: "Allow opening while
-        // locked" toggle, wiring `KeychainAccessibility` between
-        // `.afterFirstUnlockThisDeviceOnly` (default) and
-        // `.whenUnlockedThisDeviceOnly`. Deliberately no UI yet — this
-        // section exists only so the Lock Screen section's position in
-        // the form is stable once .16 adds its content.
         Section {
-            EmptyView()
+            Toggle("Allow opening while locked", isOn: allowOpenWhileLockedBinding)
+
+            if let lockScreenErrorMessage {
+                Text(lockScreenErrorMessage)
+                    .font(.footnote)
+                    .foregroundStyle(.red)
+            }
         } header: {
             Text("Lock Screen")
+        } footer: {
+            Text("When off, the Control Center and Lock Screen buttons only work after you unlock your iPhone.")
         }
+    }
+
+    /// A `Binding` over `appSettings.allowOpenWhileLocked` that, on change,
+    /// persists the new value and immediately applies it to the Keychain
+    /// via `environment.updateKeychainAccessibility(allowWhileLocked:)`
+    /// (which rewrites any already-stored credentials/tokens in place and
+    /// swaps in a freshly-accessibility-configured `credentialStore` for
+    /// future saves — see that method's doc comment for exactly what it
+    /// does and does not rebuild). On failure, the setting AND the
+    /// displayed toggle are both reverted to the previous value, and the
+    /// short failure message is shown inline via `lockScreenErrorMessage`.
+    private var allowOpenWhileLockedBinding: Binding<Bool> {
+        Binding(
+            get: { appSettings.allowOpenWhileLocked },
+            set: { newValue in
+                let previousValue = appSettings.allowOpenWhileLocked
+                lockScreenErrorMessage = nil
+                appSettings.allowOpenWhileLocked = newValue
+                do {
+                    try environment.updateKeychainAccessibility(allowWhileLocked: newValue)
+                } catch {
+                    appSettings.allowOpenWhileLocked = previousValue
+                    lockScreenErrorMessage = shortErrorMessage(for: error)
+                }
+                refreshToken += 1
+            }
+        )
     }
 
     // MARK: - Account
@@ -273,4 +304,32 @@ struct SettingsView: View {
             Text("About")
         }
     }
+}
+
+// MARK: - Short, human-readable error mapping (view-layer copy)
+//
+// `GateController.shortMessage(for:)` (`Sources/GateOpenerCore/
+// GateController.swift`) implements the canonical short-message mapping,
+// including the `errSecInteractionNotAllowed` -> "Unlock iPhone to open
+// the gate" case this Lock Screen toggle can hit (rewriting keychain items
+// while the device is locked), but it is `internal` to `GateOpenerCore`,
+// not `public`, so it is not visible from this target. This is a small,
+// deliberate duplication of that mapping — mirroring the existing
+// `Sources/GateOpener/SettingsView.swift` (macOS) and
+// `iOS/App/SignInView.swift` view-layer copies — so this view never
+// surfaces a raw `Error` description (which could contain a status code or
+// other implementation detail unsuitable for end-user display). Keep in
+// sync with `GateController.shortMessage(for:)` if either changes.
+private func shortErrorMessage(for error: Error) -> String {
+    if let keychainError = error as? KeychainError {
+        switch keychainError {
+        case .loadFailed(let status), .saveFailed(let status), .deleteFailed(let status):
+            if status == errSecInteractionNotAllowed {
+                return "Unlock iPhone to open the gate"
+            }
+        case .decodeFailed:
+            break
+        }
+    }
+    return "Could not update this setting"
 }
