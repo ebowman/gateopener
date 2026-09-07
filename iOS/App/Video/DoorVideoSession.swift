@@ -142,7 +142,17 @@ public final class DoorVideoSession: NSObject {
                 // is guaranteed to leave a persisted log regardless of
                 // which code path produced it.
                 persistDiagnostics()
-            case .idle, .connecting, .streaming:
+            case .streaming:
+                // Bead gateopener-672.30: iOS pauses/refuses inline media
+                // playback in a hidden (opacity-0) web view, and by the
+                // time this session reaches `.streaming` (the first "frame"
+                // message has already arrived — see `recordFrameReceived`),
+                // WebKit may have paused the element regardless. Re-issue
+                // play() defensively on every transition into `.streaming`
+                // — `ensurePlaying()` itself is a no-op ("playing") when
+                // the element is already playing.
+                callEnsurePlaying()
+            case .idle, .connecting:
                 break
             }
             onStateChange?(state)
@@ -230,6 +240,13 @@ public final class DoorVideoSession: NSObject {
         config.userContentController = contentController
 
         self.webView = WKWebView(frame: .zero, configuration: config)
+        // No white flash: `DoorVideoView` (bead gateopener-672.30) now keeps
+        // this web view visible (opacity 1) from the moment it appears,
+        // including before `door-video.html` has loaded, so its default
+        // white background would otherwise show through briefly.
+        self.webView.isOpaque = false
+        self.webView.backgroundColor = .black
+        self.webView.scrollView.backgroundColor = .black
 
         super.init()
 
@@ -425,6 +442,15 @@ public final class DoorVideoSession: NSObject {
         // are logged, never surfaced (the session is ending regardless).
         Task { [weak webView] in
             guard let webView else { return }
+            // markClosing() first (bead gateopener-672.30) so the page's
+            // "pause" event listener (see door-video.html) recognizes the
+            // pause closeSession() is about to cause as deliberate teardown
+            // and does NOT retry play() against a peer connection that is
+            // being closed right underneath it.
+            _ = try? await webView.callAsyncJavaScript(
+                "if (window.markClosing) { window.markClosing(); }",
+                contentWorld: .page
+            )
             _ = try? await webView.callAsyncJavaScript(
                 "return window.closeSession ? window.closeSession() : null;",
                 contentWorld: .page
@@ -613,6 +639,37 @@ public final class DoorVideoSession: NSObject {
         _ = try await webView.callAsyncJavaScript(js, contentWorld: .page)
     }
 
+    /// Calls `door-video.html`'s `window.ensurePlaying()` and appends the
+    /// returned status string ("playing"/"resumed"/"rejected:<name>"/
+    /// "no-video") to `diagnostics` (bead gateopener-672.30). Fire-and-
+    /// forget: failures (e.g. the page not loaded yet) are swallowed since
+    /// this is a best-effort nudge, never load-bearing for the session
+    /// itself succeeding or failing.
+    private func callEnsurePlaying() {
+        Task { [weak self] in
+            guard let self else { return }
+            let result = try? await self.webView.callAsyncJavaScript(
+                "return await window.ensurePlaying ? await window.ensurePlaying() : \"no-fn\";",
+                contentWorld: .page
+            )
+            let status = (result as? String) ?? "unavailable"
+            self.diagnostics.append("[\(Self.diagTimestamp())] ensurePlaying: \(status)")
+        }
+    }
+
+    /// Called by `DoorVideoView.onAppear` (bead gateopener-672.30) so a
+    /// view that re-appears while a session is already `.streaming` (e.g.
+    /// navigating away and back) gets the same defensive `ensurePlaying()`
+    /// nudge as the initial transition into `.streaming` — see that
+    /// `didSet` case above. A no-op for every other state: `.idle`/
+    /// `.connecting` have no page loaded yet (or no video track applied
+    /// yet) to nudge, and `.ended`/`.failed` have already torn the page
+    /// down, so calling `ensurePlaying()` there would be meaningless.
+    public func ensurePlayingFromHost() {
+        guard state == .streaming else { return }
+        callEnsurePlaying()
+    }
+
     // MARK: - Liveness watchdog
 
     /// Watches for new "frame" messages (see `userContentController(_:
@@ -675,6 +732,12 @@ public final class DoorVideoSession: NSObject {
 
         Task { [weak webView] in
             guard let webView else { return }
+            // markClosing() first — see the identical comment in stop()
+            // above.
+            _ = try? await webView.callAsyncJavaScript(
+                "if (window.markClosing) { window.markClosing(); }",
+                contentWorld: .page
+            )
             _ = try? await webView.callAsyncJavaScript(
                 "return window.closeSession ? window.closeSession() : null;",
                 contentWorld: .page

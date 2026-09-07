@@ -36,6 +36,16 @@ function logMsg(msg) {
     window.__state.log.splice(0, window.__state.log.length - 200);
   }
   console.log(line);
+  // Mirror every logMsg() line into diag (bead gateopener-672.30) so
+  // play()/autoplay errors are visible in Settings > Video diagnostics on a
+  // Release (TestFlight) build, where there is no debug console attached.
+  // Guarded with `typeof diag === "function"` since diag() is defined AFTER
+  // logMsg() below in this file and function declarations are hoisted, so
+  // in practice this is always true by the time logMsg() is ever CALLED --
+  // the guard exists purely so this ordering is not load-bearing.
+  if (typeof diag === "function") {
+    diag("log: " + line);
+  }
 }
 
 // Release-build diagnostics recorder (bead gateopener-672.27). Entirely
@@ -377,6 +387,69 @@ function stopSelectedPairPolling() {
     window.__diagPairTimer = null;
   }
 }
+
+// Re-issues video.play() if the element is currently paused (bead
+// gateopener-672.30): iOS pauses/refuses inline media playback on a hidden
+// (opacity-0) WKWebView, and DoorVideoView now keeps the web view visible
+// at all times specifically so play() can succeed here instead of leaving
+// the element paused with a native "tap to play" glyph. No-op (returns
+// "no-video") if the video element is missing -- guards this addition so a
+// page variant without a #v element (there is none today, but future-proof
+// per this bead's brief) never throws. Returns a short status string Swift
+// records into diagnostics; never throws.
+window.ensurePlaying = async function () {
+  const video = document.getElementById("v");
+  if (!video) return "no-video";
+  if (!video.paused) return "playing";
+  try {
+    await video.play();
+    return "resumed";
+  } catch (e) {
+    diag("play() rejected: " + (e && e.name) + " " + (e && e.message));
+    return "rejected:" + (e && e.name);
+  }
+};
+
+// Set by Swift (via callAsyncJavaScript) immediately before it calls
+// window.closeSession(), so the video-element "pause" listener below can
+// tell a teardown-triggered pause (expected, must NOT retry play()) apart
+// from an unexpected mid-session pause (must retry). closeSession() itself
+// stays byte-identical to its pre-gateopener-672.30 form -- this flag is
+// set from a SEPARATE function Swift calls first, rather than added inside
+// closeSession, specifically so closeSession's body never changes.
+window.markClosing = function () {
+  window.__state.closing = true;
+};
+
+// Video-element playback event listeners (bead gateopener-672.30): every
+// event just diag()s its name plus paused/readyState for visibility into
+// why iOS may have paused playback. On "pause", if the peer connection is
+// still "connected" and the session is not closing (see markClosing above),
+// this is an UNEXPECTED pause (not the deliberate teardown blanking in
+// closeSession), so play() is retried once after 250ms and the outcome is
+// diag()'d. Guarded on the #v element existing so this whole block is a
+// no-op on any page variant without one.
+(function () {
+  const video = document.getElementById("v");
+  if (!video) return;
+  const events = ["play", "playing", "pause", "stalled", "suspend", "waiting", "ended"];
+  events.forEach((name) => {
+    video.addEventListener(name, () => {
+      diag("video event: " + name + " paused=" + video.paused + " readyState=" + video.readyState);
+      if (name === "pause") {
+        const pc = window.__state.pc;
+        if (pc && pc.connectionState === "connected" && !window.__state.closing) {
+          setTimeout(() => {
+            video.play().then(
+              () => diag("retry play() after unexpected pause: resumed"),
+              (e) => diag("retry play() after unexpected pause: rejected " + (e && e.name) + " " + (e && e.message))
+            );
+          }, 250);
+        }
+      }
+    });
+  });
+})();
 
 // Tears down the RTCPeerConnection. Idempotent: safe to call even if no
 // session was ever started, or if called more than once.
