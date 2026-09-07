@@ -20,7 +20,16 @@ import os
 struct GateOpenerIOSApp: App {
     @State private var environment: AppEnvironment
     @State private var observable: GateControllerObservable
+    @State private var doorVideoCoordinator: DoorVideoCoordinator
     private let backgroundOpenRunner: BackgroundOpenRunner
+
+    #if DEBUG
+    /// `--video-harness` (bead gateopener-672.11 verification): held
+    /// strongly here (rather than a local inside a `.task`) so the session
+    /// survives the closure that starts it. `nil` unless `--video-harness`
+    /// was passed. See `DebugLaunchOptions.videoHarnessOnLaunch`.
+    @State private var videoHarnessSession: DoorVideoSession?
+    #endif
 
     @Environment(\.scenePhase) private var scenePhase
 
@@ -65,8 +74,36 @@ struct GateOpenerIOSApp: App {
         }
         let observable = GateControllerObservable(environment: environment, backgroundOpenRunner: runner)
 
+        // `DoorVideoCoordinator`'s factory closure captures `environment`
+        // (constructed above), so its `tokenManager`/`gateClient`/
+        // `appSettings` always match what `GateController`/`observable`
+        // themselves use — including a `--mock-gate`-injected fake
+        // `GateOpening`/`TokenResolving`, where relevant.
+        //
+        // `--mock-video` (bead gateopener-672.12 verification) substitutes
+        // `DoorVideoSession.debugStub()` for a real session: `--mock-gate
+        // ok`'s seeded `cachedGates` has no camera endpoint, so a real
+        // session would fail immediately with "No camera" and the video
+        // panel could never be screenshotted from the simulator.
+        let doorVideoCoordinator = DoorVideoCoordinator(
+            makeSession: {
+                #if DEBUG
+                if DebugLaunchOptions.mockVideoOnLaunch {
+                    return DoorVideoSession.debugStub()
+                }
+                #endif
+                return DoorVideoSession(
+                    tokenManager: environment.tokenManager,
+                    gateClient: environment.gateClient,
+                    appSettings: environment.appSettings
+                )
+            },
+            isEnabled: { environment.appSettings.autoShowDoorVideoOnOpen }
+        )
+
         _environment = State(initialValue: environment)
         _observable = State(initialValue: observable)
+        _doorVideoCoordinator = State(initialValue: doorVideoCoordinator)
         self.backgroundOpenRunner = runner
     }
 
@@ -89,7 +126,23 @@ struct GateOpenerIOSApp: App {
             #endif
         }
         .onChange(of: scenePhase) { _, newPhase in
-            guard newPhase == .active else { return }
+            guard newPhase == .active else {
+                // Backgrounding always dismisses any live door-video panel
+                // (WebRTC would be suspended by the system anyway, and
+                // `DoorVideoCoordinator.dismiss()` -> `DoorVideoSession
+                // .stop()` is idempotent, so this is always safe to call
+                // even if nothing is running) — bead gateopener-672.12 step
+                // "Wire scenePhase".
+                doorVideoCoordinator.dismiss()
+                #if DEBUG
+                // Backgrounding also stops an in-flight `--video-harness`
+                // session, independent of `doorVideoCoordinator` (the
+                // harness is not wired into it — see that property's doc
+                // comment).
+                videoHarnessSession?.stop()
+                #endif
+                return
+            }
             Task { await environment.tokenManager.prewarm() }
             environment.publishSnapshot()
         }
@@ -97,7 +150,12 @@ struct GateOpenerIOSApp: App {
 
     @ViewBuilder
     private var mainContent: some View {
-        RootView(environment: environment, observable: observable, appSettings: environment.appSettings)
+        RootView(
+            environment: environment,
+            observable: observable,
+            appSettings: environment.appSettings,
+            doorVideoCoordinator: doorVideoCoordinator
+        )
             #if DEBUG
             // `--run-intent` (bead gateopener-672.13 verification):
             // drives `OpenGateIntent` directly, without any
@@ -137,5 +195,28 @@ struct GateOpenerIOSApp: App {
                 // Intentionally empty otherwise: opening the URL itself
                 // already brought the app to the foreground/MainView.
             }
+            #if DEBUG
+            // `--video-harness` (bead gateopener-672.11 verification):
+            // creates a `DoorVideoSession` and logs every state
+            // transition via os.Logger. Not wired into any visible UI —
+            // bead gateopener-672.12 does that; this exists purely so a
+            // verification script can grep the log for the session's
+            // state machine running end to end.
+            .task {
+                guard DebugLaunchOptions.videoHarnessOnLaunch, videoHarnessSession == nil else { return }
+                let logger = Logger(subsystem: "ie.boboco.GateOpener", category: "video")
+                let session = DoorVideoSession(
+                    tokenManager: environment.tokenManager,
+                    gateClient: environment.gateClient,
+                    appSettings: environment.appSettings
+                )
+                session.onStateChange = { newState in
+                    logger.notice("--video-harness state: \(String(describing: newState), privacy: .public)")
+                }
+                videoHarnessSession = session
+                logger.notice("--video-harness: starting session")
+                await session.start()
+            }
+            #endif
     }
 }

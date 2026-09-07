@@ -24,6 +24,13 @@ struct MainView: View {
     /// reads from, so it always reflects the actually-selected gate.
     let appSettings: AppSettings
 
+    /// Owns the live door-camera video panel (bead gateopener-672.12).
+    /// Constructed once by `GateOpenerIOSApp` (not by this view) so its
+    /// session survives `MainView` being recreated by SwiftUI, and so
+    /// `GateOpenerIOSApp`'s `scenePhase == .background` handler can call
+    /// `dismiss()` on the SAME instance this view observes.
+    var doorVideoCoordinator: DoorVideoCoordinator
+
     @State private var settingsPresented = false
 
     /// Prepared on appear (`prepare()` primes the Taptic Engine so the
@@ -103,17 +110,21 @@ struct MainView: View {
                 .foregroundStyle(.secondary)
                 .padding(.top, 12)
 
-            // MARK: - Video panel slot (bead gateopener-672.12)
+            // MARK: - Video panel (bead gateopener-672.12)
             //
-            // Reserved, clearly-marked empty region for the live
-            // door-camera view. Deliberately empty in this bead — do not
-            // implement video here. `.12` replaces this `Spacer()` (or
-            // the whole VStack region) with the actual video panel.
-            VStack {
-                Spacer()
+            // Shown only while `doorVideoCoordinator.isPanelVisible` (a
+            // session is connecting or streaming); animates in/out so the
+            // panel never just pops in/out of the layout. When hidden this
+            // renders as a zero-height `EmptyView`, so the button/status
+            // line below simply occupy the space instead of leaving a gap
+            // — there is no separate "reserved slot" once real video
+            // exists.
+            if doorVideoCoordinator.isPanelVisible, let session = doorVideoCoordinator.session {
+                videoPanel(session: session)
+                    .padding(.horizontal, 20)
+                    .padding(.top, 12)
+                    .transition(.opacity.combined(with: .scale(scale: 0.95)))
             }
-            .frame(maxWidth: .infinity)
-            .frame(minHeight: 80)
 
             Spacer(minLength: 24)
 
@@ -124,9 +135,13 @@ struct MainView: View {
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
                 .padding(.top, 12)
-                .padding(.bottom, 24)
                 .accessibilityHidden(true) // surfaced via the button's accessibilityValue instead
+
+            viewDoorButton
+                .padding(.top, 4)
+                .padding(.bottom, 24)
         }
+        .animation(.easeInOut(duration: 0.25), value: doorVideoCoordinator.isPanelVisible)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color(uiColor: .systemBackground))
         .toolbar {
@@ -201,6 +216,43 @@ struct MainView: View {
         return false
     }
 
+    /// The live door-camera panel: `DoorVideoView` plus a small circular X
+    /// (dismiss) button overlaid in the top-trailing corner, so the
+    /// operator can close it early without waiting for the door's own
+    /// ~28-30s session window to elapse. Calling `dismiss()` stops the
+    /// session (idempotent) and clears it immediately (no animation delay
+    /// — the button itself IS the explicit dismiss action).
+    private func videoPanel(session: DoorVideoSession) -> some View {
+        DoorVideoView(session: session, state: doorVideoCoordinator.sessionState)
+            .overlay(alignment: .topTrailing) {
+                Button {
+                    doorVideoCoordinator.dismiss()
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.title2)
+                        .foregroundStyle(.white, .black.opacity(0.4))
+                }
+                .padding(8)
+                .accessibilityLabel("Close door camera")
+            }
+    }
+
+    /// Secondary, plain "View door" affordance below the status line: starts
+    /// a video session WITHOUT opening the gate. Per this bead's STEPS,
+    /// pressing it while a session is already live (connecting/streaming)
+    /// is a no-op — `DoorVideoCoordinator.viewDoor()` itself enforces the
+    /// retain-vs-replace policy, so this button never needs to check
+    /// `isPanelVisible` itself before calling it.
+    private var viewDoorButton: some View {
+        Button("View door") {
+            lightImpactGenerator.impactOccurred()
+            doorVideoCoordinator.viewDoor()
+        }
+        .buttonStyle(.plain)
+        .font(.subheadline)
+        .foregroundStyle(Color.accentColor)
+    }
+
     /// The tap handler: fires a heavy haptic, keeps the screen awake, and
     /// forwards to `observable.requestOpen()`. `requestOpen()` itself is
     /// non-blocking and returns immediately (see
@@ -211,6 +263,19 @@ struct MainView: View {
     /// this method. A repeat tap while `.queued`/`.opening` is a no-op
     /// beyond a light haptic acknowledgment, since `GateController
     /// .requestOpen()` already coalesces repeat calls in those states.
+    ///
+    /// `doorVideoCoordinator.startForOpen()` is called on this SAME
+    /// synchronous path, immediately after `observable.requestOpen()` —
+    /// bead gateopener-672.12's STEPS require video to start CONCURRENTLY
+    /// with the open (same instant, separate `Task`), never awaited before
+    /// or after it. Both calls are already non-blocking themselves
+    /// (`requestOpen()` per the doc comment above; `startForOpen()` per
+    /// `DoorVideoCoordinator.startForOpen()`'s doc comment, which only
+    /// kicks off a detached `Task` for the actual `DoorVideoSession.start()`
+    /// call), so this ordering is purely textual — neither call can delay
+    /// the other. An open failing later does not touch
+    /// `doorVideoCoordinator` at all (see the `onChange` handler below),
+    /// so a streaming video is never torn down by a failed open.
     private func handleTap() {
         switch observable.state {
         case .queued, .opening:
@@ -223,6 +288,7 @@ struct MainView: View {
         impactGenerator.impactOccurred()
         UIApplication.shared.isIdleTimerDisabled = true
         observable.requestOpen()
+        doorVideoCoordinator.startForOpen()
     }
 
     /// Drives haptics and the idle-timer reset from `state` transitions,

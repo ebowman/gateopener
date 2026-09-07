@@ -102,7 +102,7 @@ struct SignInView: View {
                 // nothing further to do here.
                 username = ""
             } catch {
-                errorMessage = shortErrorMessage(for: error)
+                errorMessage = GateErrorMessage.signIn(for: error)
             }
         }
     }
@@ -128,46 +128,4 @@ struct SignInView: View {
         signIn()
     }
     #endif
-}
-
-// MARK: - Short, human-readable error mapping (view-layer copy)
-//
-// `GateController.shortMessage(for:)` (`Sources/GateOpenerCore/
-// GateController.swift`) implements the canonical short-message mapping
-// but is `internal` to `GateOpenerCore`, not `public`, so it is not
-// visible from this target — and that file is off-limits to this bead.
-// This is a deliberate, sign-in-specific variant of the same idea already
-// established in `Sources/GateOpener/SettingsView.swift` for the macOS
-// app: the wording here is tailored to the sign-in context (nothing is
-// being "opened" yet on this screen), so it intentionally does NOT match
-// `shortMessage(for:)`/`shortErrorMessage(for:)` verbatim. It still never
-// surfaces a raw `Error` description (which could contain a URL, status
-// body fragment, or other implementation detail unsuitable for end-user
-// display).
-private func shortErrorMessage(for error: Error) -> String {
-    if let comelitError = error as? ComelitError {
-        switch comelitError {
-        case .invalidCredentials:
-            return "Wrong username or password"
-        case .network:
-            return "Can't reach Comelit. Check your connection and try again."
-        case .server, .missingRefreshToken, .decoding:
-            return "Sign-in failed. Please try again."
-        }
-    }
-    if let gateClientError = error as? GateClientError {
-        switch gateClientError {
-        case .noEndpointsFound, .noGateFound:
-            return "No gate found on this account"
-        }
-    }
-    // `URLError` (offline, timeout, host not found, etc.) surfaces
-    // directly from `URLSession` rather than being wrapped in
-    // `ComelitError.network` in every code path, so it needs its own
-    // check here to land on the network message rather than the generic
-    // sign-in fallback below.
-    if error is URLError {
-        return "Can't reach Comelit. Check your connection and try again."
-    }
-    return "Sign-in failed. Please try again."
 }

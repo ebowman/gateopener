@@ -181,6 +181,68 @@ struct AppSettingsTests {
         #expect(settingsB.autoShowDoorVideoOnOpen)
     }
 
+    @Test func allowOpenWhileLockedDefaultsToTrueWhenUnset() {
+        let (defaults, cleanup) = makeSuite()
+        defer { cleanup() }
+
+        let settings = AppSettings(defaults: defaults)
+
+        #expect(settings.allowOpenWhileLocked)
+    }
+
+    @Test func allowOpenWhileLockedSetFalseReadsFalseOnSameInstance() {
+        let (defaults, cleanup) = makeSuite()
+        defer { cleanup() }
+
+        let settings = AppSettings(defaults: defaults)
+        settings.allowOpenWhileLocked = false
+
+        #expect(!settings.allowOpenWhileLocked)
+    }
+
+    @Test func allowOpenWhileLockedSetFalsePersistsAcrossNewInstance() {
+        let (defaults, cleanup) = makeSuite()
+        defer { cleanup() }
+
+        let settingsA = AppSettings(defaults: defaults)
+        settingsA.allowOpenWhileLocked = false
+
+        let settingsB = AppSettings(defaults: defaults)
+        #expect(!settingsB.allowOpenWhileLocked)
+    }
+
+    @Test func allowOpenWhileLockedSetTruePersists() {
+        let (defaults, cleanup) = makeSuite()
+        defer { cleanup() }
+
+        let settings = AppSettings(defaults: defaults)
+        settings.allowOpenWhileLocked = false
+        settings.allowOpenWhileLocked = true
+
+        #expect(settings.allowOpenWhileLocked)
+
+        let settingsB = AppSettings(defaults: defaults)
+        #expect(settingsB.allowOpenWhileLocked)
+    }
+
+    @Test func resetRestoresAllowOpenWhileLockedDefault() {
+        let (defaults, cleanup) = makeSuite()
+        defer { cleanup() }
+
+        let settings = AppSettings(defaults: defaults)
+        settings.allowOpenWhileLocked = false
+
+        // Mutation check: confirm the value is actually false BEFORE
+        // reset(), so the post-reset assertion below is proven to
+        // distinguish "reset restored the default" from "it was never
+        // changed".
+        #expect(!settings.allowOpenWhileLocked)
+
+        settings.reset()
+
+        #expect(settings.allowOpenWhileLocked)
+    }
+
     @Test func twoInstancesOverSameSuiteSeeEachOthersWrites() {
         let (defaults, cleanup) = makeSuite()
         defer { cleanup() }

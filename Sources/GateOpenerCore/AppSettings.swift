@@ -27,13 +27,14 @@ public final class AppSettings: @unchecked Sendable {
         static let showOpenConfirmationOverlay = "ie.boboco.GateOpener.showOpenConfirmationOverlay"
         static let autoShowDoorVideoOnOpen = "ie.boboco.GateOpener.autoShowDoorVideoOnOpen"
         static let cachedGates = "ie.boboco.GateOpener.cachedGates"
+        static let allowOpenWhileLocked = "ie.boboco.GateOpener.allowOpenWhileLocked"
 
         /// All keys owned by `AppSettings`. Used by `reset()` so unrelated
         /// UserDefaults keys (e.g. from other parts of the app, or the test
         /// suite) are never touched.
         static let all = [
             aptId, selectedEndpointId, selectedEndpointName, lastDiscoveryDate, shortcutPreference,
-            showOpenConfirmationOverlay, autoShowDoorVideoOnOpen, cachedGates,
+            showOpenConfirmationOverlay, autoShowDoorVideoOnOpen, cachedGates, allowOpenWhileLocked,
         ]
     }
 
@@ -180,6 +181,38 @@ public final class AppSettings: @unchecked Sendable {
             guard let data = try? JSONEncoder().encode(newValue) else { return }
             defaults.set(data, forKey: Keys.cachedGates)
         }
+    }
+
+    /// Whether the Control Center / Lock Screen / Home Screen widget "Open
+    /// Gate" button (bead gateopener-672.16) is allowed to work while the
+    /// device is locked. Defaults to `true` — the operator prioritises
+    /// zero-friction one-tap opening, so out of the box the button works
+    /// immediately after install with no configuration.
+    ///
+    /// This setting is the UI-facing half of a keychain accessibility
+    /// choice: `AppEnvironment.make()` maps `true` to
+    /// `KeychainAccessibility.afterFirstUnlockThisDeviceOnly` (readable
+    /// while locked, as long as the device has been unlocked at least once
+    /// since boot) and `false` to `.whenUnlockedThisDeviceOnly` (readable
+    /// only while actively unlocked) when constructing the
+    /// `KeychainCredentialStore`. See `CredentialStore.swift`'s
+    /// `KeychainAccessibility` doc comment for what each class means in
+    /// practice.
+    public var allowOpenWhileLocked: Bool {
+        get {
+            // Same absent-key-means-true handling as
+            // `showOpenConfirmationOverlay`/`autoShowDoorVideoOnOpen` above,
+            // and for the same reason: `UserDefaults.bool(forKey:)`'s
+            // `false`-for-absent-key default would silently ship this
+            // feature OFF (requiring the device to be unlocked) for every
+            // user who has never touched the toggle, which is the opposite
+            // of the required default. Do not "simplify" this back to
+            // `defaults.bool(forKey:)`.
+            defaults.object(forKey: Keys.allowOpenWhileLocked) == nil
+                ? true
+                : defaults.bool(forKey: Keys.allowOpenWhileLocked)
+        }
+        set { defaults.set(newValue, forKey: Keys.allowOpenWhileLocked) }
     }
 
     /// True if and only if a non-empty `selectedEndpointId` is present.

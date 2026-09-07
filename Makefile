@@ -1,4 +1,4 @@
-.PHONY: build test run clean release xcodeproj ios-build ios-sim-build ios-sim-run testflight-archive
+.PHONY: build test run clean release xcodeproj ios-build ios-sim-build ios-sim-run ios-test testflight-archive
 
 build:
 	swift build
@@ -79,6 +79,15 @@ ios-sim-run: ios-sim-build
 	xcrun simctl uninstall booted $(IOS_APP_BUNDLE_ID) 2>/dev/null || true
 	xcrun simctl install booted $(IOS_APP_PATH)
 	xcrun simctl launch booted $(IOS_APP_BUNDLE_ID) $(SIM_ARGS)
+
+# Runs the GateOpener-iOSTests unit-test bundle (bead gateopener-672.18),
+# hosted by the GateOpener-iOS app target, on the Simulator. Reuses
+# SIM_DEVICE (default "iPhone 17 Pro", see above) so this targets the same
+# device family as ios-sim-build/ios-sim-run.
+ios-test: xcodeproj
+	xcodebuild test -project GateOpener.xcodeproj -scheme GateOpener-iOS \
+		-destination 'platform=iOS Simulator,name=$(SIM_DEVICE)' \
+		-derivedDataPath .build/xcode
 
 # Publishes a GitHub release: generates the update manifest (appcast.json)
 # describing the just-built, notarized DMG, then uploads both as release

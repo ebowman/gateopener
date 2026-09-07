@@ -1,5 +1,7 @@
 import SwiftUI
 import GateOpenerCore
+import Security
+import UIKit
 
 /// The Settings screen presented from `MainView`'s gear button (bead
 /// gateopener-672.10).
@@ -35,6 +37,17 @@ struct SettingsView: View {
     @State private var isRefreshing = false
     @State private var refreshErrorMessage: String?
     @State private var isConfirmingSignOut = false
+    @State private var lockScreenErrorMessage: String?
+
+    /// The full text of the last persisted `VideoDiagnostics` log (bead
+    /// gateopener-672.27), or `nil` if none has ever been persisted. Loaded
+    /// via `reloadVideoDiagnostics()` on appear and whenever `refreshToken`
+    /// changes, since a video session run from elsewhere in the app (the
+    /// door-video overlay) persists to the shared app-group defaults
+    /// out-of-process from this view's perspective within the same process
+    /// but not observed by any `@State`/`@Observable` wiring this view
+    /// already has.
+    @State private var videoDiagnosticsText: String?
 
     private var username: String? {
         (try? environment.credentialStore.loadCredentials())?.username
@@ -74,6 +87,7 @@ struct SettingsView: View {
                 quickAccessSection
                 lockScreenSection
                 accountSection
+                videoDiagnosticsSection
                 aboutSection
             }
             // Reading `refreshToken` here (even though its value is never
@@ -90,6 +104,8 @@ struct SettingsView: View {
                     Button("Done") { dismiss() }
                 }
             }
+            .onAppear { reloadVideoDiagnostics() }
+            .onChange(of: refreshToken) { _, _ in reloadVideoDiagnostics() }
         }
     }
 
@@ -214,20 +230,51 @@ struct SettingsView: View {
         .foregroundStyle(.secondary)
     }
 
-    // MARK: - Lock Screen (reserved for bead gateopener-672.16)
+    // MARK: - Lock Screen
 
     private var lockScreenSection: some View {
-        // Reserved for bead gateopener-672.16: "Allow opening while
-        // locked" toggle, wiring `KeychainAccessibility` between
-        // `.afterFirstUnlockThisDeviceOnly` (default) and
-        // `.whenUnlockedThisDeviceOnly`. Deliberately no UI yet — this
-        // section exists only so the Lock Screen section's position in
-        // the form is stable once .16 adds its content.
         Section {
-            EmptyView()
+            Toggle("Allow opening while locked", isOn: allowOpenWhileLockedBinding)
+
+            if let lockScreenErrorMessage {
+                Text(lockScreenErrorMessage)
+                    .font(.footnote)
+                    .foregroundStyle(.red)
+            }
         } header: {
             Text("Lock Screen")
+        } footer: {
+            Text("When off, the Control Center and Lock Screen buttons only work after you unlock your iPhone.")
         }
+    }
+
+    /// A `Binding` over `appSettings.allowOpenWhileLocked` that, on change,
+    /// persists the new value and immediately applies it to the Keychain
+    /// via `environment.updateKeychainAccessibility(allowWhileLocked:)`
+    /// (which rewrites any already-stored credentials/tokens in place and
+    /// swaps in a freshly-accessibility-configured `credentialStore` for
+    /// future saves — see that method's doc comment for exactly what it
+    /// does and does not rebuild). On failure, the setting AND the
+    /// displayed toggle are both reverted to the previous value, and the
+    /// short failure message is shown inline via `lockScreenErrorMessage`.
+    private var allowOpenWhileLockedBinding: Binding<Bool> {
+        Binding(
+            get: { appSettings.allowOpenWhileLocked },
+            set: { newValue in
+                let previousValue = appSettings.allowOpenWhileLocked
+                lockScreenErrorMessage = nil
+                appSettings.allowOpenWhileLocked = newValue
+                Task {
+                    do {
+                        try await environment.updateKeychainAccessibility(allowWhileLocked: newValue)
+                    } catch {
+                        appSettings.allowOpenWhileLocked = previousValue
+                        lockScreenErrorMessage = shortErrorMessage(for: error)
+                    }
+                    refreshToken += 1
+                }
+            }
+        )
     }
 
     // MARK: - Account
@@ -260,6 +307,54 @@ struct SettingsView: View {
         }
     }
 
+    // MARK: - Video diagnostics
+
+    /// Bead gateopener-672.27: the operator-facing surface for the release-
+    /// build diagnostics `DoorVideoSession`/`VideoDiagnostics` collect on
+    /// every session attempt, so an off-LAN failure that only reproduces on
+    /// a TestFlight build can still be captured and sent back. Shows the
+    /// last session's TERMINAL line only (never the full text inline —
+    /// that would make this row an unbounded-height wall of text); the full
+    /// text is only surfaced via Share/Copy.
+    private var videoDiagnosticsSection: some View {
+        Section {
+            Text(videoDiagnosticsSummary)
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+
+            if let videoDiagnosticsText {
+                ShareLink("Share log", item: videoDiagnosticsText)
+                Button("Copy") {
+                    UIPasteboard.general.string = videoDiagnosticsText
+                }
+            }
+        } header: {
+            Text("Video diagnostics")
+        } footer: {
+            Text("Captures ICE candidate types and the failure stage from the last door-camera video attempt, so it can be shared for troubleshooting.")
+        }
+    }
+
+    /// The last line of `videoDiagnosticsText` (the terminal "state:" or
+    /// "terminal reason:" line — every session's log ends with one, per
+    /// `DoorVideoSession`'s `state` `didSet` and `stop()`/
+    /// `endDueToLiveness(reason:)`), or a placeholder if no session has ever
+    /// run.
+    private var videoDiagnosticsSummary: String {
+        guard let videoDiagnosticsText, let lastLine = videoDiagnosticsText.split(separator: "\n").last else {
+            return "No video session yet"
+        }
+        return String(lastLine)
+    }
+
+    /// Reloads `videoDiagnosticsText` from the shared app-group defaults
+    /// (falling back to `.standard`, matching `DoorVideoSession`'s own
+    /// fallback — see `VideoDiagnostics.persist(to:)`'s call site).
+    private func reloadVideoDiagnostics() {
+        let defaults = SharedContainer.sharedDefaults() ?? .standard
+        videoDiagnosticsText = VideoDiagnostics.loadLast(from: defaults)
+    }
+
     // MARK: - About
 
     private var aboutSection: some View {
@@ -273,4 +368,26 @@ struct SettingsView: View {
             Text("About")
         }
     }
+}
+
+// MARK: - Short, human-readable error mapping (view-layer wrapper)
+//
+// `GateErrorMessage.short(for:)` (`Sources/GateOpenerCore/
+// GateErrorMessage.swift`) is the single canonical mapping, including the
+// `errSecInteractionNotAllowed` -> "Unlock iPhone to open the gate" case
+// this Lock Screen toggle can hit (rewriting keychain items while the
+// device is locked). Its generic fallback text ("Could not open the
+// gate") is tailored to the gate-opening context, though, which is wrong
+// here — this toggle updates a setting, not the gate — so this thin
+// wrapper keeps the settings-specific fallback wording
+// ("Could not update this setting") while still deferring to the shared
+// mapping for the unlock-message case. This never surfaces a raw `Error`
+// description (which could contain a status code or other implementation
+// detail unsuitable for end-user display).
+private func shortErrorMessage(for error: Error) -> String {
+    let mapped = GateErrorMessage.short(for: error)
+    guard error is KeychainError else {
+        return "Could not update this setting"
+    }
+    return mapped == "Unlock iPhone to open the gate" ? mapped : "Could not update this setting"
 }

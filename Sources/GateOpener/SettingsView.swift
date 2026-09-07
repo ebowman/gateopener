@@ -361,34 +361,6 @@ private struct GlobalHotkeySectionView: View {
     }
 }
 
-// MARK: - Short, human-readable error mapping (view-layer copy)
-//
-// `GateController.shortMessage(for:)` (`Sources/GateOpenerCore/GateController.swift`)
-// implements the canonical short-message mapping but is `internal` to
-// `GateOpenerCore`, not `public`, so it is not visible from this target —
-// and that file is off-limits to this bead. This is a small, deliberate
-// duplication of the same mapping so this view never surfaces a raw
-// `Error` description (which could contain a URL, status body fragment, or
-// other implementation detail unsuitable for end-user display). Keep in
-// sync with `GateController.shortMessage(for:)` if either changes.
-private func shortErrorMessage(for error: Error) -> String {
-    if let comelitError = error as? ComelitError {
-        switch comelitError {
-        case .invalidCredentials:
-            return "Wrong username or password"
-        case .network, .server, .missingRefreshToken, .decoding:
-            return "Could not reach the gate"
-        }
-    }
-    if let gateClientError = error as? GateClientError {
-        switch gateClientError {
-        case .noEndpointsFound, .noGateFound:
-            return "No gate found"
-        }
-    }
-    return "Could not open the gate"
-}
-
 // MARK: - Sign-in form (not configured / signed out)
 
 private struct SignInFormView: View {
@@ -469,8 +441,8 @@ private struct SignInFormView: View {
             } catch {
                 // `.invalidCredentials` must read EXACTLY "Wrong username
                 // or password" per the bead's done-criteria; that mapping
-                // lives in `shortErrorMessage(for:)` above.
-                errorMessage = shortErrorMessage(for: error)
+                // lives in `GateErrorMessage.short(for:)`.
+                errorMessage = GateErrorMessage.short(for: error)
             }
         }
     }
@@ -665,7 +637,7 @@ private struct ChangePasswordSheet: View {
                 try await observable.controller.performFirstTimeSetup(username: user, password: pass)
                 succeeded = true
             } catch {
-                errorMessage = shortErrorMessage(for: error)
+                errorMessage = GateErrorMessage.short(for: error)
             }
         }
     }
@@ -752,7 +724,7 @@ private struct GatePickerView: View {
                 // Discovery failure: show inline, and — critically — do NOT
                 // clear `candidates` (leaves any already-working selection
                 // visible/usable) or touch AppSettings.
-                refreshError = shortErrorMessage(for: error)
+                refreshError = GateErrorMessage.short(for: error)
             }
         }
     }

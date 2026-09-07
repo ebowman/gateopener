@@ -460,6 +460,58 @@ private func makeTokenSet(
     #expect(persisted?.accessToken == "soon-to-expire")
 }
 
+// MARK: - setCredentialStore() tests
+
+/// Covers bead gateopener-672.25: after `AppEnvironment
+/// .updateKeychainAccessibility(allowWhileLocked:)` swaps in a freshly
+/// -accessibility-configured `KeychainCredentialStore`, an in-session token
+/// refresh must persist via the NEW store, not the one `TokenManager` was
+/// originally constructed with.
+///
+/// Seeds the NEW store (not the old one) with the expired token/credentials
+/// so the refresh path is exercised deterministically via the new store
+/// once `setCredentialStore` has run, isolating the assertion to "saves go
+/// to the new store" rather than also depending on which store credentials/
+/// tokens were loaded from. The old store is left seeded too, so a
+/// mutation that accidentally routes the save back to it is caught by
+/// `oldStore.saveTokensCallCount` staying at its pre-swap value (1, from
+/// this setup's own `saveTokens(expired)` call) rather than incrementing.
+@Test func setCredentialStoreRefreshAfterSwapSavesOnlyToNewStore() async throws {
+    let oldStore = MockCredentialStore()
+    let newStore = MockCredentialStore()
+    let issuing = MockTokenIssuing()
+    let expired = makeTokenSet(accessToken: "old-token", expiresIn: -10)
+    let refreshed = makeTokenSet(accessToken: "refreshed-token", expiresIn: 3600)
+    try oldStore.saveCredentials(username: "alice", password: "s3cret")
+    try oldStore.saveTokens(expired)
+    try newStore.saveCredentials(username: "alice", password: "s3cret")
+    try newStore.saveTokens(expired)
+    issuing.refreshResult = .success(refreshed)
+
+    let manager = TokenManager(api: issuing, credentialStore: oldStore)
+    await manager.setCredentialStore(newStore)
+
+    // Pre-swap save counts, captured AFTER setup's seeding saves and AFTER
+    // the swap, so the assertions below isolate exactly what `accessToken()`
+    // itself does.
+    let oldStoreSaveCountBeforeRefresh = oldStore.saveTokensCallCount
+    let newStoreSaveCountBeforeRefresh = newStore.saveTokensCallCount
+
+    let token = try await manager.accessToken()
+
+    #expect(token == "refreshed-token")
+    #expect(issuing.refreshCallCount == 1)
+    // The refresh triggered by accessToken() must save exactly once, and
+    // only to the NEW store -- the old store's count must not move at all.
+    #expect(newStore.saveTokensCallCount == newStoreSaveCountBeforeRefresh + 1)
+    #expect(oldStore.saveTokensCallCount == oldStoreSaveCountBeforeRefresh)
+
+    let persistedNew = try newStore.loadTokens()
+    #expect(persistedNew?.accessToken == "refreshed-token")
+    let persistedOld = try oldStore.loadTokens()
+    #expect(persistedOld?.accessToken == "old-token")
+}
+
 @Test func concurrentPrewarmAndAccessTokenCoalesceToOneRefresh() async throws {
     let store = MockCredentialStore()
     let issuing = MockTokenIssuing()

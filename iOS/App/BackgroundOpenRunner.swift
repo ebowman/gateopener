@@ -16,7 +16,7 @@ protocol BackgroundTaskHost {
     /// returns an opaque identifier and invokes `expirationHandler` if the
     /// system needs to end the task before `endBackgroundTask(_:)` is
     /// called.
-    func beginBackgroundTask(expirationHandler: @escaping () -> Void) -> UIBackgroundTaskIdentifier
+    func beginBackgroundTask(expirationHandler: @escaping @Sendable () -> Void) -> UIBackgroundTaskIdentifier
     /// Ends a previously-begun background task.
     func endBackgroundTask(_ identifier: UIBackgroundTaskIdentifier)
 }
@@ -24,7 +24,7 @@ protocol BackgroundTaskHost {
 /// Default `BackgroundTaskHost` backed by the real `UIApplication.shared`.
 @MainActor
 struct UIApplicationBackgroundTaskHost: BackgroundTaskHost {
-    func beginBackgroundTask(expirationHandler: @escaping () -> Void) -> UIBackgroundTaskIdentifier {
+    func beginBackgroundTask(expirationHandler: @escaping @Sendable () -> Void) -> UIBackgroundTaskIdentifier {
         UIApplication.shared.beginBackgroundTask(expirationHandler: expirationHandler)
     }
 
@@ -96,8 +96,12 @@ final class BackgroundOpenRunner {
             // app if this background task is not ended now. End it
             // immediately; the open itself may still fail asynchronously,
             // but there is nothing further this runner can do to extend
-            // its lifetime.
-            self?.endCurrentTaskIfNeeded()
+            // its lifetime. The handler itself must be `@Sendable` (it may
+            // be invoked off the main actor), so hop back to the main
+            // actor before touching this main-actor-isolated instance.
+            Task { @MainActor in
+                self?.endCurrentTaskIfNeeded()
+            }
         }
     }
 

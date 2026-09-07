@@ -442,6 +442,32 @@ private func makeController(
     #expect(settings.isConfigured == false)
 }
 
+// MARK: - 5b. setCredentialStore() routes signOut()'s deletes to the new store
+
+/// Covers bead gateopener-672.25: after `AppEnvironment
+/// .updateKeychainAccessibility(allowWhileLocked:)` swaps in a freshly
+/// -accessibility-configured store, `GateController.signOut()` must delete
+/// from the NEW store, not the one the controller was originally
+/// constructed with.
+@Test @MainActor func setCredentialStoreRoutesSignOutDeletesToTheNewStore() async throws {
+    let oldStore = MockCredentialStore()
+    let (controller, _, _, _, settings) = makeController(credentialStore: oldStore)
+    let newStore = MockCredentialStore()
+    try newStore.saveCredentials(username: "alice", password: "s3cret")
+    try newStore.saveTokens(TokenSet(accessToken: "tok", refreshToken: "r", expiresIn: 3600, tokenType: "bearer"))
+
+    controller.setCredentialStore(newStore)
+    controller.signOut()
+
+    #expect(controller.state == .needsSetup)
+    #expect(newStore.deleteCredentialsCallCount == 1)
+    #expect(newStore.deleteTokensCallCount == 1)
+    #expect(newStore.isEmpty)
+    #expect(oldStore.deleteCredentialsCallCount == 0)
+    #expect(oldStore.deleteTokensCallCount == 0)
+    #expect(settings.selectedEndpointId == nil)
+}
+
 // MARK: - 6. Auto-reset to .idle uses the injected delay, not a real sleep
 
 @Test @MainActor func autoResetUsesInjectedDelayNotRealSleep() async throws {
@@ -629,47 +655,15 @@ private func makeController(
     #expect(controller.state == .idle)
 }
 
-// MARK: - Additional: unknown error type never surfaces a raw description
+// MARK: - Additional: shortMessage(for:) forwards to GateErrorMessage.short(for:)
+//
+// The full branch-by-branch coverage of the mapping itself now lives in
+// `GateErrorMessageTests.swift` (`GateErrorMessage.short`/`.signIn`); this
+// single smoke test just proves `GateController.shortMessage(for:)` still
+// forwards correctly now that it is a one-line wrapper.
 
-private struct WeirdError: Error {}
-
-@Test @MainActor func unknownErrorTypeMapsToGenericShortMessage() throws {
-    let message = GateController.shortMessage(for: WeirdError())
-    #expect(message == "Could not open the gate")
-}
-
-@Test @MainActor func noGateFoundMapsToShortMessage() throws {
-    let message = GateController.shortMessage(for: GateClientError.noGateFound)
-    #expect(message == "No gate found")
-}
-
-@Test @MainActor func invalidCredentialsMapsToShortMessage() throws {
-    let message = GateController.shortMessage(for: ComelitError.invalidCredentials)
-    #expect(message == "Wrong username or password")
-}
-
-/// `errSecInteractionNotAllowed` (-25308) is the status a locked-device
-/// App Intent invocation surfaces when it tries to read a keychain item
-/// before first unlock (bead gateopener-672.13 step 6). This must map to
-/// an explicit, actionable message rather than the generic fallback.
-@Test @MainActor func keychainInteractionNotAllowedMapsToUnlockMessage() throws {
-    let loadMessage = GateController.shortMessage(for: KeychainError.loadFailed(status: errSecInteractionNotAllowed))
-    #expect(loadMessage == "Unlock iPhone to open the gate")
-
-    let saveMessage = GateController.shortMessage(for: KeychainError.saveFailed(status: errSecInteractionNotAllowed))
-    #expect(saveMessage == "Unlock iPhone to open the gate")
-
-    let deleteMessage = GateController.shortMessage(for: KeychainError.deleteFailed(status: errSecInteractionNotAllowed))
-    #expect(deleteMessage == "Unlock iPhone to open the gate")
-}
-
-/// A DIFFERENT `KeychainError` status must NOT be mapped to the unlock
-/// message — distinguishes this from a vacuous "any KeychainError ->
-/// unlock message" mapping.
-@Test @MainActor func keychainOtherStatusDoesNotMapToUnlockMessage() throws {
-    let message = GateController.shortMessage(for: KeychainError.loadFailed(status: errSecItemNotFound))
-    #expect(message != "Unlock iPhone to open the gate")
-    #expect(message == "Could not open the gate")
+@Test @MainActor func shortMessageForwardsToGateErrorMessageShort() throws {
+    #expect(GateController.shortMessage(for: ComelitError.invalidCredentials) == GateErrorMessage.short(for: ComelitError.invalidCredentials))
 }
 
 // MARK: - requestOpen() (bead .4: non-blocking entry point, offline queue, TTL, coalescing)
