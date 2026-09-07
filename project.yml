@@ -148,7 +148,7 @@ targets:
         # for the same reason (see that file's own NSExtension dict). This
         # is the proven-working approach for THIS xcodegen setup.
         INFOPLIST_FILE: iOS/Widget/Info.plist
-        INFOPLIST_KEY_CFBundleDisplayName: GateOpener
+        INFOPLIST_KEY_CFBundleDisplayName: "Flö Gate Opener"
         CODE_SIGN_ENTITLEMENTS: iOS/Widget/GateOpenerWidget.entitlements
         SKIP_INSTALL: YES
       configs:
