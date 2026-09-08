@@ -267,7 +267,10 @@ window.getState = function () {
 
 // Fetches pc.getStats(), summarized to exactly the fields DoorVideoSession
 // needs (packetsReceived/framesDecoded/framesReceived for video,
-// packetsReceived for audio).
+// packetsReceived for audio), plus (bead gateopener-kgx.6)
+// iceConnectionState/connectionState so the stats line alone shows whether
+// ICE connected without a separate window.getState() round trip. Purely
+// additive: every existing key keeps its exact prior meaning and shape.
 window.getVideoStats = async function () {
   const pc = window.__state.pc;
   if (!pc) return JSON.stringify({error: 'no pc'});
@@ -284,7 +287,12 @@ window.getVideoStats = async function () {
       audio.packetsReceived = report.packetsReceived || 0;
     }
   });
-  return JSON.stringify({video, audio});
+  return JSON.stringify({
+    video,
+    audio,
+    iceConnectionState: pc.iceConnectionState,
+    connectionState: pc.connectionState,
+  });
 };
 
 // EXPERIMENT (gateopener-12h.8, option (c)): draws the current video frame

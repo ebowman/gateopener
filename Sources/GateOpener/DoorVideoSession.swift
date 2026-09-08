@@ -170,6 +170,27 @@ public final class DoorVideoSession: NSObject {
     private var hasStarted = false
     private var hasStopped = false
 
+    /// Set the instant `diagnostics` is persisted for the terminal time —
+    /// i.e. on `.ended`/`.failed` or `stop()` (see `finalizeDiagnostics
+    /// (reason:)`). Guards against a double-persist AND against any further
+    /// `diagnostics.append` after that point (e.g. `stop()` called before
+    /// the page finished loading, racing a late `didFail`/`didFinish`
+    /// navigation-delegate callback that would otherwise append after the
+    /// log has already been persisted and handed off).
+    private var finalized = false
+
+    /// Release-build diagnostics for THIS session attempt (bead
+    /// gateopener-kgx.6, mirroring the iOS recorder wired in
+    /// gateopener-672.27): collects every page-side `diag()` line (via the
+    /// "diag" `WKScriptMessageHandler` below) plus every Swift-side stage
+    /// line, so a failed session leaves a complete, shareable, address-free
+    /// record even outside a debugger.
+    private let diagnostics = VideoDiagnostics()
+
+    /// Wall-clock start of `start()`, used only to compute "streaming after
+    /// X.Xs" for the terminal diagnostics line.
+    private var startedAt: Date?
+
     /// Polling task watching for the first decoded frame after the answer
     /// SDP has been applied; cancelled by `stop()`.
     private var streamingPollTask: Task<Void, Never>?
@@ -184,6 +205,9 @@ public final class DoorVideoSession: NSObject {
         self.session = session
 
         let config = WKWebViewConfiguration()
+        let contentController = WKUserContentController()
+        config.userContentController = contentController
+
         // A minimal non-zero frame avoids a degenerate 0x0 layout before the
         // embedder resizes it. This type does NOT manage window placement —
         // whatever embeds `contentView` owns that — but embedding into a
@@ -200,6 +224,19 @@ public final class DoorVideoSession: NSObject {
 
         super.init()
         contentView.navigationDelegate = self
+
+        // Registered via a weak-referencing shim (`DiagScriptMessageForwarder`
+        // below), NOT `self` directly, mirroring the iOS session's init —
+        // `WKUserContentController.add(_:name:)` retains its handler
+        // strongly, and the content controller is itself owned (via
+        // `contentView.configuration`) by `contentView`, which `self` owns —
+        // registering `self` directly would be a permanent retain cycle
+        // (`self` -> `contentView` -> `contentController` -> `self`) that
+        // only `removeScriptMessageHandler` breaks, which nothing before
+        // `stop()` would ever call. Every message body is a page-authored
+        // `door-video.html` `diag()` line (see that file); non-`String`
+        // bodies are ignored by the forwarder.
+        contentController.add(DiagScriptMessageForwarder(target: self), name: "diag")
     }
 
     deinit {
@@ -211,6 +248,38 @@ public final class DoorVideoSession: NSObject {
         // released with this instance). Callers are expected to call
         // `stop()` explicitly before releasing their last reference so
         // teardown is deterministic rather than relying on `deinit` timing.
+        // The "diag" handler is removed in `stop()` (mirroring iOS); by the
+        // time `deinit` runs, either `stop()` already ran and the handler
+        // is gone, or `contentView` itself (and its `WKUserContentController`)
+        // is being released here regardless, so there is nothing further to
+        // tear down.
+    }
+
+    /// Appends `line` to `diagnostics` (unless the session has already been
+    /// finalized — see `finalized`'s doc comment) and mirrors it to the
+    /// unified log, so `log show`/`log stream` alone carries the full
+    /// record without opening the app or reading persisted `UserDefaults`.
+    private func recordDiag(_ line: String) {
+        guard !finalized else { return }
+        diagnostics.append(line)
+        Self.logger.notice("diag: \(line, privacy: .public)")
+    }
+
+    /// Called once, on the FIRST terminal transition this instance ever
+    /// reaches (`.ended`, `.failed`, or `stop()`): appends the terminal
+    /// line, persists `diagnostics` to `defaults`, and sets `finalized` so
+    /// no further `recordDiag` calls can append after the log has been
+    /// handed off. Safe to call more than once — only the first call has
+    /// any effect — since `stop()` after an already-`.failed` state, or a
+    /// late navigation-delegate callback racing `stop()`, would otherwise
+    /// double-persist or append post-persist.
+    private func finalizeDiagnostics(_ reason: VideoDiagnosticsStage.TerminalReason, defaults: UserDefaults = .standard) {
+        guard !finalized else { return }
+        let line = VideoDiagnosticsStage.terminal(reason)
+        diagnostics.append(line)
+        Self.logger.notice("diag: \(line, privacy: .public)")
+        diagnostics.persist(to: defaults)
+        finalized = true
     }
 
     // MARK: - start()
@@ -226,7 +295,13 @@ public final class DoorVideoSession: NSObject {
             return
         }
         hasStarted = true
+        startedAt = Date()
         state = .connecting
+
+        let appVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown"
+        let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "unknown"
+        let osVersion = ProcessInfo.processInfo.operatingSystemVersionString
+        recordDiag(VideoDiagnosticsStage.sessionStart(appVersion: appVersion, build: build, os: osVersion))
 
         guard let pageURL = Bundle.main.url(forResource: "door-video", withExtension: "html") else {
             // Mirrors GateOpenVideoView.makeIfAvailable's degrade path: an
@@ -234,30 +309,43 @@ public final class DoorVideoSession: NSObject {
             // directory to resolve at all. Logged as a notice, not an
             // error — this is expected outside a built .app bundle.
             Self.logger.notice("door-video.html not found in bundle; DoorVideoSession cannot start")
-            state = .failed(message: "Video page unavailable")
+            let message = "Video page unavailable"
+            state = .failed(message: message)
+            finalizeDiagnostics(.failed(message: message))
             return
         }
 
         let token: String
         do {
             token = try await tokenManager.accessToken()
+            recordDiag(VideoDiagnosticsStage.tokenResolved(outcome: .ok))
         } catch TokenManagerError.notConfigured {
-            state = .failed(message: "Sign-in required")
+            recordDiag(VideoDiagnosticsStage.tokenResolved(outcome: .failed("notConfigured")))
+            let message = "Sign-in required"
+            state = .failed(message: message)
+            finalizeDiagnostics(.failed(message: message))
             return
         } catch {
-            state = .failed(message: "Could not get access token")
+            recordDiag(VideoDiagnosticsStage.tokenResolved(outcome: .failed(String(describing: error))))
+            let message = "Could not get access token"
+            state = .failed(message: message)
+            finalizeDiagnostics(.failed(message: message))
             return
         }
 
         let endpointId: String
         do {
             endpointId = try await resolveCameraEndpointId()
+            recordDiag(VideoDiagnosticsStage.endpointResolved(id: endpointId))
         } catch {
-            state = .failed(message: "Door camera not found")
+            let message = "Door camera not found"
+            state = .failed(message: message)
+            finalizeDiagnostics(.failed(message: message))
             return
         }
 
         let stunIPs = Self.resolveStunIPs(host: Self.stunHost)
+        recordDiag(VideoDiagnosticsStage.stunResolved(count: stunIPs.count))
         let iceServerURLs = stunIPs.isEmpty
             ? ["stun:\(Self.stunHost):\(Self.stunPort)"]
             : stunIPs.map { "stun:\($0):\(Self.stunPort)" }
@@ -272,7 +360,9 @@ public final class DoorVideoSession: NSObject {
         do {
             try await injectIceServers(iceServerURLs)
         } catch {
-            state = .failed(message: "Video page failed to load")
+            let message = "Video page failed to load"
+            state = .failed(message: message)
+            finalizeDiagnostics(.failed(message: message))
             return
         }
 
@@ -282,7 +372,9 @@ public final class DoorVideoSession: NSObject {
         do {
             offerSDP = try await startNegotiation()
         } catch {
-            state = .failed(message: "Could not negotiate video session")
+            let message = "Could not negotiate video session"
+            state = .failed(message: message)
+            finalizeDiagnostics(.failed(message: message))
             return
         }
 
@@ -293,7 +385,9 @@ public final class DoorVideoSession: NSObject {
             answerSDP = try await putOfferWithRetry(endpointId: endpointId, token: token, sdp: offerSDP)
         } catch {
             Self.logger.error("rtc/offer failed after retry: \(String(describing: error), privacy: .public)")
-            state = .failed(message: "Could not reach door camera")
+            let message = "Could not reach door camera"
+            state = .failed(message: message)
+            finalizeDiagnostics(.failed(message: message))
             return
         }
 
@@ -301,8 +395,11 @@ public final class DoorVideoSession: NSObject {
 
         do {
             try await applyAnswer(answerSDP)
+            recordDiag(VideoDiagnosticsStage.answerApplied())
         } catch {
-            state = .failed(message: "Could not apply video answer")
+            let message = "Could not apply video answer"
+            state = .failed(message: message)
+            finalizeDiagnostics(.failed(message: message))
             return
         }
 
@@ -340,14 +437,36 @@ public final class DoorVideoSession: NSObject {
         contentView.stopLoading()
         contentView.navigationDelegate = nil
         contentView.loadHTMLString("", baseURL: nil)
+        // Breaks the retain cycle described in `init`'s doc comment; also
+        // ensures no further page-originated "diag" message can reach
+        // `recordDiag` after this point (belt-and-suspenders alongside the
+        // `finalized` guard below, since `finalizeDiagnostics` may not have
+        // run yet the very first time `stop()` reaches this line).
+        contentView.configuration.userContentController.removeScriptMessageHandler(forName: "diag")
 
         if case .failed = state {
             // Preserve a failure reason already reported rather than
             // clobbering it with a generic "ended" — stop() after a failed
-            // start() should not overwrite the more specific message.
+            // start() should not overwrite the more specific message. The
+            // failure path already called `finalizeDiagnostics(.failed(...))`
+            // when `state` was set, so this is a no-op persist (guarded by
+            // `finalized`), matching the edge case that `stop()` after an
+            // already-failed `start()` must not persist twice.
+            finalizeDiagnostics(.failed(message: Self.failureMessage(from: state)))
             return
         }
         state = .ended(reason: "stopped")
+        finalizeDiagnostics(.stopped)
+    }
+
+    /// Extracts `.failed`'s associated message, or a fallback if `state`
+    /// somehow is not `.failed` when this is called (defensive only — every
+    /// call site already checked `case .failed = state` first).
+    private static func failureMessage(from state: DoorVideoSessionState) -> String {
+        if case .failed(let message) = state {
+            return message
+        }
+        return "unknown"
     }
 
     /// Alias for `stop()`, per the bead's naming ("stop()/close()").
@@ -449,6 +568,7 @@ public final class DoorVideoSession: NSObject {
         // finishes, so no separate Swift-side poll is needed here).
         let candidateCount = sdp.components(separatedBy: "a=candidate:").count - 1
         Self.logger.notice("offer SDP ready: \(sdp.count) chars, \(candidateCount, privacy: .public) ICE candidates")
+        recordDiag(VideoDiagnosticsStage.offerReady(candidateCount: candidateCount))
 
         return sdp
     }
@@ -501,12 +621,19 @@ public final class DoorVideoSession: NSObject {
                         if jsonStr != lastLoggedState {
                             lastLoggedState = jsonStr
                             Self.logger.notice("video stats: \(jsonStr, privacy: .public)")
+                            self.recordDiag(VideoDiagnosticsStage.videoStats(json: jsonStr))
                         }
                         if let data = jsonStr.data(using: .utf8),
                            let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                            let video = obj["video"] as? [String: Any],
                            let framesDecoded = video["framesDecoded"] as? Int, framesDecoded > 0 {
                             self.state = .streaming
+                            // .streaming is NOT a terminal state (per this
+                            // bead's requirement) -- no `finalizeDiagnostics`
+                            // call here; the eventual .ended/.failed/stop()
+                            // that follows is what finalizes and persists.
+                            let elapsed = self.startedAt.map { Date().timeIntervalSince($0) } ?? 0
+                            self.recordDiag(VideoDiagnosticsStage.terminal(.streaming(afterSeconds: elapsed)))
                             return
                         }
                     }
@@ -518,6 +645,7 @@ public final class DoorVideoSession: NSObject {
             }
             guard !self.hasStopped else { return }
             self.state = .failed(message: "No video received")
+            self.finalizeDiagnostics(.noVideo)
         }
     }
 
@@ -597,11 +725,15 @@ public final class DoorVideoSession: NSObject {
         var lastError: Error = DoorVideoSessionError.network
         for attempt in 1...policy.maxAttempts {
             let sessionId = UUID().uuidString.lowercased()
+            let attemptStart = Date()
             do {
                 let answer = try await putOffer(endpointId: endpointId, token: token, sdp: sdp, sessionId: sessionId)
+                let latencyMs = Int(Date().timeIntervalSince(attemptStart) * 1000)
                 Self.logger.notice("rtc/offer attempt \(attempt, privacy: .public)/\(policy.maxAttempts, privacy: .public) succeeded")
+                recordDiag(VideoDiagnosticsStage.offerAttempt(n: attempt, of: policy.maxAttempts, outcome: .success, latencyMs: latencyMs))
                 return answer
             } catch {
+                let latencyMs = Int(Date().timeIntervalSince(attemptStart) * 1000)
                 lastError = error
                 let retryable: Bool
                 if case DoorVideoSessionError.server(let status) = error, status == 500 {
@@ -612,6 +744,13 @@ public final class DoorVideoSession: NSObject {
                     retryable = false
                 }
                 Self.logger.notice("rtc/offer attempt \(attempt, privacy: .public)/\(policy.maxAttempts, privacy: .public) failed: \(String(describing: error), privacy: .public), retryable=\(retryable, privacy: .public)")
+                let statusDescription: String
+                if case DoorVideoSessionError.server(let status) = error {
+                    statusDescription = "\(status)"
+                } else {
+                    statusDescription = "network-error"
+                }
+                recordDiag(VideoDiagnosticsStage.offerAttempt(n: attempt, of: policy.maxAttempts, outcome: .failure(statusDescription), latencyMs: latencyMs))
 
                 guard retryable, attempt < policy.maxAttempts else {
                     throw error
@@ -672,4 +811,44 @@ extension DoorVideoSession: WKNavigationDelegate {
 extension DoorVideoSession: OverlayShowHideResponding {
     public func overlayWillShow() {}
     public func overlayDidHide() {}
+}
+
+// MARK: - "diag" diagnostics channel (bead gateopener-kgx.6)
+
+/// Receives "diag" messages on behalf of a `DoorVideoSession` without the
+/// session itself being retained by `WKUserContentController` — mirrors
+/// `iOS/App/Video/DoorVideoSession.swift`'s `DiagScriptMessageForwarder`
+/// exactly, including the weak `target` reference (see `DoorVideoSession.
+/// init`'s doc comment for why `add(_:name:)` is never given `self`
+/// directly).
+private final class DiagScriptMessageForwarder: NSObject, WKScriptMessageHandler {
+    private weak var target: DoorVideoSession?
+
+    init(target: DoorVideoSession) {
+        self.target = target
+    }
+
+    /// Ignores any message whose body is not a `String` (per this bead's
+    /// edge case), and any message once `target` has been deallocated.
+    func userContentController(
+        _ userContentController: WKUserContentController,
+        didReceive message: WKScriptMessage
+    ) {
+        guard message.name == "diag", let line = message.body as? String else { return }
+        Task { @MainActor [weak target] in
+            target?.recordDiagMessage(line)
+        }
+    }
+}
+
+extension DoorVideoSession {
+    /// Called (on the main actor) by `DiagScriptMessageForwarder` on every
+    /// "diag" message from `door-video.html`'s `diag()` helper; see that
+    /// type's doc comment. `fileprivate` (not `private`) so the forwarder,
+    /// a sibling top-level type in this file, can reach it despite
+    /// `recordDiag`/`diagnostics`/`finalized` being otherwise private to
+    /// `DoorVideoSession`.
+    fileprivate func recordDiagMessage(_ line: String) {
+        recordDiag(line)
+    }
 }

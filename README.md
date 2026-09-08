@@ -189,6 +189,27 @@ This requires, on the machine doing the release:
 Contributors without any of the above can still build, run, and test the app
 completely — none of this is required to work on the code.
 
+## Troubleshooting door video
+
+If "View door" gets stuck on "Connecting…" or fails without a clear reason,
+capture a diagnostic report and attach it to the issue:
+
+1. Quit and relaunch GateOpener.
+2. Choose "View door" from the menu bar item and wait until the panel
+   disappears (whether it succeeds or fails).
+3. Within 30 minutes, run the diagnostic script and paste its output:
+
+   ```bash
+   bash scripts/video-diag.sh > ~/Desktop/video-diag.txt
+   ```
+
+The script (also runnable as `make video-diag`) is self-contained and only
+uses tools that ship with macOS, so it works even on a Mac with just the
+installed app and no copy of this repository — copy `scripts/video-diag.sh`
+over by itself if needed. It redacts bearer tokens and JWTs before printing,
+but the report still contains local IP addresses and hostnames, so review it
+before sharing outside the intended recipient.
+
 ## Security
 
 - **Credentials never live in this repository.** Your Comelit username and

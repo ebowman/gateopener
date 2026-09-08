@@ -1,6 +1,6 @@
 import Foundation
 import Testing
-@testable import GateOpener
+@testable import GateOpenerCore
 
 /// Tests for `VideoDiagnostics` (bead gateopener-672.27): the release-build
 /// diagnostics recorder `DoorVideoSession` appends to and persists so a
@@ -8,6 +8,19 @@ import Testing
 /// off-LAN video failure.
 @MainActor
 struct VideoDiagnosticsTests {
+    /// Creates a throwaway UserDefaults suite and returns it along with a
+    /// closure that removes it. Callers should `defer { cleanup() }`.
+    private func makeInMemoryDefaults() -> (defaults: UserDefaults, cleanup: () -> Void) {
+        let suiteName = "ie.boboco.GateOpener.tests.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            fatalError("Failed to create UserDefaults suite for testing")
+        }
+        let cleanup = {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+        return (defaults, cleanup)
+    }
+
     // MARK: - append() caps at 16KB, keeping the most recent lines
 
     /// MUTATION CHECK: removing the `while textByteCount() > Self.maxBytes`
