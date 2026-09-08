@@ -1,4 +1,4 @@
-.PHONY: build test run clean release xcodeproj ios-build ios-sim-build ios-sim-run ios-test testflight-archive
+.PHONY: build test run clean release xcodeproj ios-build ios-sim-build ios-sim-run ios-test testflight-archive video-diag
 
 build:
 	swift build
@@ -111,3 +111,9 @@ release:
 # (TestFlight)" section.
 testflight-archive:
 	./testflight.sh ios --archive-only
+
+# Runs the paste-able door video diagnostic capture (scripts/video-diag.sh).
+# Prints a plain-text report to stdout; see the README's "Troubleshooting
+# door video" section for the operator steps to follow before running this.
+video-diag:
+	bash scripts/video-diag.sh
