@@ -72,8 +72,9 @@ extension DoorVideoSession.State {
 ///    AUDIO ADDED BEFORE VIDEO, plus a `createDataChannel('data')`.
 ///  - Non-trickle ICE: the page waits for `iceGatheringState === 'complete'`
 ///    before returning the offer SDP.
-///  - Comelit's STUN host is pre-resolved to IPs in Swift
-///    (`resolveStunIPs`) and injected as `window.__ICE_SERVERS__` before
+///  - Comelit's STUN host is pre-resolved to IPs via
+///    `GateOpenerCore.IceServerList` (shared with macOS, bead
+///    gateopener-6s8.5) and injected as `window.__ICE_SERVERS__` before
 ///    the page negotiates.
 ///  - The `rtc/offer` PUT is issued from Swift via `URLSession`, using a
 ///    token obtained through `GateOpenerCore`'s `TokenManager`. THE BEARER
@@ -351,8 +352,8 @@ public final class DoorVideoSession: NSObject {
 
         guard !hasStopped else { return }
 
-        let resolvedStunAddresses = Self.resolveStunAddresses(host: Self.stunHost)
-        let iceServerURLs = Self.iceServerURLs(host: Self.stunHost, port: Self.stunPort, resolved: resolvedStunAddresses)
+        let resolvedStunAddresses = IceServerList.resolveStunAddresses(host: Self.stunHost)
+        let iceServerURLs = IceServerList.urls(host: Self.stunHost, port: Self.stunPort, resolved: resolvedStunAddresses)
         let pathSummary = Self.currentPathSummary()
         Self.logger.info("STUN ICE servers: \(iceServerURLs, privacy: .public); path: \(pathSummary, privacy: .public)")
 
@@ -365,9 +366,9 @@ public final class DoorVideoSession: NSObject {
 
         // Diagnostics only (bead gateopener-672.27): log the array exactly
         // as it is about to be injected into the page, whatever upstream
-        // logic (see `resolveStunIPs`/`iceServerURLs` above -- concurrently
-        // evolving under bead gateopener-672.28) produced it. This never
-        // reads or duplicates that logic, only the resulting variable.
+        // logic (`IceServerList.resolveStunAddresses`/`IceServerList.urls`,
+        // moved to Core in gateopener-6s8.5) produced it. This never reads
+        // or duplicates that logic, only the resulting variable.
         diagnostics.append("[\(Self.diagTimestamp())] injecting ICE servers: \(iceServerURLs)")
 
         do {
@@ -526,71 +527,6 @@ public final class DoorVideoSession: NSObject {
         let trimmed = endpointId.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let lastComponent = trimmed.components(separatedBy: "_").last else { return false }
         return lastComponent.caseInsensitiveCompare(cameraEndpointIdSuffix) == .orderedSame
-    }
-
-    // MARK: - STUN pre-resolution
-
-    /// Resolves `host` to its addresses via `getaddrinfo`, so the page can
-    /// be handed real `stun:<ip>:3478`/`stun:[<ip6>]:3478` URLs alongside
-    /// the hostname form. Unlike macOS's IPv4-only
-    /// `DoorVideoSession.resolveStunIPs`, this resolves with
-    /// `ai_family = AF_UNSPEC` and `ai_flags = AI_DEFAULT`
-    /// (`AI_V4MAPPED_CFG | AI_ADDRCONFIG` on iOS): on an IPv6-only/NAT64
-    /// cellular network, this makes the resolver SYNTHESIZE an IPv6 address
-    /// for this IPv4-only host, giving WKWebView's ICE gathering a route to
-    /// an actual STUN response where a bare IPv4 literal would silently
-    /// fail (root cause of bead gateopener-672.28: video works over
-    /// STUN-only on IPv4 Wi-Fi/hotel networks but fails on cellular).
-    /// Returns `[]` (never throws) on any resolution failure — the caller
-    /// still injects the hostname-form entry regardless (see
-    /// `iceServerURLs`).
-    private nonisolated static func resolveStunAddresses(host: String) -> [(family: Int32, address: String)] {
-        var hints = addrinfo(
-            ai_flags: AI_DEFAULT, ai_family: AF_UNSPEC, ai_socktype: SOCK_DGRAM,
-            ai_protocol: 0, ai_addrlen: 0, ai_canonname: nil, ai_addr: nil, ai_next: nil
-        )
-        var result: UnsafeMutablePointer<addrinfo>?
-        var addresses: [(family: Int32, address: String)] = []
-        let status = getaddrinfo(host, nil, &hints, &result)
-        guard status == 0, let first = result else { return addresses }
-        defer { freeaddrinfo(first) }
-        var ptr: UnsafeMutablePointer<addrinfo>? = first
-        while let p = ptr {
-            var buf = [CChar](repeating: 0, count: Int(NI_MAXHOST))
-            if getnameinfo(p.pointee.ai_addr, p.pointee.ai_addrlen, &buf, socklen_t(buf.count), nil, 0, NI_NUMERICHOST) == 0 {
-                let address = String(decoding: buf.prefix(while: { $0 != 0 }).map { UInt8(bitPattern: $0) }, as: UTF8.self)
-                let family = p.pointee.ai_family
-                if !address.isEmpty, !addresses.contains(where: { $0.family == family && $0.address == address }) {
-                    addresses.append((family: family, address: address))
-                }
-            }
-            ptr = p.pointee.ai_next
-        }
-        return addresses
-    }
-
-    /// Pure formatting/ordering helper (unit-tested directly in
-    /// `IceServerURLTests`): builds the final `stun:` URL list injected as
-    /// `window.__ICE_SERVERS__`. Order is significant only insofar as the
-    /// hostname form is tried first (WebKit resolves it itself, including
-    /// NAT64 synthesis — the HTTP-500-on-hostname problem documented in bd
-    /// memory `gateopener-yjn-spike-*` was Chromium-specific and was never
-    /// observed in WKWebView), then IPv6/synthesized literals (bracketed
-    /// per RFC 3986), then IPv4 literals — never empty, since the hostname
-    /// entry is unconditional.
-    nonisolated static func iceServerURLs(host: String, port: Int, resolved: [(family: Int32, address: String)]) -> [String] {
-        var urls: [String] = ["stun:\(host):\(port)"]
-
-        for entry in resolved where entry.family == AF_INET6 {
-            let url = "stun:[\(entry.address)]:\(port)"
-            if !urls.contains(url) { urls.append(url) }
-        }
-        for entry in resolved where entry.family == AF_INET {
-            let url = "stun:\(entry.address):\(port)"
-            if !urls.contains(url) { urls.append(url) }
-        }
-
-        return urls
     }
 
     /// One-shot, cheap `NWPath` snapshot for the ICE-server log line only

@@ -88,8 +88,9 @@ extension DoorVideoSessionState {
 ///    3 BUNDLE m-sections (audio/video/application).
 ///  - Non-trickle ICE: the page waits for `iceGatheringState === 'complete'`
 ///    before returning the offer SDP; the full offer is sent in one shot.
-///  - Comelit's STUN host is pre-resolved to IPs HERE, in Swift
-///    (`resolveStunIPs`), and injected as `window.__ICE_SERVERS__` before
+///  - Comelit's STUN host is pre-resolved to IPs via
+///    `GateOpenerCore.IceServerList` (shared with iOS, bead
+///    gateopener-6s8.5), and injected as `window.__ICE_SERVERS__` before
 ///    the page negotiates — a bare hostname/mDNS-only candidate is
 ///    rejected by the door's signaling backend.
 ///  - The `rtc/offer` PUT is issued from Swift via `URLSession`, using a
@@ -399,11 +400,9 @@ public final class DoorVideoSession: NSObject {
     private func runGatheringBranch(pageURL: URL) async -> BranchBResult {
         let branchStart = Date()
 
-        let stunIPs = Self.resolveStunIPs(host: Self.stunHost)
-        recordDiag(VideoDiagnosticsStage.stunResolved(count: stunIPs.count))
-        let iceServerURLs = stunIPs.isEmpty
-            ? ["stun:\(Self.stunHost):\(Self.stunPort)"]
-            : stunIPs.map { "stun:\($0):\(Self.stunPort)" }
+        let resolvedStunAddresses = IceServerList.resolveStunAddresses(host: Self.stunHost)
+        recordDiag(VideoDiagnosticsStage.stunResolved(count: resolvedStunAddresses.count))
+        let iceServerURLs = IceServerList.urls(host: Self.stunHost, port: Self.stunPort, resolved: resolvedStunAddresses)
 
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             self.pageLoadContinuation = continuation
@@ -686,35 +685,6 @@ public final class DoorVideoSession: NSObject {
         let trimmed = endpointId.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let lastComponent = trimmed.components(separatedBy: "_").last else { return false }
         return lastComponent.caseInsensitiveCompare(cameraEndpointIdSuffix) == .orderedSame
-    }
-
-    // MARK: - STUN pre-resolution
-
-    /// Resolves `host` to its IP addresses via `getaddrinfo`, so the
-    /// page can be handed real `stun:<ip>:3478` URLs instead of a hostname
-    /// the door's signaling backend may reject. Returns `[]` (never
-    /// throws) on any resolution failure — the caller falls back to the
-    /// hostname form.
-    private static func resolveStunIPs(host: String) -> [String] {
-        var hints = addrinfo(
-            ai_flags: 0, ai_family: AF_UNSPEC, ai_socktype: SOCK_DGRAM,
-            ai_protocol: 0, ai_addrlen: 0, ai_canonname: nil, ai_addr: nil, ai_next: nil
-        )
-        var result: UnsafeMutablePointer<addrinfo>?
-        var ips: [String] = []
-        let status = getaddrinfo(host, nil, &hints, &result)
-        guard status == 0, let first = result else { return ips }
-        defer { freeaddrinfo(first) }
-        var ptr: UnsafeMutablePointer<addrinfo>? = first
-        while let p = ptr {
-            var buf = [CChar](repeating: 0, count: Int(NI_MAXHOST))
-            if getnameinfo(p.pointee.ai_addr, p.pointee.ai_addrlen, &buf, socklen_t(buf.count), nil, 0, NI_NUMERICHOST) == 0 {
-                let ip = String(decoding: buf.prefix(while: { $0 != 0 }).map { UInt8(bitPattern: $0) }, as: UTF8.self)
-                if !ip.isEmpty, !ips.contains(ip) { ips.append(ip) }
-            }
-            ptr = p.pointee.ai_next
-        }
-        return ips
     }
 
     // MARK: - Page bridging (all async calls MUST use callAsyncJavaScript,
