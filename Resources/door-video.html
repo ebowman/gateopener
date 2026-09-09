@@ -271,20 +271,64 @@ window.getState = function () {
 // iceConnectionState/connectionState so the stats line alone shows whether
 // ICE connected without a separate window.getState() round trip. Purely
 // additive: every existing key keeps its exact prior meaning and shape.
+//
+// bead gateopener-kgx.11: adds packetsLost/nackCount/pliCount/firCount/
+// keyFramesDecoded/frameWidth/frameHeight to `video` (and packetsLost to
+// `audio`) so a relay-path session with packetsReceived growing but
+// framesDecoded=0 (see memory gateopener-remote-video-relay-path-no-frames)
+// can be split into "keyframe never arrived / door ignores PLI"
+// (packetsLost~0, pliCount growing, keyFramesDecoded=0) vs. "packets
+// dropped on the path" (packetsLost growing). All new fields are numeric,
+// default 0 when the report doesn't carry them yet.
+//
+// `jitter` is deliberately NOT placed inside `video` -- it is exposed as a
+// separate top-level `jitterMs` key instead. jitter fluctuates almost every
+// poll (every ~300ms per watchForFirstFrame's poll interval), and the Swift
+// side's change-detection in DoorVideoSession.watchForFirstFrame compares
+// the ENTIRE raw JSON string against the previous poll's, logging a new
+// "video stats: ..." line only on change. If jitter lived inside `video`,
+// every single poll would count as "changed" and spam one log line per
+// ~300ms for the whole session. Keeping it as a sibling top-level key lets
+// the Swift side strip/ignore just that key when deciding whether the
+// interesting counters (video/audio/ICE/connection state) actually
+// changed, while still surfacing jitter in the JSON for a human reading
+// the raw diag line. Rounded to 3 decimals to keep the value itself
+// readable (RTCStatsReport reports jitter in seconds, e.g. 0.012).
 window.getVideoStats = async function () {
   const pc = window.__state.pc;
   if (!pc) return JSON.stringify({error: 'no pc'});
   const stats = await pc.getStats();
-  let video = {packetsReceived: 0, framesDecoded: 0, framesReceived: 0};
-  let audio = {packetsReceived: 0};
+  let video = {
+    packetsReceived: 0,
+    framesDecoded: 0,
+    framesReceived: 0,
+    packetsLost: 0,
+    nackCount: 0,
+    pliCount: 0,
+    firCount: 0,
+    keyFramesDecoded: 0,
+    frameWidth: 0,
+    frameHeight: 0,
+  };
+  let audio = {packetsReceived: 0, packetsLost: 0};
+  let jitterMs = 0;
   stats.forEach((report) => {
     if (report.type === 'inbound-rtp' && report.kind === 'video') {
       video.packetsReceived = report.packetsReceived || 0;
       video.framesDecoded = report.framesDecoded || 0;
       video.framesReceived = report.framesReceived || 0;
+      video.packetsLost = report.packetsLost || 0;
+      video.nackCount = report.nackCount || 0;
+      video.pliCount = report.pliCount || 0;
+      video.firCount = report.firCount || 0;
+      video.keyFramesDecoded = report.keyFramesDecoded || 0;
+      video.frameWidth = report.frameWidth || 0;
+      video.frameHeight = report.frameHeight || 0;
+      jitterMs = Math.round((report.jitter || 0) * 1000) / 1000;
     }
     if (report.type === 'inbound-rtp' && report.kind === 'audio') {
       audio.packetsReceived = report.packetsReceived || 0;
+      audio.packetsLost = report.packetsLost || 0;
     }
   });
   return JSON.stringify({
@@ -292,6 +336,7 @@ window.getVideoStats = async function () {
     audio,
     iceConnectionState: pc.iceConnectionState,
     connectionState: pc.connectionState,
+    jitterMs,
   });
 };
 

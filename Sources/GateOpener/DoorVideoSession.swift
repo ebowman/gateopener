@@ -823,8 +823,29 @@ public final class DoorVideoSession: NSObject {
                         contentWorld: .page
                     )
                     if let jsonStr = raw as? String {
-                        if jsonStr != lastLoggedState {
-                            lastLoggedState = jsonStr
+                        // Change-detection key (bead gateopener-kgx.11):
+                        // compares only the `video`/`audio`/state fields,
+                        // NOT the full `jsonStr` -- `getVideoStats()` also
+                        // returns a top-level `jitterMs` that fluctuates on
+                        // nearly every ~300ms poll (see the doc comment on
+                        // window.getVideoStats in door-video.html). Comparing
+                        // the raw string directly would log a new "video
+                        // stats: ..." line on almost every poll for the
+                        // whole session; stripping `jitterMs` out of the
+                        // comparison key (while still logging the full
+                        // `jsonStr`, jitterMs included) keeps the log at one
+                        // line per genuine counter/state change.
+                        var changeDetectionKey = jsonStr
+                        if let data = jsonStr.data(using: .utf8),
+                           var obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                            obj.removeValue(forKey: "jitterMs")
+                            if let strippedData = try? JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys]),
+                               let stripped = String(data: strippedData, encoding: .utf8) {
+                                changeDetectionKey = stripped
+                            }
+                        }
+                        if changeDetectionKey != lastLoggedState {
+                            lastLoggedState = changeDetectionKey
                             Self.logger.notice("video stats: \(jsonStr, privacy: .public)")
                             self.recordDiag(VideoDiagnosticsStage.videoStats(json: jsonStr))
                         }
