@@ -81,6 +81,34 @@ public enum VideoDiagnosticsStage {
         "stun resolved \(count) addresses"
     }
 
+    /// "auth+discovery took Xms" — the wall-clock duration of the
+    /// token-refresh + camera-endpoint-discovery branch run concurrently
+    /// with the STUN-resolve/page-load/gathering branch (bead
+    /// gateopener-6s8.4). Recorded once, when that branch completes
+    /// (success or failure), so a cold-token run's actual cost is visible
+    /// alongside the "gathering took Xms" line for the other branch.
+    public static func authDiscoveryDuration(ms: Int) -> String {
+        "auth+discovery took \(ms)ms"
+    }
+
+    /// "gathering took Xms" — the wall-clock duration of the STUN-resolve +
+    /// page-load + ICE-server-injection + `startNegotiation()` branch run
+    /// concurrently with the token+discovery branch (bead gateopener-6s8.4).
+    /// Recorded once, when that branch completes (success or failure).
+    public static func gatheringDuration(ms: Int) -> String {
+        "gathering took \(ms)ms"
+    }
+
+    /// "door cooldown: waiting X.Xs" — recorded once, immediately before
+    /// `DoorVideoSession.start()` sleeps out `DoorVideoSessionRegistry.
+    /// shared.waitBeforeOffer()`'s non-zero remainder of the door's
+    /// post-session busy window (epic gateopener-6s8's design note (a)).
+    /// `seconds` is formatted to one decimal place, matching the existing
+    /// `terminal(.streaming(afterSeconds:))` precision.
+    public static func cooldownWait(seconds: Double) -> String {
+        "door cooldown: waiting \(String(format: "%.1f", seconds))s"
+    }
+
     /// "offer ready: N candidates" — the non-trickle offer SDP's ICE
     /// candidate count, never the SDP or the candidates themselves.
     public static func offerReady(candidateCount: Int) -> String {
@@ -152,5 +180,51 @@ public enum VideoDiagnosticsStage {
         case .stopped:
             return "terminal: stopped by caller"
         }
+    }
+
+    // MARK: - candidate pairs (bead gateopener-6s8.6)
+
+    /// "candidate pair N: state=<state> nominated=<bool> local=<type>/<protocol>/<family>
+    /// remote=<type>/<protocol>/<family> req=<requestsSent> resp=<responsesReceived>"
+    /// — one line per candidate pair reported by `window.getCandidatePairs()`
+    /// (`door-video.html`), recorded by `DoorVideoSession` once per terminal
+    /// event (the 20s no-video deadline, or a post-answer-applied failure).
+    /// `index` is 1-based, matching this bead's example line. Every field
+    /// here is whitelisted — type/protocol/family/state/nominated/counts
+    /// only, NEVER an address or port — so this can never leak network
+    /// details even if a caller's `CandidatePairReport` decode somehow
+    /// carried one.
+    public static func candidatePair(
+        index: Int,
+        state: String,
+        nominated: Bool,
+        localType: String,
+        localProtocol: String,
+        localFamily: String,
+        remoteType: String,
+        remoteProtocol: String,
+        remoteFamily: String,
+        requestsSent: Int,
+        responsesReceived: Int
+    ) -> String {
+        "candidate pair \(index): state=\(state) nominated=\(nominated) " +
+            "local=\(localType)/\(localProtocol)/\(localFamily) " +
+            "remote=\(remoteType)/\(remoteProtocol)/\(remoteFamily) " +
+            "req=\(requestsSent) resp=\(responsesReceived)"
+    }
+
+    /// "candidate pairs: N, remote types: [<type>, <type>, ...], ice=<iceConnectionState>
+    /// conn=<connectionState>" — the summary line recorded immediately
+    /// before the per-pair `candidatePair(...)` lines. `remoteTypes` is
+    /// rendered in whatever order it is passed (callers should pass the
+    /// already-deduplicated set from `CandidatePairReport`).
+    public static func candidatePairSummary(
+        count: Int,
+        remoteTypes: [String],
+        iceConnectionState: String,
+        connectionState: String
+    ) -> String {
+        "candidate pairs: \(count), remote types: [\(remoteTypes.joined(separator: ", "))], " +
+            "ice=\(iceConnectionState) conn=\(connectionState)"
     }
 }

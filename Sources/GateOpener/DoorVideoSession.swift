@@ -88,8 +88,9 @@ extension DoorVideoSessionState {
 ///    3 BUNDLE m-sections (audio/video/application).
 ///  - Non-trickle ICE: the page waits for `iceGatheringState === 'complete'`
 ///    before returning the offer SDP; the full offer is sent in one shot.
-///  - Comelit's STUN host is pre-resolved to IPs HERE, in Swift
-///    (`resolveStunIPs`), and injected as `window.__ICE_SERVERS__` before
+///  - Comelit's STUN host is pre-resolved to IPs via
+///    `GateOpenerCore.IceServerList` (shared with iOS, bead
+///    gateopener-6s8.5), and injected as `window.__ICE_SERVERS__` before
 ///    the page negotiates — a bare hostname/mDNS-only candidate is
 ///    rejected by the door's signaling backend.
 ///  - The `rtc/offer` PUT is issued from Swift via `URLSession`, using a
@@ -195,6 +196,28 @@ public final class DoorVideoSession: NSObject {
     /// SDP has been applied; cancelled by `stop()`.
     private var streamingPollTask: Task<Void, Never>?
 
+    /// Set to `true` the instant an `rtc/offer` PUT is accepted (HTTP 200)
+    /// by the door. Consulted at every terminal transition (`.ended`,
+    /// `.failed`, `stop()`) via `DoorVideoSessionRegistry.
+    /// shouldRecordEnd(offerAccepted:)` to decide whether that transition
+    /// should call `DoorVideoSessionRegistry.shared.recordSessionEnded()` —
+    /// a session that never occupied the door's one session slot (e.g.
+    /// failed on token/discovery/negotiation, or was `.doorBusy`/`.timedOut`
+    /// on the offer itself) must NOT start a busy-cooldown window for the
+    /// NEXT attempt (see that helper's doc comment).
+    private var offerAccepted = false
+
+    /// Set to `true` the instant `applyAnswer(_:)` succeeds (bead
+    /// gateopener-6s8.6). Consulted only by the candidate-pair diagnostics
+    /// dump (`dumpCandidatePairs(reason:)`): a `.failed` transition that
+    /// happens BEFORE the answer was ever applied (page-URL-missing, token/
+    /// discovery failure, offer PUT failure, or `applyAnswer` itself
+    /// throwing) has no meaningful peer-connection state to inspect yet, so
+    /// this flag gates the dump to the two paths that DO have one — the 20s
+    /// no-video deadline in `watchForFirstFrame()`, and any future
+    /// post-answer `.failed` path.
+    private var answerApplied = false
+
     public init(
         tokenManager: TokenManager,
         gateClient: GateClient,
@@ -280,6 +303,156 @@ public final class DoorVideoSession: NSObject {
         Self.logger.notice("diag: \(line, privacy: .public)")
         diagnostics.persist(to: defaults)
         finalized = true
+
+        // Registry bookkeeping lives at this SAME choke point (guarded by
+        // the same `finalized` flag, so it fires exactly once per session,
+        // on whichever of `.ended`/`.failed`/`stop()` reaches here first) —
+        // see `DoorVideoSessionRegistry.shouldRecordEnd(offerAccepted:)`'s
+        // doc comment for why a session that never had its offer accepted
+        // must NOT record an end (it never occupied the door's session
+        // slot, so it must not start a busy-cooldown window for the next
+        // attempt).
+        if DoorVideoSessionRegistry.shouldRecordEnd(offerAccepted: offerAccepted) {
+            DoorVideoSessionRegistry.shared.recordSessionEnded()
+        }
+    }
+
+    // MARK: - start()'s two concurrent branches (bead gateopener-6s8.4)
+
+    /// Outcome of branch A (token refresh -> camera-endpoint discovery).
+    /// Never thrown — every failure this branch can hit is captured here so
+    /// `start()` can decide, AFTER both branches have finished, which
+    /// failure (if any) to report, per this bead's priority rule (branch A
+    /// wins if both failed).
+    private enum BranchAResult {
+        case success(token: String, endpointId: String)
+        case failure(message: String)
+    }
+
+    /// Outcome of branch B (STUN resolve -> page load -> inject ICE servers
+    /// -> `startNegotiation()`). Never thrown, for the same reason as
+    /// `BranchAResult`.
+    private enum BranchBResult {
+        case success(offerSDP: String)
+        case failure(message: String)
+    }
+
+    /// Branch A: resolves an access token, then discovers the camera
+    /// endpoint id. Records every diag line the ORIGINAL sequential
+    /// `start()` recorded for these two steps, in the same order, plus a
+    /// final "auth+discovery took Xms" line on completion (success or
+    /// failure) — see `VideoDiagnosticsStage.authDiscoveryDuration(ms:)`.
+    ///
+    /// Every `await` is followed by a `hasStopped` check before recording
+    /// anything further, matching this type's existing convention
+    /// elsewhere (e.g. `putOfferWithRetry`) so a `stop()` racing this
+    /// branch cannot append a diag line after teardown — `recordDiag`
+    /// itself already no-ops post-`finalized`, but the early return also
+    /// skips the pointless remaining work (endpoint discovery after a
+    /// token that arrived post-stop, etc).
+    private func runAuthDiscoveryBranch() async -> BranchAResult {
+        let branchStart = Date()
+
+        let token: String
+        do {
+            token = try await tokenManager.accessToken()
+            recordDiag(VideoDiagnosticsStage.tokenResolved(outcome: .ok))
+        } catch TokenManagerError.notConfigured {
+            recordDiag(VideoDiagnosticsStage.tokenResolved(outcome: .failed("notConfigured")))
+            recordDiag(VideoDiagnosticsStage.authDiscoveryDuration(ms: Self.elapsedMs(since: branchStart)))
+            return .failure(message: "Sign-in required")
+        } catch {
+            recordDiag(VideoDiagnosticsStage.tokenResolved(outcome: .failed(String(describing: error))))
+            recordDiag(VideoDiagnosticsStage.authDiscoveryDuration(ms: Self.elapsedMs(since: branchStart)))
+            return .failure(message: "Could not get access token")
+        }
+
+        guard !hasStopped else {
+            recordDiag(VideoDiagnosticsStage.authDiscoveryDuration(ms: Self.elapsedMs(since: branchStart)))
+            return .failure(message: "Could not get access token")
+        }
+
+        let endpointId: String
+        do {
+            endpointId = try await resolveCameraEndpointId()
+            recordDiag(VideoDiagnosticsStage.endpointResolved(id: endpointId))
+        } catch {
+            recordDiag(VideoDiagnosticsStage.authDiscoveryDuration(ms: Self.elapsedMs(since: branchStart)))
+            return .failure(message: "Door camera not found")
+        }
+
+        recordDiag(VideoDiagnosticsStage.authDiscoveryDuration(ms: Self.elapsedMs(since: branchStart)))
+        return .success(token: token, endpointId: endpointId)
+    }
+
+    /// Branch B: resolves Comelit's STUN host to IPs, loads
+    /// `door-video.html` into `contentView` (awaiting the SAME
+    /// `pageLoadContinuation` the navigation delegate resumes today),
+    /// injects the resolved ICE server URLs, then negotiates the
+    /// non-trickle offer. Records every diag line the original sequential
+    /// `start()` recorded for these steps, in the same order, plus a final
+    /// "gathering took Xms" line on completion (success or failure) — see
+    /// `VideoDiagnosticsStage.gatheringDuration(ms:)`.
+    ///
+    /// `pageURL` is resolved by the CALLER (`start()`) before either branch
+    /// is launched, since a missing `door-video.html` is reported as a
+    /// dedicated "Video page unavailable" failure that neither branch A nor
+    /// B individually owns (it precedes both in the original sequential
+    /// flow, and both branches would otherwise need to special-case it).
+    ///
+    /// `hasStopped` is checked after every `await` before any further diag
+    /// line, mirroring branch A. If `stop()` resumes `pageLoadContinuation`
+    /// while this branch is awaiting it, this branch's own `guard
+    /// !hasStopped` immediately after that `await` returns `.failure`
+    /// without EVER touching `pageLoadContinuation` again — so the
+    /// continuation this branch owns is resumed exactly once, by whichever
+    /// of {navigation delegate, `stop()`} gets there first, never by this
+    /// branch itself a second time.
+    private func runGatheringBranch(pageURL: URL) async -> BranchBResult {
+        let branchStart = Date()
+
+        let resolvedStunAddresses = IceServerList.resolveStunAddresses(host: Self.stunHost)
+        recordDiag(VideoDiagnosticsStage.stunResolved(count: resolvedStunAddresses.count))
+        let iceServerURLs = IceServerList.urls(host: Self.stunHost, port: Self.stunPort, resolved: resolvedStunAddresses)
+
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            self.pageLoadContinuation = continuation
+            self.contentView.loadFileURL(pageURL, allowingReadAccessTo: pageURL.deletingLastPathComponent())
+        }
+
+        guard !hasStopped else {
+            recordDiag(VideoDiagnosticsStage.gatheringDuration(ms: Self.elapsedMs(since: branchStart)))
+            return .failure(message: "Video page failed to load")
+        }
+
+        do {
+            try await injectIceServers(iceServerURLs)
+        } catch {
+            recordDiag(VideoDiagnosticsStage.gatheringDuration(ms: Self.elapsedMs(since: branchStart)))
+            return .failure(message: "Video page failed to load")
+        }
+
+        guard !hasStopped else {
+            recordDiag(VideoDiagnosticsStage.gatheringDuration(ms: Self.elapsedMs(since: branchStart)))
+            return .failure(message: "Video page failed to load")
+        }
+
+        let offerSDP: String
+        do {
+            offerSDP = try await startNegotiation()
+        } catch {
+            recordDiag(VideoDiagnosticsStage.gatheringDuration(ms: Self.elapsedMs(since: branchStart)))
+            return .failure(message: "Could not negotiate video session")
+        }
+
+        recordDiag(VideoDiagnosticsStage.gatheringDuration(ms: Self.elapsedMs(since: branchStart)))
+        return .success(offerSDP: offerSDP)
+    }
+
+    /// Milliseconds elapsed since `start`, as an `Int` (matching
+    /// `putOfferOnce`'s existing `latencyMs` computation style).
+    private static func elapsedMs(since start: Date) -> Int {
+        Int(Date().timeIntervalSince(start) * 1000)
     }
 
     // MARK: - start()
@@ -289,6 +462,25 @@ public final class DoorVideoSession: NSObject {
     /// since this type does not support restarting.
     ///
     /// Never throws: all failure paths are reported via `state`.
+    ///
+    /// Runs two branches CONCURRENTLY (bead gateopener-6s8.4): branch A
+    /// (`runAuthDiscoveryBranch`, token -> discovery) and branch B
+    /// (`runGatheringBranch`, STUN resolve -> page load -> inject ICE
+    /// servers -> negotiate) — neither needs the other's result, and cold
+    /// token refresh + discovery can cost up to ~8s that used to fully
+    /// precede gathering. Both are joined (both `async let`s are awaited
+    /// to completion — never cancelled early) before the door-busy cooldown
+    /// wait and the `rtc/offer` PUT, which DO need both results (the token
+    /// and endpoint id from A, the offer SDP from B).
+    ///
+    /// Failure priority, per this bead: if BOTH branches failed, branch A's
+    /// failure message is reported (auth/discovery failures are the more
+    /// actionable message for the user). If only one branch failed, that
+    /// branch's message is reported and the OTHER branch's (now-unused)
+    /// successful result is simply discarded — both branches are always
+    /// awaited to completion here (via `async let`), so there is never a
+    /// dangling continuation or an orphaned child task left running past
+    /// this function's return.
     public func start() async {
         guard !hasStarted else {
             Self.logger.notice("DoorVideoSession.start() called more than once; ignoring")
@@ -315,67 +507,57 @@ public final class DoorVideoSession: NSObject {
             return
         }
 
+        async let branchAResult = runAuthDiscoveryBranch()
+        async let branchBResult = runGatheringBranch(pageURL: pageURL)
+
+        // Both branches are ALWAYS awaited fully here — never cancelled
+        // early — so `pageLoadContinuation` (owned by branch B) is never
+        // left dangling and any late navigation-delegate callback or
+        // `stop()` racing either branch always finds a branch that is
+        // either still legitimately running or has already returned.
+        let resolvedA = await branchAResult
+        let resolvedB = await branchBResult
+
+        guard !hasStopped else { return }
+
         let token: String
-        do {
-            token = try await tokenManager.accessToken()
-            recordDiag(VideoDiagnosticsStage.tokenResolved(outcome: .ok))
-        } catch TokenManagerError.notConfigured {
-            recordDiag(VideoDiagnosticsStage.tokenResolved(outcome: .failed("notConfigured")))
-            let message = "Sign-in required"
-            state = .failed(message: message)
-            finalizeDiagnostics(.failed(message: message))
-            return
-        } catch {
-            recordDiag(VideoDiagnosticsStage.tokenResolved(outcome: .failed(String(describing: error))))
-            let message = "Could not get access token"
-            state = .failed(message: message)
-            finalizeDiagnostics(.failed(message: message))
-            return
-        }
-
         let endpointId: String
-        do {
-            endpointId = try await resolveCameraEndpointId()
-            recordDiag(VideoDiagnosticsStage.endpointResolved(id: endpointId))
-        } catch {
-            let message = "Door camera not found"
+        switch resolvedA {
+        case .success(let resolvedToken, let resolvedEndpointId):
+            token = resolvedToken
+            endpointId = resolvedEndpointId
+        case .failure(let message):
+            // Branch A's failure wins regardless of branch B's outcome —
+            // this bead's stated priority. Branch B's result (success or
+            // its own failure) is discarded here without further action.
             state = .failed(message: message)
             finalizeDiagnostics(.failed(message: message))
             return
         }
-
-        let stunIPs = Self.resolveStunIPs(host: Self.stunHost)
-        recordDiag(VideoDiagnosticsStage.stunResolved(count: stunIPs.count))
-        let iceServerURLs = stunIPs.isEmpty
-            ? ["stun:\(Self.stunHost):\(Self.stunPort)"]
-            : stunIPs.map { "stun:\($0):\(Self.stunPort)" }
-
-        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            self.pageLoadContinuation = continuation
-            self.contentView.loadFileURL(pageURL, allowingReadAccessTo: pageURL.deletingLastPathComponent())
-        }
-
-        guard !hasStopped else { return }
-
-        do {
-            try await injectIceServers(iceServerURLs)
-        } catch {
-            let message = "Video page failed to load"
-            state = .failed(message: message)
-            finalizeDiagnostics(.failed(message: message))
-            return
-        }
-
-        guard !hasStopped else { return }
 
         let offerSDP: String
-        do {
-            offerSDP = try await startNegotiation()
-        } catch {
-            let message = "Could not negotiate video session"
+        switch resolvedB {
+        case .success(let resolvedOfferSDP):
+            offerSDP = resolvedOfferSDP
+        case .failure(let message):
             state = .failed(message: message)
             finalizeDiagnostics(.failed(message: message))
             return
+        }
+
+        guard !hasStopped else { return }
+
+        // Wait out any remaining door-busy cooldown from a PRIOR session in
+        // this process (see `DoorVideoBusyPolicy`/`DoorVideoSessionRegistry`)
+        // before issuing the offer PUT at all. `state` stays `.connecting`
+        // throughout — this is not a new user-visible phase, just a delay
+        // before the existing "connecting" phase's offer step.
+        let cooldown = DoorVideoSessionRegistry.shared.waitBeforeOffer()
+        if cooldown > .zero {
+            let cooldownSeconds = Double(cooldown.components.seconds)
+                + Double(cooldown.components.attoseconds) / 1e18
+            recordDiag(VideoDiagnosticsStage.cooldownWait(seconds: cooldownSeconds))
+            try? await Task.sleep(for: cooldown)
         }
 
         guard !hasStopped else { return }
@@ -383,8 +565,14 @@ public final class DoorVideoSession: NSObject {
         let answerSDP: String
         do {
             answerSDP = try await putOfferWithRetry(endpointId: endpointId, token: token, sdp: offerSDP)
+        } catch let DoorVideoSessionError.offer(outcome) {
+            Self.logger.error("rtc/offer failed: \(String(describing: outcome), privacy: .public)")
+            let message = DoorVideoBusyPolicy.failureMessage(for: outcome)
+            state = .failed(message: message)
+            finalizeDiagnostics(.failed(message: message))
+            return
         } catch {
-            Self.logger.error("rtc/offer failed after retry: \(String(describing: error), privacy: .public)")
+            Self.logger.error("rtc/offer failed: \(String(describing: error), privacy: .public)")
             let message = "Could not reach door camera"
             state = .failed(message: message)
             finalizeDiagnostics(.failed(message: message))
@@ -396,6 +584,7 @@ public final class DoorVideoSession: NSObject {
         do {
             try await applyAnswer(answerSDP)
             recordDiag(VideoDiagnosticsStage.answerApplied())
+            answerApplied = true
         } catch {
             let message = "Could not apply video answer"
             state = .failed(message: message)
@@ -510,35 +699,6 @@ public final class DoorVideoSession: NSObject {
         return lastComponent.caseInsensitiveCompare(cameraEndpointIdSuffix) == .orderedSame
     }
 
-    // MARK: - STUN pre-resolution
-
-    /// Resolves `host` to its IP addresses via `getaddrinfo`, so the
-    /// page can be handed real `stun:<ip>:3478` URLs instead of a hostname
-    /// the door's signaling backend may reject. Returns `[]` (never
-    /// throws) on any resolution failure — the caller falls back to the
-    /// hostname form.
-    private static func resolveStunIPs(host: String) -> [String] {
-        var hints = addrinfo(
-            ai_flags: 0, ai_family: AF_UNSPEC, ai_socktype: SOCK_DGRAM,
-            ai_protocol: 0, ai_addrlen: 0, ai_canonname: nil, ai_addr: nil, ai_next: nil
-        )
-        var result: UnsafeMutablePointer<addrinfo>?
-        var ips: [String] = []
-        let status = getaddrinfo(host, nil, &hints, &result)
-        guard status == 0, let first = result else { return ips }
-        defer { freeaddrinfo(first) }
-        var ptr: UnsafeMutablePointer<addrinfo>? = first
-        while let p = ptr {
-            var buf = [CChar](repeating: 0, count: Int(NI_MAXHOST))
-            if getnameinfo(p.pointee.ai_addr, p.pointee.ai_addrlen, &buf, socklen_t(buf.count), nil, 0, NI_NUMERICHOST) == 0 {
-                let ip = String(decoding: buf.prefix(while: { $0 != 0 }).map { UInt8(bitPattern: $0) }, as: UTF8.self)
-                if !ip.isEmpty, !ips.contains(ip) { ips.append(ip) }
-            }
-            ptr = p.pointee.ai_next
-        }
-        return ips
-    }
-
     // MARK: - Page bridging (all async calls MUST use callAsyncJavaScript,
     // never evaluateJavaScript — see the GOTCHA in the type doc comment)
 
@@ -583,6 +743,51 @@ public final class DoorVideoSession: NSObject {
             .replacingOccurrences(of: "$", with: "\\$")
         let js = "return await window.applyAnswer(`\(escaped)`);"
         _ = try await contentView.callAsyncJavaScript(js, contentWorld: .page)
+    }
+
+    /// One-shot candidate-pair diagnostics dump (bead gateopener-6s8.6):
+    /// calls `window.getCandidatePairs()` exactly once, decodes the result
+    /// with `CandidatePairReport`, and records every line from
+    /// `diagLines()` (summary first, then one line per pair) via
+    /// `recordDiag`. MUST be called, and MUST complete, BEFORE the caller
+    /// sets `state = .failed` and calls `finalizeDiagnostics(...)` — once
+    /// `finalizeDiagnostics` runs, `finalized` is set and `recordDiag`
+    /// becomes a no-op (see both doc comments), so calling this any later
+    /// would silently drop every line it records.
+    ///
+    /// Only ever called when `answerApplied` is `true` (checked by every
+    /// call site, not here, so this stays a pure "make the call and record
+    /// the result" helper) — before the answer is applied there is no
+    /// peer-connection state worth inspecting yet (see `answerApplied`'s
+    /// doc comment).
+    ///
+    /// Never throws: `callAsyncJavaScript` errors (including the page-side
+    /// `getCandidatePairs` promise rejecting, which it is designed not to —
+    /// see that function's doc comment in `door-video.html` — but a
+    /// WKWebView-level bridging failure is still possible) are caught and
+    /// recorded as a single "candidate pairs: unavailable (js error)" line,
+    /// mirroring `CandidatePairReport.diagLines()`'s own
+    /// "unavailable (<error>)" shape for a JS-side failure.
+    private func dumpCandidatePairs() async {
+        do {
+            let raw = try await contentView.callAsyncJavaScript(
+                "return await window.getCandidatePairs();",
+                contentWorld: .page
+            )
+            guard let jsonStr = raw as? String else {
+                recordDiag("candidate pairs: unavailable (js error)")
+                return
+            }
+            guard let report = CandidatePairReport.parse(json: jsonStr) else {
+                recordDiag("candidate pairs: unavailable (js error)")
+                return
+            }
+            for line in report.diagLines() {
+                recordDiag(line)
+            }
+        } catch {
+            recordDiag("candidate pairs: unavailable (js error)")
+        }
     }
 
     /// Polls `window.getState()` for `hasVideoFrame` becoming true, then
@@ -644,6 +849,19 @@ public final class DoorVideoSession: NSObject {
                 try? await Task.sleep(nanoseconds: 300_000_000)
             }
             guard !self.hasStopped else { return }
+            // Candidate-pair dump BEFORE the terminal transition (bead
+            // gateopener-6s8.6): `dumpCandidatePairs()` calls `recordDiag`,
+            // which is a no-op once `finalized` is set by
+            // `finalizeDiagnostics` below — so the dump must complete, and
+            // its lines must already be in `diagnostics`, before `state`
+            // flips to `.failed` and `finalizeDiagnostics` persists the
+            // log. `answerApplied` is always `true` here: `watchForFirstFrame()`
+            // is only ever invoked (from `start()`) after `applyAnswer`
+            // already succeeded.
+            if self.answerApplied {
+                await self.dumpCandidatePairs()
+            }
+            guard !self.hasStopped else { return }
             self.state = .failed(message: "No video received")
             self.finalizeDiagnostics(.noVideo)
         }
@@ -653,112 +871,165 @@ public final class DoorVideoSession: NSObject {
 
     private struct OfferResponse: Decodable { let answer: String }
 
-    private func putOffer(endpointId: String, token: String, sdp: String, sessionId: String) async throws -> String {
+    /// A single `rtc/offer` PUT attempt, classified via
+    /// `DoorVideoBusyPolicy.classify(httpStatus:transportError:)` rather
+    /// than thrown as a raw HTTP-status/transport `Error` — see
+    /// `putOfferWithRetry` for how the outcome drives retry and the
+    /// eventual `DoorVideoSessionState.failed(message:)`.
+    ///
+    /// `request.timeoutInterval = 12` is set explicitly on the REQUEST
+    /// (not relying on `session`'s configuration): `URLRequest.
+    /// timeoutInterval` takes precedence over
+    /// `URLSessionConfiguration.timeoutIntervalForRequest` for the request
+    /// it is set on, per Foundation's documented behavior, so this is
+    /// effective regardless of `session`'s configuration UNLESS that
+    /// configuration's `timeoutIntervalForRequest` is somehow shorter than
+    /// 12s and takes priority in some undocumented edge case -- `session`
+    /// is `URLSession.shared` at every real call site (`GateOpenerApp.
+    /// swift`), whose default configuration's `timeoutIntervalForRequest`
+    /// is 60s (longer than 12s), so this 12s request-level timeout is the
+    /// binding one in practice.
+    private func putOfferOnce(
+        endpointId: String,
+        token: String,
+        sdp: String,
+        sessionId: String
+    ) async -> (outcome: DoorVideoBusyPolicy.OfferOutcome, answer: String?) {
         // '#' -> %23 only, matching the proven recipe (NOT full percent
         // encoding, which the door's signaling backend does not expect).
         let encodedEndpoint = endpointId.replacingOccurrences(of: "#", with: "%23")
         guard let url = URL(string: "\(ComelitAPI.baseURL)/servicerest/devicecom/endpoint/\(encodedEndpoint)/rtc/offer") else {
-            throw DoorVideoSessionError.invalidURL
+            // Not a real HTTP/transport outcome (a malformed URL is a
+            // programmer error, not a door-busy/network condition), but
+            // `.network` is the closest existing classification and keeps
+            // this an unreachable-in-practice path rather than a new state
+            // the rest of the pipeline has to special-case.
+            return (.network, nil)
         }
         var request = URLRequest(url: url)
         request.httpMethod = "PUT"
+        request.timeoutInterval = 12
         request.setValue("bearer \(token)", forHTTPHeaderField: "authorization")
         request.setValue("application/json", forHTTPHeaderField: "content-type")
         request.setValue("ktor-client", forHTTPHeaderField: "user-agent")
         let body: [String: String] = ["sessionId": sessionId, "offer": sdp]
-        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        guard let httpBody = try? JSONSerialization.data(withJSONObject: body) else {
+            return (.network, nil)
+        }
+        request.httpBody = httpBody
 
         let (data, response): (Data, URLResponse)
         do {
             (data, response) = try await session.data(for: request)
+        } catch let urlError as URLError {
+            let transportError: DoorVideoBusyPolicy.OfferTransportError = urlError.code == .timedOut ? .timedOut : .other
+            return (DoorVideoBusyPolicy.classify(httpStatus: nil, transportError: transportError), nil)
         } catch {
-            throw DoorVideoSessionError.network
+            return (DoorVideoBusyPolicy.classify(httpStatus: nil, transportError: .other), nil)
         }
         guard let http = response as? HTTPURLResponse else {
-            throw DoorVideoSessionError.network
+            return (DoorVideoBusyPolicy.classify(httpStatus: nil, transportError: .other), nil)
         }
-        guard http.statusCode == 200 else {
-            throw DoorVideoSessionError.server(status: http.statusCode)
+        let outcome = DoorVideoBusyPolicy.classify(httpStatus: http.statusCode, transportError: nil)
+        guard outcome == .accepted else {
+            return (outcome, nil)
         }
-        let decoded = try JSONDecoder().decode(OfferResponse.self, from: data)
-        return decoded.answer
+        guard let decoded = try? JSONDecoder().decode(OfferResponse.self, from: data) else {
+            // The door said 200 but the body did not decode -- treat as a
+            // server-error outcome (distinct from `.doorBusy`/`.accepted`)
+            // rather than accepting a session with no usable answer SDP.
+            return (.serverError(http.statusCode), nil)
+        }
+        return (.accepted, decoded.answer)
     }
 
-    /// Wraps `putOffer` with a bounded retry, matching a real-world
-    /// observation from the reference iOS app: `rtc/offer` sometimes
-    /// returns a TRANSIENT HTTP 500 that a second attempt clears, so a
-    /// single 500 is not necessarily proof of a malformed offer.
+    /// Issues the `rtc/offer` PUT with the epic gateopener-6s8 policy: ONE
+    /// attempt, a 12s per-request timeout (see `putOfferOnce`), classified
+    /// via `DoorVideoBusyPolicy.classify`. Per that policy's `shouldRetry`,
+    /// the ONLY retryable outcome is `.network` (the request never reached
+    /// the door at all) — retried exactly ONCE, after 500ms, with a FRESH
+    /// `sessionId`. Every other outcome (`.doorBusy`, `.unauthorized`,
+    /// `.serverError`, `.timedOut`) is NOT retried and thrown immediately:
+    ///  - `.doorBusy` needs `waitBeforeOffer`'s cooldown before the NEXT
+    ///    session attempt, not a fast retry against a door that has already
+    ///    said no.
+    ///  - `.timedOut` is never retried: the PUT may have succeeded
+    ///    server-side and consumed the door's one session slot even though
+    ///    this process never saw the response — blindly retrying risks
+    ///    racing a second session against one already accepted.
+    ///  - `.unauthorized`/`.serverError` are not transient network
+    ///    failures, so a fast retry is not expected to help.
     ///
-    /// Reuses `GateOpenerCore.RetryPolicy` (the same type `GateClient`
-    /// itself is built on) rather than inventing a second retry mechanism
-    /// — `DoorVideoSession` already imports `GateOpenerCore`, so this is a
-    /// same-module reuse, not a new dependency.
+    /// The SAME offer SDP is reused across the one allowed retry
+    /// (deliberately NOT regenerated): the SDP's ICE ufrag/password and
+    /// DTLS fingerprint are tied to the single `RTCPeerConnection` already
+    /// created and gathered in the page, and Comelit's `sessionId` is the
+    /// field that scopes one negotiation attempt from the next — nothing
+    /// about a `.network` failure implies the offer itself was malformed.
     ///
-    ///  - 2 attempts total (1 retry), matching the reference app's observed
-    ///    behavior — NOT an aggressive/unbounded loop against the door.
-    ///  - Retries ONLY on HTTP 500 and transport/network errors
-    ///    (`DoorVideoSessionError.network`); any other HTTP status (4xx, or
-    ///    a non-500 5xx) is treated as non-retryable and rethrown
-    ///    immediately, since retrying an auth/shape problem will not fix it.
-    ///  - A FRESH `sessionId` (uuid4) is minted for the retry attempt, per
-    ///    the bead's requirement. The SAME offer SDP is reused across
-    ///    attempts (deliberately NOT regenerated): the SDP's ICE
-    ///    ufrag/password and DTLS fingerprint are tied to the single
-    ///    `RTCPeerConnection` already created and gathered in the page, and
-    ///    Comelit's `sessionId` is the field that scopes one negotiation
-    ///    attempt from the next — nothing about a transient 500 implies the
-    ///    offer itself was malformed. Regenerating the offer would require
-    ///    tearing down and rebuilding the whole peer connection (a second
-    ///    ICE-gathering round trip), which is unwarranted extra latency and
-    ///    complexity for what the reference app treats as a quick retry.
-    ///  - Backoff is a few hundred ms (`RetryPolicy.baseDelay`), bounded by
-    ///    `maxTotalDelay`, so the retry cannot meaningfully add to the
-    ///    human-facing wait.
+    /// On `.accepted`, records `DoorVideoSessionRegistry.shared.
+    /// recordSessionAccepted()` and sets `offerAccepted = true` (consulted
+    /// by `finalizeDiagnostics` to decide whether a later terminal
+    /// transition should record a session END — see that property's doc
+    /// comment) before returning the answer SDP.
+    ///
+    /// On failure, throws `DoorVideoSessionError.offer(outcome)` so `start()`
+    /// can map the SPECIFIC outcome to a `DoorVideoSessionState.failed(
+    /// message:)` via `DoorVideoBusyPolicy.failureMessage(for:)`, rather than
+    /// the previous one-size-fits-all "Could not reach door camera".
+    ///
+    /// Every `await` in this func is followed by a `hasStopped` check
+    /// before any further diagnostics/registry side effect, so a `stop()`
+    /// racing an in-flight PUT or the retry's sleep cannot record a diag
+    /// line or registry mutation after the session has been torn down.
     private func putOfferWithRetry(endpointId: String, token: String, sdp: String) async throws -> String {
-        let policy = RetryPolicy(
-            maxAttempts: 2,
-            baseDelay: .milliseconds(500),
-            maxTotalDelay: .seconds(2),
-            requestTimeout: .seconds(5)
-        )
+        let maxAttempts = 2 // one attempt + at most one .network retry
 
-        var lastError: Error = DoorVideoSessionError.network
-        for attempt in 1...policy.maxAttempts {
+        for attempt in 1...maxAttempts {
+            guard !hasStopped else { throw DoorVideoSessionError.offer(.network) }
+
             let sessionId = UUID().uuidString.lowercased()
             let attemptStart = Date()
-            do {
-                let answer = try await putOffer(endpointId: endpointId, token: token, sdp: sdp, sessionId: sessionId)
-                let latencyMs = Int(Date().timeIntervalSince(attemptStart) * 1000)
-                Self.logger.notice("rtc/offer attempt \(attempt, privacy: .public)/\(policy.maxAttempts, privacy: .public) succeeded")
-                recordDiag(VideoDiagnosticsStage.offerAttempt(n: attempt, of: policy.maxAttempts, outcome: .success, latencyMs: latencyMs))
-                return answer
-            } catch {
-                let latencyMs = Int(Date().timeIntervalSince(attemptStart) * 1000)
-                lastError = error
-                let retryable: Bool
-                if case DoorVideoSessionError.server(let status) = error, status == 500 {
-                    retryable = true
-                } else if case DoorVideoSessionError.network = error {
-                    retryable = true
-                } else {
-                    retryable = false
-                }
-                Self.logger.notice("rtc/offer attempt \(attempt, privacy: .public)/\(policy.maxAttempts, privacy: .public) failed: \(String(describing: error), privacy: .public), retryable=\(retryable, privacy: .public)")
-                let statusDescription: String
-                if case DoorVideoSessionError.server(let status) = error {
-                    statusDescription = "\(status)"
-                } else {
-                    statusDescription = "network-error"
-                }
-                recordDiag(VideoDiagnosticsStage.offerAttempt(n: attempt, of: policy.maxAttempts, outcome: .failure(statusDescription), latencyMs: latencyMs))
+            let (outcome, answer) = await putOfferOnce(endpointId: endpointId, token: token, sdp: sdp, sessionId: sessionId)
+            let latencyMs = Int(Date().timeIntervalSince(attemptStart) * 1000)
 
-                guard retryable, attempt < policy.maxAttempts else {
-                    throw error
-                }
-                try? await policy.sleep(policy.baseDelay)
+            guard !hasStopped else { throw DoorVideoSessionError.offer(.network) }
+
+            if outcome == .accepted, let answer {
+                Self.logger.notice("rtc/offer attempt \(attempt, privacy: .public)/\(maxAttempts, privacy: .public) succeeded")
+                recordDiag(VideoDiagnosticsStage.offerAttempt(n: attempt, of: maxAttempts, outcome: .success, latencyMs: latencyMs))
+                offerAccepted = true
+                DoorVideoSessionRegistry.shared.recordSessionAccepted(at: Date())
+                return answer
             }
+
+            let retryable = DoorVideoBusyPolicy.shouldRetry(outcome)
+            Self.logger.notice("rtc/offer attempt \(attempt, privacy: .public)/\(maxAttempts, privacy: .public) failed: \(String(describing: outcome), privacy: .public), retryable=\(retryable, privacy: .public)")
+
+            let diagLabel = DoorVideoBusyPolicy.diagLabel(for: outcome)
+            let statusDescription: String
+            switch outcome {
+            case .doorBusy:
+                statusDescription = "500 \(diagLabel)"
+            case .serverError(let status):
+                statusDescription = "\(status) \(diagLabel)"
+            case .unauthorized, .timedOut, .network, .accepted:
+                statusDescription = diagLabel
+            }
+            recordDiag(VideoDiagnosticsStage.offerAttempt(n: attempt, of: maxAttempts, outcome: .failure(statusDescription), latencyMs: latencyMs))
+
+            guard !hasStopped else { throw DoorVideoSessionError.offer(outcome) }
+
+            guard retryable, attempt < maxAttempts else {
+                throw DoorVideoSessionError.offer(outcome)
+            }
+
+            try? await Task.sleep(for: .milliseconds(500))
+            guard !hasStopped else { throw DoorVideoSessionError.offer(outcome) }
         }
-        throw lastError
+        // Unreachable: the loop above always either returns or throws on
+        // its final iteration.
+        throw DoorVideoSessionError.offer(.network)
     }
 }
 
@@ -767,9 +1038,13 @@ public final class DoorVideoSession: NSObject {
 enum DoorVideoSessionError: Error, Equatable {
     case cameraNotFound
     case negotiationFailed
-    case invalidURL
-    case network
-    case server(status: Int)
+    /// Wraps a classified `rtc/offer` failure outcome so callers (`start()`)
+    /// can distinguish `.doorBusy`/`.unauthorized`/`.timedOut`/`.network`/
+    /// `.serverError` and map each to its own
+    /// `DoorVideoSessionState.failed(message:)` via
+    /// `DoorVideoBusyPolicy.failureMessage(for:)`, rather than a single
+    /// generic transport/server error case.
+    case offer(DoorVideoBusyPolicy.OfferOutcome)
 }
 
 // MARK: - WKNavigationDelegate

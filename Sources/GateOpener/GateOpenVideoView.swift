@@ -153,6 +153,21 @@ final class GateOpenVideoView: NSView, OverlayShowHideResponding {
         player.pause()
     }
 
+    /// The underlying player's current playback rate and position, exposed
+    /// for `OverlayWindowController.teardownOpenVideoSession()`'s diagnostic
+    /// log line (bead gateopener-6s8.3, step 4: the "half-open-curtains
+    /// mystery" — whether the canned animation's playback had actually
+    /// stopped mid-clip by the time the panel was torn down). `rate` is `0`
+    /// when paused/stopped, non-zero while actively playing; `currentTime`
+    /// is the player's position in seconds, `nil` if not yet numeric/valid
+    /// (mirrors the same guard `seekToFinalFrameAndPause()` above already
+    /// applies to `duration`).
+    var diagnosticPlaybackSnapshot: (rate: Float, currentTimeSeconds: Double?) {
+        let time = player.currentTime()
+        let seconds: Double? = (time.isNumeric && time.isValid) ? time.seconds : nil
+        return (rate: player.rate, currentTimeSeconds: seconds)
+    }
+
     // MARK: - Private
 
     /// Ensures the final frame stays visible at end-of-item rather than the
