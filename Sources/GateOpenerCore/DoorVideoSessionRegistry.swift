@@ -66,4 +66,23 @@ public final class DoorVideoSessionRegistry {
     public func waitBeforeOffer(now: Date = Date()) -> Duration {
         DoorVideoBusyPolicy.waitBeforeOffer(lastSessionEnded: lastSessionEnded, now: now)
     }
+
+    /// Pure helper encoding the rule from gateopener-6s8.2 step 4: a
+    /// session that never had its `rtc/offer` accepted never occupied the
+    /// door's one session slot, so its termination (a pre-accept failure,
+    /// or `stop()` called before an offer was ever accepted) must NOT start
+    /// a busy-cooldown window -- doing so would make an UNRELATED prior
+    /// failure (e.g. "Sign-in required", which never even reached the
+    /// door) impose a 15s wait on the NEXT attempt for no reason.
+    ///
+    /// Callers should call `recordSessionEnded` if and only if this
+    /// returns `true`, i.e. only when `offerAccepted` is `true` -- kept as
+    /// a separate pure func (rather than inlining `if offerAccepted { ... }`
+    /// at every call site) so this rule has exactly one place it is stated
+    /// and can be unit-tested in isolation from `DoorVideoSession`'s
+    /// WKWebView-dependent call sites, which cannot be exercised headlessly
+    /// (see that type's doc comment).
+    public static func shouldRecordEnd(offerAccepted: Bool) -> Bool {
+        offerAccepted
+    }
 }

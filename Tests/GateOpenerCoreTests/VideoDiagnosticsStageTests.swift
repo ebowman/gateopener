@@ -10,6 +10,15 @@ import Testing
 struct VideoDiagnosticsStageTests {
     // MARK: - endpoint suffix truncation
 
+    // MARK: - cooldownWait
+
+    /// "door cooldown: waiting X.Xs" — one decimal place, matching
+    /// `terminal(.streaming(afterSeconds:))`'s precision.
+    @Test func cooldownWaitFormat() {
+        #expect(VideoDiagnosticsStage.cooldownWait(seconds: 9.951) == "door cooldown: waiting 10.0s")
+        #expect(VideoDiagnosticsStage.cooldownWait(seconds: 0.04) == "door cooldown: waiting 0.0s")
+    }
+
     /// The endpoint id must be truncated to its `"VIP#"`-onward suffix —
     /// never the full id, which embeds the apartment id ahead of `VIP#`.
     @Test func endpointResolvedTruncatesToVIPSuffix() {

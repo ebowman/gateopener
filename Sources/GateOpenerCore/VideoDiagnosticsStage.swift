@@ -81,6 +81,16 @@ public enum VideoDiagnosticsStage {
         "stun resolved \(count) addresses"
     }
 
+    /// "door cooldown: waiting X.Xs" — recorded once, immediately before
+    /// `DoorVideoSession.start()` sleeps out `DoorVideoSessionRegistry.
+    /// shared.waitBeforeOffer()`'s non-zero remainder of the door's
+    /// post-session busy window (epic gateopener-6s8's design note (a)).
+    /// `seconds` is formatted to one decimal place, matching the existing
+    /// `terminal(.streaming(afterSeconds:))` precision.
+    public static func cooldownWait(seconds: Double) -> String {
+        "door cooldown: waiting \(String(format: "%.1f", seconds))s"
+    }
+
     /// "offer ready: N candidates" — the non-trickle offer SDP's ICE
     /// candidate count, never the SDP or the candidates themselves.
     public static func offerReady(candidateCount: Int) -> String {

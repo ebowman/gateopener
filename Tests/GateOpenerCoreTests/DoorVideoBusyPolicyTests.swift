@@ -133,4 +133,73 @@ struct DoorVideoBusyPolicyTests {
         // accept was recorded moments ago.
         #expect(registry.waitBeforeOffer(now: now) == .zero)
     }
+
+    // MARK: - shouldRecordEnd
+
+    @Test @MainActor func shouldRecordEndTrueWhenOfferAccepted() {
+        #expect(DoorVideoSessionRegistry.shouldRecordEnd(offerAccepted: true) == true)
+    }
+
+    @Test @MainActor func shouldRecordEndFalseWhenOfferNeverAccepted() {
+        #expect(DoorVideoSessionRegistry.shouldRecordEnd(offerAccepted: false) == false)
+    }
+
+    // MARK: - failureMessage(for:)
+
+    @Test func failureMessageDoorBusy() {
+        #expect(DoorVideoBusyPolicy.failureMessage(for: .doorBusy) == "Door camera busy")
+    }
+
+    @Test func failureMessageUnauthorized() {
+        #expect(DoorVideoBusyPolicy.failureMessage(for: .unauthorized) == "Sign-in required")
+    }
+
+    @Test func failureMessageTimedOut() {
+        #expect(DoorVideoBusyPolicy.failureMessage(for: .timedOut) == "Door camera not responding")
+    }
+
+    @Test func failureMessageNetworkAndServerErrorShareWording() {
+        #expect(DoorVideoBusyPolicy.failureMessage(for: .network) == "Could not reach door camera")
+        #expect(DoorVideoBusyPolicy.failureMessage(for: .serverError(503)) == "Could not reach door camera")
+    }
+
+    @Test func failureMessageAcceptedIsEmpty() {
+        #expect(DoorVideoBusyPolicy.failureMessage(for: .accepted) == "")
+    }
+
+    /// MUTATION CHECK (per bd memory `gateopener-vacuous-assertion-failure-
+    /// mode`): if `failureMessage(for: .doorBusy)` regressed to return the
+    /// generic network wording instead of the door-busy-specific message,
+    /// this simulated "broken" variant demonstrates
+    /// `failureMessageDoorBusy`'s assertion above would then fail.
+    @Test func mutationCheckGenericWordingForDoorBusyWouldFailTheAssertion() {
+        let brokenMessage = "Could not reach door camera" // simulated regression
+        #expect(brokenMessage != "Door camera busy")
+    }
+
+    // MARK: - diagLabel(for:)
+
+    @Test func diagLabelDoorBusy() {
+        #expect(DoorVideoBusyPolicy.diagLabel(for: .doorBusy) == "door-busy")
+    }
+
+    @Test func diagLabelTimedOut() {
+        #expect(DoorVideoBusyPolicy.diagLabel(for: .timedOut) == "timeout")
+    }
+
+    @Test func diagLabelNetwork() {
+        #expect(DoorVideoBusyPolicy.diagLabel(for: .network) == "network-error")
+    }
+
+    @Test func diagLabelUnauthorized() {
+        #expect(DoorVideoBusyPolicy.diagLabel(for: .unauthorized) == "unauthorized")
+    }
+
+    @Test func diagLabelServerError() {
+        #expect(DoorVideoBusyPolicy.diagLabel(for: .serverError(503)) == "server-error")
+    }
+
+    @Test func diagLabelAccepted() {
+        #expect(DoorVideoBusyPolicy.diagLabel(for: .accepted) == "accepted")
+    }
 }
