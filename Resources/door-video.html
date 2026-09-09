@@ -356,6 +356,72 @@ window.captureFrameAndStats = async function (quality) {
   return JSON.stringify({jpeg: jpeg, video: video});
 };
 
+// One-shot candidate-pair diagnostics dump (bead gateopener-6s8.6): unlike
+// startSelectedPairPolling below (which only reports the CURRENTLY selected
+// pair, and only once connected), this walks EVERY candidate-pair report in
+// pc.getStats() so a failure that never reaches "connected" still yields a
+// full picture of what was tried. Swift calls this once, at most, per
+// terminal event (the 20s no-video deadline, or a post-answer-applied
+// "failed" ICE/connection state) -- never polled. Reuses addressFamily and
+// the candidate-pair report's localCandidateId/remoteCandidateId to resolve
+// the matching local-candidate/remote-candidate reports, exactly like
+// startSelectedPairPolling does for the single selected pair. NEVER logs an
+// address or port -- only type/protocol/family per this bead's privacy
+// requirement -- and must never throw: any failure is captured into the
+// returned JSON's "error" field instead. Capped at 12 pairs.
+window.getCandidatePairs = async function () {
+  try {
+    const pc = window.__state.pc;
+    if (!pc) {
+      return JSON.stringify({ error: "no pc" });
+    }
+    const stats = await pc.getStats();
+    const candidateReports = new Map();
+    const pairReports = [];
+    const remoteTypeSet = new Set();
+    stats.forEach((report) => {
+      if (report.type === "local-candidate" || report.type === "remote-candidate") {
+        candidateReports.set(report.id, report);
+        if (report.type === "remote-candidate" && report.candidateType) {
+          remoteTypeSet.add(report.candidateType);
+        }
+      } else if (report.type === "candidate-pair") {
+        pairReports.push(report);
+      }
+    });
+
+    const pairs = pairReports.slice(0, 12).map((pair) => {
+      const local = candidateReports.get(pair.localCandidateId);
+      const remote = candidateReports.get(pair.remoteCandidateId);
+      return {
+        state: pair.state || "unknown",
+        nominated: !!pair.nominated,
+        local: {
+          type: local ? (local.candidateType || "unknown") : "unknown",
+          protocol: local ? (local.protocol || "unknown") : "unknown",
+          family: addressFamily(local ? local.address : null),
+        },
+        remote: {
+          type: remote ? (remote.candidateType || "unknown") : "unknown",
+          protocol: remote ? (remote.protocol || "unknown") : "unknown",
+          family: addressFamily(remote ? remote.address : null),
+        },
+        requestsSent: pair.requestsSent || 0,
+        responsesReceived: pair.responsesReceived || 0,
+      };
+    });
+
+    return JSON.stringify({
+      iceConnectionState: pc.iceConnectionState,
+      connectionState: pc.connectionState,
+      remoteCandidateTypes: Array.from(remoteTypeSet),
+      pairs: pairs,
+    });
+  } catch (err) {
+    return JSON.stringify({ error: String(err && err.message ? err.message : err) });
+  }
+};
+
 // Diagnostics only (bead gateopener-672.27): once `pc.connectionState` first
 // reaches "connected" (see the onconnectionstatechange handler in
 // negotiate() above), polls pc.getStats() every ~2s for the transport's

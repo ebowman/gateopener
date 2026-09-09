@@ -207,6 +207,17 @@ public final class DoorVideoSession: NSObject {
     /// NEXT attempt (see that helper's doc comment).
     private var offerAccepted = false
 
+    /// Set to `true` the instant `applyAnswer(_:)` succeeds (bead
+    /// gateopener-6s8.6). Consulted only by the candidate-pair diagnostics
+    /// dump (`dumpCandidatePairs(reason:)`): a `.failed` transition that
+    /// happens BEFORE the answer was ever applied (page-URL-missing, token/
+    /// discovery failure, offer PUT failure, or `applyAnswer` itself
+    /// throwing) has no meaningful peer-connection state to inspect yet, so
+    /// this flag gates the dump to the two paths that DO have one — the 20s
+    /// no-video deadline in `watchForFirstFrame()`, and any future
+    /// post-answer `.failed` path.
+    private var answerApplied = false
+
     public init(
         tokenManager: TokenManager,
         gateClient: GateClient,
@@ -573,6 +584,7 @@ public final class DoorVideoSession: NSObject {
         do {
             try await applyAnswer(answerSDP)
             recordDiag(VideoDiagnosticsStage.answerApplied())
+            answerApplied = true
         } catch {
             let message = "Could not apply video answer"
             state = .failed(message: message)
@@ -733,6 +745,51 @@ public final class DoorVideoSession: NSObject {
         _ = try await contentView.callAsyncJavaScript(js, contentWorld: .page)
     }
 
+    /// One-shot candidate-pair diagnostics dump (bead gateopener-6s8.6):
+    /// calls `window.getCandidatePairs()` exactly once, decodes the result
+    /// with `CandidatePairReport`, and records every line from
+    /// `diagLines()` (summary first, then one line per pair) via
+    /// `recordDiag`. MUST be called, and MUST complete, BEFORE the caller
+    /// sets `state = .failed` and calls `finalizeDiagnostics(...)` — once
+    /// `finalizeDiagnostics` runs, `finalized` is set and `recordDiag`
+    /// becomes a no-op (see both doc comments), so calling this any later
+    /// would silently drop every line it records.
+    ///
+    /// Only ever called when `answerApplied` is `true` (checked by every
+    /// call site, not here, so this stays a pure "make the call and record
+    /// the result" helper) — before the answer is applied there is no
+    /// peer-connection state worth inspecting yet (see `answerApplied`'s
+    /// doc comment).
+    ///
+    /// Never throws: `callAsyncJavaScript` errors (including the page-side
+    /// `getCandidatePairs` promise rejecting, which it is designed not to —
+    /// see that function's doc comment in `door-video.html` — but a
+    /// WKWebView-level bridging failure is still possible) are caught and
+    /// recorded as a single "candidate pairs: unavailable (js error)" line,
+    /// mirroring `CandidatePairReport.diagLines()`'s own
+    /// "unavailable (<error>)" shape for a JS-side failure.
+    private func dumpCandidatePairs() async {
+        do {
+            let raw = try await contentView.callAsyncJavaScript(
+                "return await window.getCandidatePairs();",
+                contentWorld: .page
+            )
+            guard let jsonStr = raw as? String else {
+                recordDiag("candidate pairs: unavailable (js error)")
+                return
+            }
+            guard let report = CandidatePairReport.parse(json: jsonStr) else {
+                recordDiag("candidate pairs: unavailable (js error)")
+                return
+            }
+            for line in report.diagLines() {
+                recordDiag(line)
+            }
+        } catch {
+            recordDiag("candidate pairs: unavailable (js error)")
+        }
+    }
+
     /// Polls `window.getState()` for `hasVideoFrame` becoming true, then
     /// transitions to `.streaming`. This is the ONLY polling this type
     /// does — there is no ongoing stale-frame watchdog (out of scope; see
@@ -790,6 +847,19 @@ public final class DoorVideoSession: NSObject {
                     // their own; keep polling until the deadline.
                 }
                 try? await Task.sleep(nanoseconds: 300_000_000)
+            }
+            guard !self.hasStopped else { return }
+            // Candidate-pair dump BEFORE the terminal transition (bead
+            // gateopener-6s8.6): `dumpCandidatePairs()` calls `recordDiag`,
+            // which is a no-op once `finalized` is set by
+            // `finalizeDiagnostics` below — so the dump must complete, and
+            // its lines must already be in `diagnostics`, before `state`
+            // flips to `.failed` and `finalizeDiagnostics` persists the
+            // log. `answerApplied` is always `true` here: `watchForFirstFrame()`
+            // is only ever invoked (from `start()`) after `applyAnswer`
+            // already succeeded.
+            if self.answerApplied {
+                await self.dumpCandidatePairs()
             }
             guard !self.hasStopped else { return }
             self.state = .failed(message: "No video received")

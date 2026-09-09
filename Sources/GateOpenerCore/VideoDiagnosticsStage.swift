@@ -181,4 +181,50 @@ public enum VideoDiagnosticsStage {
             return "terminal: stopped by caller"
         }
     }
+
+    // MARK: - candidate pairs (bead gateopener-6s8.6)
+
+    /// "candidate pair N: state=<state> nominated=<bool> local=<type>/<protocol>/<family>
+    /// remote=<type>/<protocol>/<family> req=<requestsSent> resp=<responsesReceived>"
+    /// — one line per candidate pair reported by `window.getCandidatePairs()`
+    /// (`door-video.html`), recorded by `DoorVideoSession` once per terminal
+    /// event (the 20s no-video deadline, or a post-answer-applied failure).
+    /// `index` is 1-based, matching this bead's example line. Every field
+    /// here is whitelisted — type/protocol/family/state/nominated/counts
+    /// only, NEVER an address or port — so this can never leak network
+    /// details even if a caller's `CandidatePairReport` decode somehow
+    /// carried one.
+    public static func candidatePair(
+        index: Int,
+        state: String,
+        nominated: Bool,
+        localType: String,
+        localProtocol: String,
+        localFamily: String,
+        remoteType: String,
+        remoteProtocol: String,
+        remoteFamily: String,
+        requestsSent: Int,
+        responsesReceived: Int
+    ) -> String {
+        "candidate pair \(index): state=\(state) nominated=\(nominated) " +
+            "local=\(localType)/\(localProtocol)/\(localFamily) " +
+            "remote=\(remoteType)/\(remoteProtocol)/\(remoteFamily) " +
+            "req=\(requestsSent) resp=\(responsesReceived)"
+    }
+
+    /// "candidate pairs: N, remote types: [<type>, <type>, ...], ice=<iceConnectionState>
+    /// conn=<connectionState>" — the summary line recorded immediately
+    /// before the per-pair `candidatePair(...)` lines. `remoteTypes` is
+    /// rendered in whatever order it is passed (callers should pass the
+    /// already-deduplicated set from `CandidatePairReport`).
+    public static func candidatePairSummary(
+        count: Int,
+        remoteTypes: [String],
+        iceConnectionState: String,
+        connectionState: String
+    ) -> String {
+        "candidate pairs: \(count), remote types: [\(remoteTypes.joined(separator: ", "))], " +
+            "ice=\(iceConnectionState) conn=\(connectionState)"
+    }
 }
