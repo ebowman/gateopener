@@ -81,6 +81,24 @@ public enum VideoDiagnosticsStage {
         "stun resolved \(count) addresses"
     }
 
+    /// "auth+discovery took Xms" — the wall-clock duration of the
+    /// token-refresh + camera-endpoint-discovery branch run concurrently
+    /// with the STUN-resolve/page-load/gathering branch (bead
+    /// gateopener-6s8.4). Recorded once, when that branch completes
+    /// (success or failure), so a cold-token run's actual cost is visible
+    /// alongside the "gathering took Xms" line for the other branch.
+    public static func authDiscoveryDuration(ms: Int) -> String {
+        "auth+discovery took \(ms)ms"
+    }
+
+    /// "gathering took Xms" — the wall-clock duration of the STUN-resolve +
+    /// page-load + ICE-server-injection + `startNegotiation()` branch run
+    /// concurrently with the token+discovery branch (bead gateopener-6s8.4).
+    /// Recorded once, when that branch completes (success or failure).
+    public static func gatheringDuration(ms: Int) -> String {
+        "gathering took \(ms)ms"
+    }
+
     /// "door cooldown: waiting X.Xs" — recorded once, immediately before
     /// `DoorVideoSession.start()` sleeps out `DoorVideoSessionRegistry.
     /// shared.waitBeforeOffer()`'s non-zero remainder of the door's

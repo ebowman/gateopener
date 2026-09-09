@@ -305,6 +305,146 @@ public final class DoorVideoSession: NSObject {
         }
     }
 
+    // MARK: - start()'s two concurrent branches (bead gateopener-6s8.4)
+
+    /// Outcome of branch A (token refresh -> camera-endpoint discovery).
+    /// Never thrown — every failure this branch can hit is captured here so
+    /// `start()` can decide, AFTER both branches have finished, which
+    /// failure (if any) to report, per this bead's priority rule (branch A
+    /// wins if both failed).
+    private enum BranchAResult {
+        case success(token: String, endpointId: String)
+        case failure(message: String)
+    }
+
+    /// Outcome of branch B (STUN resolve -> page load -> inject ICE servers
+    /// -> `startNegotiation()`). Never thrown, for the same reason as
+    /// `BranchAResult`.
+    private enum BranchBResult {
+        case success(offerSDP: String)
+        case failure(message: String)
+    }
+
+    /// Branch A: resolves an access token, then discovers the camera
+    /// endpoint id. Records every diag line the ORIGINAL sequential
+    /// `start()` recorded for these two steps, in the same order, plus a
+    /// final "auth+discovery took Xms" line on completion (success or
+    /// failure) — see `VideoDiagnosticsStage.authDiscoveryDuration(ms:)`.
+    ///
+    /// Every `await` is followed by a `hasStopped` check before recording
+    /// anything further, matching this type's existing convention
+    /// elsewhere (e.g. `putOfferWithRetry`) so a `stop()` racing this
+    /// branch cannot append a diag line after teardown — `recordDiag`
+    /// itself already no-ops post-`finalized`, but the early return also
+    /// skips the pointless remaining work (endpoint discovery after a
+    /// token that arrived post-stop, etc).
+    private func runAuthDiscoveryBranch() async -> BranchAResult {
+        let branchStart = Date()
+
+        let token: String
+        do {
+            token = try await tokenManager.accessToken()
+            recordDiag(VideoDiagnosticsStage.tokenResolved(outcome: .ok))
+        } catch TokenManagerError.notConfigured {
+            recordDiag(VideoDiagnosticsStage.tokenResolved(outcome: .failed("notConfigured")))
+            recordDiag(VideoDiagnosticsStage.authDiscoveryDuration(ms: Self.elapsedMs(since: branchStart)))
+            return .failure(message: "Sign-in required")
+        } catch {
+            recordDiag(VideoDiagnosticsStage.tokenResolved(outcome: .failed(String(describing: error))))
+            recordDiag(VideoDiagnosticsStage.authDiscoveryDuration(ms: Self.elapsedMs(since: branchStart)))
+            return .failure(message: "Could not get access token")
+        }
+
+        guard !hasStopped else {
+            recordDiag(VideoDiagnosticsStage.authDiscoveryDuration(ms: Self.elapsedMs(since: branchStart)))
+            return .failure(message: "Could not get access token")
+        }
+
+        let endpointId: String
+        do {
+            endpointId = try await resolveCameraEndpointId()
+            recordDiag(VideoDiagnosticsStage.endpointResolved(id: endpointId))
+        } catch {
+            recordDiag(VideoDiagnosticsStage.authDiscoveryDuration(ms: Self.elapsedMs(since: branchStart)))
+            return .failure(message: "Door camera not found")
+        }
+
+        recordDiag(VideoDiagnosticsStage.authDiscoveryDuration(ms: Self.elapsedMs(since: branchStart)))
+        return .success(token: token, endpointId: endpointId)
+    }
+
+    /// Branch B: resolves Comelit's STUN host to IPs, loads
+    /// `door-video.html` into `contentView` (awaiting the SAME
+    /// `pageLoadContinuation` the navigation delegate resumes today),
+    /// injects the resolved ICE server URLs, then negotiates the
+    /// non-trickle offer. Records every diag line the original sequential
+    /// `start()` recorded for these steps, in the same order, plus a final
+    /// "gathering took Xms" line on completion (success or failure) — see
+    /// `VideoDiagnosticsStage.gatheringDuration(ms:)`.
+    ///
+    /// `pageURL` is resolved by the CALLER (`start()`) before either branch
+    /// is launched, since a missing `door-video.html` is reported as a
+    /// dedicated "Video page unavailable" failure that neither branch A nor
+    /// B individually owns (it precedes both in the original sequential
+    /// flow, and both branches would otherwise need to special-case it).
+    ///
+    /// `hasStopped` is checked after every `await` before any further diag
+    /// line, mirroring branch A. If `stop()` resumes `pageLoadContinuation`
+    /// while this branch is awaiting it, this branch's own `guard
+    /// !hasStopped` immediately after that `await` returns `.failure`
+    /// without EVER touching `pageLoadContinuation` again — so the
+    /// continuation this branch owns is resumed exactly once, by whichever
+    /// of {navigation delegate, `stop()`} gets there first, never by this
+    /// branch itself a second time.
+    private func runGatheringBranch(pageURL: URL) async -> BranchBResult {
+        let branchStart = Date()
+
+        let stunIPs = Self.resolveStunIPs(host: Self.stunHost)
+        recordDiag(VideoDiagnosticsStage.stunResolved(count: stunIPs.count))
+        let iceServerURLs = stunIPs.isEmpty
+            ? ["stun:\(Self.stunHost):\(Self.stunPort)"]
+            : stunIPs.map { "stun:\($0):\(Self.stunPort)" }
+
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            self.pageLoadContinuation = continuation
+            self.contentView.loadFileURL(pageURL, allowingReadAccessTo: pageURL.deletingLastPathComponent())
+        }
+
+        guard !hasStopped else {
+            recordDiag(VideoDiagnosticsStage.gatheringDuration(ms: Self.elapsedMs(since: branchStart)))
+            return .failure(message: "Video page failed to load")
+        }
+
+        do {
+            try await injectIceServers(iceServerURLs)
+        } catch {
+            recordDiag(VideoDiagnosticsStage.gatheringDuration(ms: Self.elapsedMs(since: branchStart)))
+            return .failure(message: "Video page failed to load")
+        }
+
+        guard !hasStopped else {
+            recordDiag(VideoDiagnosticsStage.gatheringDuration(ms: Self.elapsedMs(since: branchStart)))
+            return .failure(message: "Video page failed to load")
+        }
+
+        let offerSDP: String
+        do {
+            offerSDP = try await startNegotiation()
+        } catch {
+            recordDiag(VideoDiagnosticsStage.gatheringDuration(ms: Self.elapsedMs(since: branchStart)))
+            return .failure(message: "Could not negotiate video session")
+        }
+
+        recordDiag(VideoDiagnosticsStage.gatheringDuration(ms: Self.elapsedMs(since: branchStart)))
+        return .success(offerSDP: offerSDP)
+    }
+
+    /// Milliseconds elapsed since `start`, as an `Int` (matching
+    /// `putOfferOnce`'s existing `latencyMs` computation style).
+    private static func elapsedMs(since start: Date) -> Int {
+        Int(Date().timeIntervalSince(start) * 1000)
+    }
+
     // MARK: - start()
 
     /// Establishes the one and only WebRTC session this instance will ever
@@ -312,6 +452,25 @@ public final class DoorVideoSession: NSObject {
     /// since this type does not support restarting.
     ///
     /// Never throws: all failure paths are reported via `state`.
+    ///
+    /// Runs two branches CONCURRENTLY (bead gateopener-6s8.4): branch A
+    /// (`runAuthDiscoveryBranch`, token -> discovery) and branch B
+    /// (`runGatheringBranch`, STUN resolve -> page load -> inject ICE
+    /// servers -> negotiate) — neither needs the other's result, and cold
+    /// token refresh + discovery can cost up to ~8s that used to fully
+    /// precede gathering. Both are joined (both `async let`s are awaited
+    /// to completion — never cancelled early) before the door-busy cooldown
+    /// wait and the `rtc/offer` PUT, which DO need both results (the token
+    /// and endpoint id from A, the offer SDP from B).
+    ///
+    /// Failure priority, per this bead: if BOTH branches failed, branch A's
+    /// failure message is reported (auth/discovery failures are the more
+    /// actionable message for the user). If only one branch failed, that
+    /// branch's message is reported and the OTHER branch's (now-unused)
+    /// successful result is simply discarded — both branches are always
+    /// awaited to completion here (via `async let`), so there is never a
+    /// dangling continuation or an orphaned child task left running past
+    /// this function's return.
     public func start() async {
         guard !hasStarted else {
             Self.logger.notice("DoorVideoSession.start() called more than once; ignoring")
@@ -338,64 +497,39 @@ public final class DoorVideoSession: NSObject {
             return
         }
 
+        async let branchAResult = runAuthDiscoveryBranch()
+        async let branchBResult = runGatheringBranch(pageURL: pageURL)
+
+        // Both branches are ALWAYS awaited fully here — never cancelled
+        // early — so `pageLoadContinuation` (owned by branch B) is never
+        // left dangling and any late navigation-delegate callback or
+        // `stop()` racing either branch always finds a branch that is
+        // either still legitimately running or has already returned.
+        let resolvedA = await branchAResult
+        let resolvedB = await branchBResult
+
+        guard !hasStopped else { return }
+
         let token: String
-        do {
-            token = try await tokenManager.accessToken()
-            recordDiag(VideoDiagnosticsStage.tokenResolved(outcome: .ok))
-        } catch TokenManagerError.notConfigured {
-            recordDiag(VideoDiagnosticsStage.tokenResolved(outcome: .failed("notConfigured")))
-            let message = "Sign-in required"
-            state = .failed(message: message)
-            finalizeDiagnostics(.failed(message: message))
-            return
-        } catch {
-            recordDiag(VideoDiagnosticsStage.tokenResolved(outcome: .failed(String(describing: error))))
-            let message = "Could not get access token"
-            state = .failed(message: message)
-            finalizeDiagnostics(.failed(message: message))
-            return
-        }
-
         let endpointId: String
-        do {
-            endpointId = try await resolveCameraEndpointId()
-            recordDiag(VideoDiagnosticsStage.endpointResolved(id: endpointId))
-        } catch {
-            let message = "Door camera not found"
+        switch resolvedA {
+        case .success(let resolvedToken, let resolvedEndpointId):
+            token = resolvedToken
+            endpointId = resolvedEndpointId
+        case .failure(let message):
+            // Branch A's failure wins regardless of branch B's outcome —
+            // this bead's stated priority. Branch B's result (success or
+            // its own failure) is discarded here without further action.
             state = .failed(message: message)
             finalizeDiagnostics(.failed(message: message))
             return
         }
-
-        let stunIPs = Self.resolveStunIPs(host: Self.stunHost)
-        recordDiag(VideoDiagnosticsStage.stunResolved(count: stunIPs.count))
-        let iceServerURLs = stunIPs.isEmpty
-            ? ["stun:\(Self.stunHost):\(Self.stunPort)"]
-            : stunIPs.map { "stun:\($0):\(Self.stunPort)" }
-
-        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            self.pageLoadContinuation = continuation
-            self.contentView.loadFileURL(pageURL, allowingReadAccessTo: pageURL.deletingLastPathComponent())
-        }
-
-        guard !hasStopped else { return }
-
-        do {
-            try await injectIceServers(iceServerURLs)
-        } catch {
-            let message = "Video page failed to load"
-            state = .failed(message: message)
-            finalizeDiagnostics(.failed(message: message))
-            return
-        }
-
-        guard !hasStopped else { return }
 
         let offerSDP: String
-        do {
-            offerSDP = try await startNegotiation()
-        } catch {
-            let message = "Could not negotiate video session"
+        switch resolvedB {
+        case .success(let resolvedOfferSDP):
+            offerSDP = resolvedOfferSDP
+        case .failure(let message):
             state = .failed(message: message)
             finalizeDiagnostics(.failed(message: message))
             return

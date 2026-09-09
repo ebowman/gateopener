@@ -112,6 +112,31 @@ struct VideoDiagnosticsStageTests {
         #expect(VideoDiagnosticsStage.offerReady(candidateCount: 7) == "offer ready: 7 candidates")
     }
 
+    // MARK: - concurrent branch durations (gateopener-6s8.4)
+
+    /// "auth+discovery took Xms" — integer milliseconds, no rounding beyond
+    /// what `Int` truncation already does at the call site.
+    @Test func authDiscoveryDurationFormat() {
+        #expect(VideoDiagnosticsStage.authDiscoveryDuration(ms: 1234) == "auth+discovery took 1234ms")
+        #expect(VideoDiagnosticsStage.authDiscoveryDuration(ms: 0) == "auth+discovery took 0ms")
+    }
+
+    /// MUTATION CHECK (per bd memory `gateopener-vacuous-assertion-failure-mode`):
+    /// a broken formatter that swapped the label (e.g. emitted "gathering
+    /// took Xms" for the auth+discovery branch) would fail this assertion —
+    /// proving the exact-string check above is not vacuously true.
+    @Test func mutationCheckAuthDiscoveryDurationLabelIsLoadBearing() {
+        let line = VideoDiagnosticsStage.authDiscoveryDuration(ms: 42)
+        let brokenLine = "gathering took 42ms"
+        #expect(line != brokenLine)
+    }
+
+    /// "gathering took Xms" — integer milliseconds.
+    @Test func gatheringDurationFormat() {
+        #expect(VideoDiagnosticsStage.gatheringDuration(ms: 5678) == "gathering took 5678ms")
+        #expect(VideoDiagnosticsStage.gatheringDuration(ms: 0) == "gathering took 0ms")
+    }
+
     // MARK: - offer attempt
 
     @Test func offerAttemptSuccessFormat() {
