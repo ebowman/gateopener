@@ -281,6 +281,31 @@ final class OverlayWindowController {
     /// `.idle`/`.needsSetup` branch to implement reentrancy rule (b) below.
     private var isResolveFadePending = false
 
+    /// gateopener-6s8.3: the hold duration `handleResolved(holdDuration:)`
+    /// would have scheduled, captured whenever it returns EARLY because a
+    /// video session is in flight for the current open (`openVideoSession
+    /// != nil` — see that method's own doc comment). `nil` whenever no such
+    /// deferral has happened (the common case): either `GateState` has not
+    /// resolved yet for the current open, or it has already resolved AND
+    /// that resolution ran the hold-then-fade normally (no video in
+    /// flight), or a previously-deferred value has already been consumed by
+    /// `handleOpenVideoState(_:)`/`handleOpenVideoSessionEnded()` below.
+    ///
+    /// THIS IS THE FIX for the stranded-overlay bug: without it, once the
+    /// video session later fails/ends (see `handleOpenVideoState(_:)`),
+    /// there is no record that `GateState` already resolved and that a
+    /// hold-then-fade is now owed — `OverlayFailureDecision.decide(
+    /// gateResolvedHold:)` reads this exact value to decide whether to
+    /// schedule that fade now (`.scheduleFade`) or leave it for a future,
+    /// not-yet-arrived `GateState` resolution to schedule normally
+    /// (`.awaitGateResolution`).
+    ///
+    /// Cleared in `handleOpening()` (a fresh open must never inherit a
+    /// stale deferred hold from a previous one) and consumed (read once,
+    /// then cleared) wherever `OverlayFailureDecision.decide(
+    /// gateResolvedHold:)` is called.
+    private var deferredResolveHold: Duration?
+
     // MARK: - Live video on open (gateopener-12h.6)
 
     /// The in-flight, open-triggered `DoorVideoSession`, if any. `nil`
@@ -317,6 +342,28 @@ final class OverlayWindowController {
     /// state delivery to a torn-down controller) and so a same-session
     /// re-`setContent` is never attempted from two different call sites.
     private var openVideoFrameView: DoorVideoFrameView?
+
+    /// `true` once `openVideoSession` has reached `.streaming` at least once
+    /// for the CURRENT session — i.e. the live feed actually replaced the
+    /// canned animation via `setContent(_:)` in the `.streaming` case below.
+    /// Reset to `false` every time a fresh session is started
+    /// (`startOpenVideoSessionIfEnabled(decision: .replace)`).
+    ///
+    /// Read by `handleOpenVideoSessionEnded()` (gateopener-6s8.3) to tell
+    /// apart two very different situations that both arrive as `.ended`:
+    /// - `false` (`.ended` arrived before ever streaming — the session was
+    ///   superseded/stopped/timed out while still connecting): this is a
+    ///   FAILURE from the panel's perspective, indistinguishable in effect
+    ///   from `handleOpenVideoState(_:)`'s `.failed` case, so it must go
+    ///   through the exact same `OverlayFailureDecision` path rather than
+    ///   hiding immediately — hiding immediately here, before `GateState`
+    ///   has even resolved, would yank the panel out from under a still-
+    ///   in-progress open.
+    /// - `true` (`.ended` arrived after real live video was shown): the
+    ///   user has been watching the feed for as long as ~28-30s and
+    ///   `GateState` resolved long ago — the existing immediate-hide
+    ///   behavior is exactly right and is left unchanged.
+    private var openVideoDidStream = false
 
     /// Downstream observer of `GateState`, shaped like
     /// `NotificationPresenter.handle(_:)`: never called from `openGate()`'s
@@ -441,6 +488,10 @@ final class OverlayWindowController {
     /// idempotent and are what keep the panel visible for this open too.
     private func handleOpening() {
         cancelPendingResolve()
+        // gateopener-6s8.3: a fresh open must never inherit a stale deferred
+        // hold left over from a previous open's failed video session — see
+        // the `deferredResolveHold` doc comment above.
+        deferredResolveHold = nil
         panel?.alphaValue = 1
         let decision = DoorVideoSessionRetention.decision(forExistingPhase: openVideoSession?.state.phase)
         if decision == .replace {
@@ -492,6 +543,9 @@ final class OverlayWindowController {
         guard appSettings.autoShowDoorVideoOnOpen, let makeDoorVideoSession else { return }
         guard let session = makeDoorVideoSession() else { return }
 
+        // gateopener-6s8.3: a fresh session starts having never streamed —
+        // see the `openVideoDidStream` doc comment above.
+        openVideoDidStream = false
         openVideoSession = session
 
         let frameView = DoorVideoFrameView(
@@ -523,50 +577,117 @@ final class OverlayWindowController {
     /// is deliberately much narrower: `.idle`/`.connecting` do nothing (the
     /// canned animation is already covering that gap — see the
     /// `openVideoSession` doc comment above), `.streaming` swaps the panel's
-    /// content to the live feed, and `.ended`/`.failed` tear the video down
-    /// WITHOUT hiding the panel via the video path — `.failed` in
-    /// particular must leave the canned animation's own already-scheduled
-    /// (or already-elapsed) hold-then-fade in full control, exactly as if
-    /// video had never been attempted (failure-must-degrade requirement).
+    /// content to the live feed, and `.ended`/`.failed` tear the video down.
     /// `.ended` DOES still need to hide the panel — that happens via
     /// `handleOpenVideoSessionEnded()` below, not from this switch directly,
     /// since `DoorVideoFrameView`'s plateau detector (not
     /// `DoorVideoSession.state` reaching `.ended`, which per
     /// `DoorVideoSession`'s own doc comment never fires on its own) is the
     /// primary end-of-session signal per the bead's explicit instruction.
+    ///
+    /// gateopener-6s8.3: `.failed` no longer simply swallows the failure and
+    /// assumes "the canned animation's own GateState-driven hold-then-fade"
+    /// is already running — THAT WAS THE BUG: when a video failure arrives
+    /// after `GateState` already resolved (`handleResolved(holdDuration:)`
+    /// returned early because this very session was in flight — see that
+    /// method's doc comment), no such sequence was ever scheduled, and
+    /// nothing was left to hide the panel. After tearing the session down,
+    /// this now asks `OverlayFailureDecision.decide(gateResolvedHold:)`
+    /// whether `GateState` already resolved (`.scheduleFade`) or has not
+    /// yet (`.awaitGateResolution`, in which case `handleResolved(
+    /// holdDuration:)` will run normally once it does, since
+    /// `openVideoSession` is now `nil`). `.scheduleFade` additionally shows
+    /// the failure's reason (briefly) when `OverlayFailureDecision
+    /// .showsReason(for:)` says it is short/actionable enough — see that
+    /// method's doc comment — installing a `DoorVideoConnectingView` in
+    /// place of the canned animation for the SAME hold duration, then
+    /// running the identical fade (`scheduleHoldThenFade(_:)`) that
+    /// `handleResolved(holdDuration:)` itself uses, so this is never a
+    /// second, diverging fade implementation.
     private func handleOpenVideoState(_ state: DoorVideoSessionState) {
         switch state {
         case .idle, .connecting:
             break
         case .streaming:
             guard let openVideoFrameView, openVideoSession != nil else { return }
+            openVideoDidStream = true
             setContent(openVideoFrameView)
         case .ended:
             handleOpenVideoSessionEnded()
-        case .failed:
-            // Additive-only: swallow the failure and leave the canned
-            // animation's own GateState-driven hold-then-fade as the only
-            // thing controlling the panel from here — see this method's
-            // doc comment.
+        case .failed(let message):
             teardownOpenVideoSession()
+            resolveAfterVideoFailureOrPrestreamEnd(message: message)
+        }
+    }
+
+    /// Shared tail for both failure paths that can strand the panel per
+    /// THE BUG (gateopener-6s8.3): `handleOpenVideoState(_:)`'s `.failed`
+    /// case, and `handleOpenVideoSessionEnded()`'s pre-streaming `.ended`
+    /// case (an `.ended` that arrives having never reached `.streaming` is,
+    /// from the panel's perspective, indistinguishable from a failure — see
+    /// `openVideoDidStream`'s doc comment).
+    ///
+    /// `message` is `nil` for the pre-streaming `.ended` case (there is no
+    /// human-readable failure message to show — the session simply never
+    /// produced a frame) and non-`nil` for `.failed(message:)`.
+    ///
+    /// Reads and CONSUMES `deferredResolveHold` (clears it immediately after
+    /// reading) so a second failure/end signal for the same already-
+    /// resolved open can never schedule a second fade.
+    private func resolveAfterVideoFailureOrPrestreamEnd(message: String?) {
+        let hold = deferredResolveHold
+        deferredResolveHold = nil
+
+        switch OverlayFailureDecision.decide(gateResolvedHold: hold) {
+        case .awaitGateResolution:
+            // `GateState` has not resolved yet for this open —
+            // `handleResolved(holdDuration:)` will now run unobstructed
+            // (openVideoSession is nil) and schedule its own hold-then-fade
+            // as usual. Nothing more to do here.
+            break
+        case .scheduleFade(let holdDuration):
+            if let message, OverlayFailureDecision.showsReason(for: message) {
+                setContent(DoorVideoConnectingView(size: Self.panelSize, text: message))
+            }
+            scheduleHoldThenFade(holdDuration)
         }
     }
 
     /// Invoked from `DoorVideoFrameView.onSessionEnded` (plateau/hard-
     /// timeout — the PRIMARY end-of-session signal per the bead) or from
-    /// `DoorVideoSession` reaching `.ended` on its own. Tears down the video
-    /// session and, since the video session ending is what the user's open
-    /// is now waiting on (GateState itself resolved long ago), hides the
-    /// panel directly here rather than waiting for another GateState
-    /// transition that may never arrive.
+    /// `DoorVideoSession` reaching `.ended` on its own.
     ///
     /// Idempotent: guards `openVideoSession != nil` itself, and `hide()`
     /// below also unconditionally calls `teardownOpenVideoSession()` (see
     /// that method's doc comment) — so a second call for the same session
     /// (e.g. both `DoorVideoFrameView`'s hard timeout AND a late
     /// `DoorVideoSession.ended` firing) is a harmless no-op either way.
+    ///
+    /// gateopener-6s8.3: splits on `openVideoDidStream` (captured BEFORE
+    /// `teardownOpenVideoSession()` — that method does not touch this flag,
+    /// but reading it first keeps the ordering obviously correct rather
+    /// than relying on that):
+    /// - `true` (real live video was shown before this session ended): the
+    ///   video session ending IS what the user's open was waiting on —
+    ///   `GateState` resolved long ago. Existing behavior, unchanged: hide
+    ///   the panel directly, right now.
+    /// - `false` (`.ended` arrived having never reached `.streaming` —
+    ///   e.g. superseded/stopped/timed out while still connecting): this is
+    ///   a FAILURE from the panel's perspective (see `openVideoDidStream`'s
+    ///   doc comment) and must go through the exact same
+    ///   `OverlayFailureDecision` path as `handleOpenVideoState(_:)`'s
+    ///   `.failed` case — hiding immediately here could yank the panel out
+    ///   from under an open whose `GateState` has not resolved yet.
     private func handleOpenVideoSessionEnded() {
         guard openVideoSession != nil else { return }
+        let didStream = openVideoDidStream
+        teardownOpenVideoSession()
+
+        guard didStream else {
+            resolveAfterVideoFailureOrPrestreamEnd(message: nil)
+            return
+        }
+
         panel?.alphaValue = 1
         hide()
     }
@@ -587,6 +708,17 @@ final class OverlayWindowController {
     /// itself, after calling this).
     private func teardownOpenVideoSession() {
         guard let session = openVideoSession else { return }
+        // gateopener-6s8.3, step 4: diag for the half-open-curtains mystery
+        // — if the panel's CURRENTLY INSTALLED content is still the canned
+        // animation at teardown time (i.e. `.streaming` never swapped it
+        // out), log its playback position so a future strand report can
+        // tell whether the canned clip's own playback had already stopped
+        // mid-frame by this point.
+        if let cannedAnimation = currentContent() as? GateOpenVideoView {
+            let snapshot = cannedAnimation.diagnosticPlaybackSnapshot
+            let timeDescription = snapshot.currentTimeSeconds.map { String($0) } ?? "nil"
+            Self.logger.notice("canned player at teardown: rate=\(snapshot.rate, privacy: .public) time=\(timeDescription, privacy: .public)")
+        }
         session.onStateChange = nil
         openVideoFrameView?.onSessionEnded = nil
         session.stop()
@@ -621,8 +753,40 @@ final class OverlayWindowController {
         // `false` is correct, not an oversight — `handleIdleOrNeedsSetup()`
         // has its own, separate `openVideoSession != nil` guard for this
         // same case.
-        guard openVideoSession == nil else { return }
+        //
+        // gateopener-6s8.3: record the hold duration THIS call would have
+        // used, BEFORE returning early — see the `deferredResolveHold` doc
+        // comment above. Without this, once the in-flight video session
+        // later fails/ends, nothing remembers that `GateState` already
+        // resolved (or with what hold), and the panel strands.
+        guard openVideoSession == nil else {
+            deferredResolveHold = holdDuration
+            return
+        }
 
+        scheduleHoldThenFade(holdDuration)
+    }
+
+    /// Schedules the hold-then-fade sequence: wait `holdDuration`, then fade
+    /// the panel out and hide it (`fadeOutThenHide()`).
+    ///
+    /// Extracted (gateopener-6s8.3) so `handleResolved(holdDuration:)` and
+    /// `handleOpenVideoState(_:)`'s `.failed` branch (and
+    /// `handleOpenVideoSessionEnded()`'s pre-streaming case) can share the
+    /// EXACT SAME fade code rather than duplicating it — the latter two run
+    /// this when a video failure/end arrives AFTER `GateState` already
+    /// resolved and deferred its hold (see `deferredResolveHold`/
+    /// `OverlayFailureDecision`).
+    ///
+    /// Callers must ensure `panel != nil` before calling this (this method
+    /// does not check) and must call `cancelPendingResolve()` first if a
+    /// stale pending sequence could otherwise race this new one —
+    /// `handleResolved(holdDuration:)` already does both via its own guards
+    /// above; the video-failure call sites below hold the panel from an
+    /// already-scheduled `show()` and have no earlier pending resolve to
+    /// race (any such sequence was itself either this one being scheduled
+    /// for the first time, or already consumed).
+    private func scheduleHoldThenFade(_ holdDuration: Duration) {
         isResolveFadePending = true
         pendingResolveTask = Task { [weak self] in
             do {
@@ -661,6 +825,19 @@ final class OverlayWindowController {
         // auto-reset) well before the ~28-30s video session is anywhere
         // near over; hiding here would cut the live feed off almost as
         // soon as it started.
+        //
+        // gateopener-6s8.3: this guard's early return no longer strands the
+        // panel. `handleResolved(holdDuration:)` now records the hold it
+        // would have used in `deferredResolveHold` before returning early
+        // for this same reason, and once the in-flight video session later
+        // fails or ends pre-streaming, `handleOpenVideoState(_:)`/
+        // `handleOpenVideoSessionEnded()` always resolve that deferred hold
+        // via `OverlayFailureDecision` — either scheduling the hold-then-
+        // fade immediately, or (if `GateState` has not resolved yet) simply
+        // clearing `openVideoSession`, at which point THIS method's guard
+        // above no longer applies and a subsequent `.idle`/`.needsSetup`
+        // hides the panel normally. Either way, every video failure now
+        // ends in a scheduled fade — see `resolveAfterVideoFailureOrPrestreamEnd(message:)`.
         guard openVideoSession == nil else { return }
         guard panel != nil else { return }
         panel?.alphaValue = 1
