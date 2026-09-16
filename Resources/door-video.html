@@ -30,10 +30,13 @@ window.__state = {
   log: [],
 };
 
-// Non-trickle signaling cannot use a partial SDP snapshot. The observed
-// iPhone path needed ~10.45s for its server-reflexive candidates, so allow
-// 15s, then fail explicitly rather than publishing a host-only stale offer.
+// Non-trickle signaling uses one bounded, immutable SDP snapshot. Prefer a
+// normal complete gathering event, but after 15s a snapshot may proceed only
+// when the actual localDescription contains a valid UDP srflx/relay candidate.
+// A host-only or malformed SDP still fails explicitly at the deadline.
 const ICE_GATHERING_TIMEOUT_MS = 15000;
+const ICE_WAIT_COMPLETE = "complete";
+const ICE_WAIT_DEADLINE_CANDIDATE = "deadline-with-gathered-candidate";
 
 function negotiationError(code, message) {
   const error = new Error(message);
@@ -51,9 +54,118 @@ function iceGatheringClosedError() {
   return error;
 }
 
-function waitForIceGatheringComplete(pc) {
+function iceGatheringTimeoutError() {
+  const error = negotiationError(
+    "ice-gathering-timeout",
+    "ICE gathering did not produce a usable bounded snapshot within 15 seconds"
+  );
+  diag("negotiation failed: " + error.code + " after " + ICE_GATHERING_TIMEOUT_MS + "ms");
+  return error;
+}
+
+function isValidIPv4Address(address) {
+  const octets = address.split(".");
+  return octets.length === 4 && octets.every((octet) =>
+    /^(0|[1-9]\d{0,2})$/.test(octet) && Number(octet) <= 255
+  );
+}
+
+// Validates IPv6 syntax without assuming a particular address range. This
+// accepts compressed and IPv4-embedded forms, including NAT64 addresses.
+function isValidIPv6Address(address) {
+  const zoneIndex = address.indexOf("%");
+  if (zoneIndex !== -1) {
+    if (address.indexOf("%", zoneIndex + 1) !== -1 ||
+        !/^[A-Za-z0-9_.~-]+$/.test(address.substring(zoneIndex + 1))) {
+      return false;
+    }
+    address = address.substring(0, zoneIndex);
+  }
+  if (address.indexOf(":") === -1 || !/^[0-9A-Fa-f:.]+$/.test(address)) {
+    return false;
+  }
+  if ((address.match(/::/g) || []).length > 1) return false;
+
+  const compressed = address.indexOf("::") !== -1;
+  const sides = compressed ? address.split("::") : [address];
+  const groups = [];
+  for (const side of sides) {
+    if (!side) continue;
+    for (const group of side.split(":")) {
+      if (!group) return false;
+      groups.push(group);
+    }
+  }
+
+  let groupCount = groups.length;
+  const ipv4Groups = groups.filter((group) => group.indexOf(".") !== -1);
+  if (ipv4Groups.length > 1) return false;
+  if (ipv4Groups.length === 1) {
+    if (groups[groups.length - 1] !== ipv4Groups[0] ||
+        !address.endsWith(ipv4Groups[0]) ||
+        !isValidIPv4Address(ipv4Groups[0])) {
+      return false;
+    }
+    groupCount += 1; // An embedded IPv4 address occupies two 16-bit groups.
+  }
+  for (const group of groups) {
+    if (group.indexOf(".") === -1 && !/^[0-9A-Fa-f]{1,4}$/.test(group)) {
+      return false;
+    }
+  }
+  return compressed ? groupCount < 8 : groupCount === 8;
+}
+
+function isValidCandidateAddress(address) {
+  return isValidIPv4Address(address) || isValidIPv6Address(address);
+}
+
+function isUnsignedIntegerInRange(token, minimum, maximum) {
+  return /^\d+$/.test(token) &&
+    Number.isSafeInteger(Number(token)) &&
+    Number(token) >= minimum &&
+    Number(token) <= maximum;
+}
+
+// A deadline fallback is based only on a real, structurally valid SDP
+// candidate line. Candidate events are deliberately ignored because they can
+// race localDescription updates and cannot be the published non-trickle SDP.
+function isQualifyingDeadlineCandidateLine(line) {
+  const parts = line.trim().split(/\s+/);
+  if (parts.length < 8 || !/^a=candidate:\S+$/.test(parts[0])) return false;
+
+  const type = parts[7] ? parts[7].toLowerCase() : "";
+  if (!isUnsignedIntegerInRange(parts[1], 1, 256) ||
+      parts[2].toLowerCase() !== "udp" ||
+      !isUnsignedIntegerInRange(parts[3], 0, 4294967295) ||
+      !isValidCandidateAddress(parts[4]) ||
+      !isUnsignedIntegerInRange(parts[5], 1, 65535) ||
+      parts[6] !== "typ" ||
+      (type !== "srflx" && type !== "relay")) {
+    return false;
+  }
+
+  for (let index = 8; index < parts.length; index += 2) {
+    if (index + 1 >= parts.length) return false;
+    const name = parts[index].toLowerCase();
+    const value = parts[index + 1];
+    if (name === "raddr" && !isValidCandidateAddress(value)) return false;
+    if (name === "rport" && !isUnsignedIntegerInRange(value, 0, 65535)) return false;
+  }
+  return true;
+}
+
+function sdpHasQualifyingDeadlineCandidate(sdp) {
+  if (typeof sdp !== "string") return false;
+  return sdp.split(/\r?\n/).some((line) =>
+    line.indexOf("a=candidate:") === 0 &&
+    isQualifyingDeadlineCandidateLine(line)
+  );
+}
+
+function waitForBoundedIceSnapshot(pc) {
   if (pc.iceGatheringState === "complete") {
-    return Promise.resolve();
+    return Promise.resolve(ICE_WAIT_COMPLETE);
   }
 
   return new Promise((resolve, reject) => {
@@ -77,7 +189,7 @@ function waitForIceGatheringComplete(pc) {
     };
     const checkComplete = () => {
       if (pc.iceGatheringState === "complete") {
-        finish(resolve);
+        finish(() => resolve(ICE_WAIT_COMPLETE));
       }
     };
     const checkClosed = () => {
@@ -94,12 +206,13 @@ function waitForIceGatheringComplete(pc) {
     pc.addEventListener("signalingstatechange", checkClosed);
     window.__state.cancelGathering = cancel;
     timer = setTimeout(() => {
-      const error = negotiationError(
-        "ice-gathering-timeout",
-        "ICE gathering did not complete within 15 seconds"
-      );
-      diag("negotiation failed: " + error.code + " after " + ICE_GATHERING_TIMEOUT_MS + "ms");
-      finish(() => reject(error));
+      const sdp = pc.localDescription && pc.localDescription.sdp;
+      if (sdpHasQualifyingDeadlineCandidate(sdp)) {
+        diag("ICE wait result: deadline with gathered UDP srflx/relay candidate");
+        finish(() => resolve(ICE_WAIT_DEADLINE_CANDIDATE));
+      } else {
+        finish(() => reject(iceGatheringTimeoutError()));
+      }
     }, ICE_GATHERING_TIMEOUT_MS);
 
     // Cover a close/complete transition that raced listener installation.
@@ -185,8 +298,8 @@ function summarizeRemoteCandidates(answerSdp) {
 
 // Builds the RTCPeerConnection, wires up ontrack and the recvonly
 // audio+video transceivers (audio first -- the door's answer generation is
-// m-line-order sensitive), creates the offer, and waits for non-trickle ICE
-// gathering to complete. Called exactly once per page load.
+// m-line-order sensitive), creates the offer, and waits for a bounded
+// non-trickle ICE snapshot. Called exactly once per page load.
 async function negotiate() {
   window.__state.offerReady = false;
   window.__state.offerSdp = null;
@@ -286,17 +399,32 @@ async function negotiate() {
 
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);
-  logMsg("setLocalDescription done, waiting for ICE gathering complete...");
+  logMsg("setLocalDescription done, waiting for bounded ICE snapshot...");
 
-  await waitForIceGatheringComplete(pc);
+  const iceWaitResult = await waitForBoundedIceSnapshot(pc);
   if (window.__state.pc !== pc ||
       pc.connectionState === "closed" ||
       pc.signalingState === "closed") {
     throw iceGatheringClosedError();
   }
 
-  logMsg("ICE gathering complete, offer ready");
-  window.__state.offerSdp = pc.localDescription.sdp;
+  // Capture exactly once after the close/replacement guard. If the deadline
+  // path qualified an earlier localDescription but the final one lost that
+  // candidate, fail rather than publishing an empty/host-only offer.
+  const offerSdp = pc.localDescription && pc.localDescription.sdp;
+  if (iceWaitResult === ICE_WAIT_DEADLINE_CANDIDATE &&
+      !sdpHasQualifyingDeadlineCandidate(offerSdp)) {
+    throw iceGatheringTimeoutError();
+  }
+
+  if (iceWaitResult === ICE_WAIT_COMPLETE) {
+    logMsg("ICE gathering complete, offer ready");
+    diag("ICE snapshot published: complete");
+  } else {
+    logMsg("ICE gathering deadline reached with gathered UDP srflx/relay candidate, offer ready");
+    diag("ICE snapshot published: deadline with gathered candidate");
+  }
+  window.__state.offerSdp = offerSdp;
   window.__state.offerReady = true;
 }
 

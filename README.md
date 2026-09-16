@@ -196,9 +196,13 @@ capture a diagnostic report and attach it to the issue:
 
 On iPhone, copy **Settings > Video diagnostics** after the failed View
 attempt. `Video network setup timed out` (and the corresponding
-`ice-gathering-timeout` diagnostic) means ICE gathering did not complete
-within the bounded 15-second window; the app deliberately did not send an
-incomplete non-trickle offer. Check that the expected Wi-Fi, VPN, or
+`ice-gathering-timeout` diagnostic) means the bounded 15-second ICE wait
+ended without a usable non-trickle snapshot. The normal path still waits for
+gathering to complete. If gathering remains stuck at the deadline, the app
+may send one immutable snapshot only when its actual SDP already contains a
+valid UDP server-reflexive or relay candidate; host-only, malformed, or
+missing SDP is rejected. This fallback does not claim full gathering or
+guarantee cellular connectivity. Check that the expected Wi-Fi, VPN, or
 Tailscale route is active, then retry View.
 
 1. Quit and relaunch GateOpener.
