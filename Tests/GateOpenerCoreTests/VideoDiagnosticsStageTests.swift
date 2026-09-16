@@ -137,6 +137,13 @@ struct VideoDiagnosticsStageTests {
         #expect(VideoDiagnosticsStage.gatheringDuration(ms: 0) == "gathering took 0ms")
     }
 
+    @Test func gatheringFailureFormat() {
+        #expect(
+            VideoDiagnosticsStage.gatheringFailed(message: "Video network setup timed out")
+                == "gathering failed: Video network setup timed out"
+        )
+    }
+
     // MARK: - offer attempt
 
     @Test func offerAttemptSuccessFormat() {

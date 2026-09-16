@@ -99,6 +99,12 @@ public enum VideoDiagnosticsStage {
         "gathering took \(ms)ms"
     }
 
+    /// Records a short mapped gathering failure, never a raw JavaScript or
+    /// WebKit error dump.
+    public static func gatheringFailed(message: String) -> String {
+        "gathering failed: \(message)"
+    }
+
     /// "door cooldown: waiting X.Xs" — recorded once, immediately before
     /// `DoorVideoSession.start()` sleeps out `DoorVideoSessionRegistry.
     /// shared.waitBeforeOffer()`'s non-zero remainder of the door's

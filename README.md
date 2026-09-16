@@ -194,6 +194,13 @@ completely — none of this is required to work on the code.
 If "View door" gets stuck on "Connecting…" or fails without a clear reason,
 capture a diagnostic report and attach it to the issue:
 
+On iPhone, copy **Settings > Video diagnostics** after the failed View
+attempt. `Video network setup timed out` (and the corresponding
+`ice-gathering-timeout` diagnostic) means ICE gathering did not complete
+within the bounded 15-second window; the app deliberately did not send an
+incomplete non-trickle offer. Check that the expected Wi-Fi, VPN, or
+Tailscale route is active, then retry View.
+
 1. Quit and relaunch GateOpener.
 2. Choose "View door" from the menu bar item and wait until the panel
    disappears (whether it succeeds or fails).

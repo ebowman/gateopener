@@ -442,7 +442,9 @@ public final class DoorVideoSession: NSObject {
             offerSDP = try await startNegotiation()
         } catch {
             recordDiag(VideoDiagnosticsStage.gatheringDuration(ms: Self.elapsedMs(since: branchStart)))
-            return .failure(message: "Could not negotiate video session")
+            let message = DoorVideoNegotiationFailure.userMessage(for: error)
+            recordDiag(VideoDiagnosticsStage.gatheringFailed(message: message))
+            return .failure(message: message)
         }
 
         recordDiag(VideoDiagnosticsStage.gatheringDuration(ms: Self.elapsedMs(since: branchStart)))

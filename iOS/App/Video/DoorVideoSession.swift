@@ -384,7 +384,9 @@ public final class DoorVideoSession: NSObject {
         do {
             offerSDP = try await startNegotiation()
         } catch {
-            state = .failed("Could not negotiate video session")
+            let message = DoorVideoNegotiationFailure.userMessage(for: error)
+            diagnostics.append("[\(Self.diagTimestamp())] gathering failed: \(message)")
+            state = .failed(message)
             return
         }
 

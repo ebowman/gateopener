@@ -20,6 +20,7 @@ window.__state = {
   pc: null,
   offerReady: false,
   offerSdp: null,
+  cancelGathering: null,
   ontrackFired: false,
   hasVideoFrame: false,
   // iOS liveness channel (gateopener-672.11): timestamp (ms, from
@@ -28,6 +29,84 @@ window.__state = {
   lastFramePostMs: 0,
   log: [],
 };
+
+// Non-trickle signaling cannot use a partial SDP snapshot. The observed
+// iPhone path needed ~10.45s for its server-reflexive candidates, so allow
+// 15s, then fail explicitly rather than publishing a host-only stale offer.
+const ICE_GATHERING_TIMEOUT_MS = 15000;
+
+function negotiationError(code, message) {
+  const error = new Error(message);
+  error.name = "DoorVideoNegotiationError";
+  error.code = code;
+  return error;
+}
+
+function iceGatheringClosedError() {
+  const error = negotiationError(
+    "ice-gathering-closed",
+    "Video session closed before ICE gathering completed"
+  );
+  diag("negotiation failed: " + error.code);
+  return error;
+}
+
+function waitForIceGatheringComplete(pc) {
+  if (pc.iceGatheringState === "complete") {
+    return Promise.resolve();
+  }
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let timer = null;
+
+    const cleanup = () => {
+      if (timer !== null) clearTimeout(timer);
+      pc.removeEventListener("icegatheringstatechange", checkComplete);
+      pc.removeEventListener("connectionstatechange", checkClosed);
+      pc.removeEventListener("signalingstatechange", checkClosed);
+      if (window.__state.cancelGathering === cancel) {
+        window.__state.cancelGathering = null;
+      }
+    };
+    const finish = (action) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      action();
+    };
+    const checkComplete = () => {
+      if (pc.iceGatheringState === "complete") {
+        finish(resolve);
+      }
+    };
+    const checkClosed = () => {
+      if (pc.connectionState === "closed" || pc.signalingState === "closed") {
+        cancel();
+      }
+    };
+    const cancel = () => {
+      finish(() => reject(iceGatheringClosedError()));
+    };
+
+    pc.addEventListener("icegatheringstatechange", checkComplete);
+    pc.addEventListener("connectionstatechange", checkClosed);
+    pc.addEventListener("signalingstatechange", checkClosed);
+    window.__state.cancelGathering = cancel;
+    timer = setTimeout(() => {
+      const error = negotiationError(
+        "ice-gathering-timeout",
+        "ICE gathering did not complete within 15 seconds"
+      );
+      diag("negotiation failed: " + error.code + " after " + ICE_GATHERING_TIMEOUT_MS + "ms");
+      finish(() => reject(error));
+    }, ICE_GATHERING_TIMEOUT_MS);
+
+    // Cover a close/complete transition that raced listener installation.
+    checkClosed();
+    checkComplete();
+  });
+}
 
 function logMsg(msg) {
   const line = `[${new Date().toISOString()}] ${msg}`;
@@ -209,23 +288,14 @@ async function negotiate() {
   await pc.setLocalDescription(offer);
   logMsg("setLocalDescription done, waiting for ICE gathering complete...");
 
-  await new Promise((resolve) => {
-    if (pc.iceGatheringState === 'complete') {
-      resolve();
-      return;
-    }
-    const check = () => {
-      if (pc.iceGatheringState === 'complete') {
-        pc.removeEventListener('icegatheringstatechange', check);
-        resolve();
-      }
-    };
-    pc.addEventListener('icegatheringstatechange', check);
-    // Safety timeout in case gathering never completes.
-    setTimeout(resolve, 8000);
-  });
+  await waitForIceGatheringComplete(pc);
+  if (window.__state.pc !== pc ||
+      pc.connectionState === "closed" ||
+      pc.signalingState === "closed") {
+    throw iceGatheringClosedError();
+  }
 
-  logMsg("ICE gathering complete (or timed out), offer ready");
+  logMsg("ICE gathering complete, offer ready");
   window.__state.offerSdp = pc.localDescription.sdp;
   window.__state.offerReady = true;
 }
@@ -574,6 +644,9 @@ window.markClosing = function () {
 // session was ever started, or if called more than once.
 window.closeSession = function () {
   stopSelectedPairPolling();
+  if (window.__state.cancelGathering) {
+    window.__state.cancelGathering();
+  }
   const pc = window.__state.pc;
   if (pc) {
     try {

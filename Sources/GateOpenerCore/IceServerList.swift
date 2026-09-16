@@ -61,9 +61,8 @@ public enum IceServerList {
     ///
     /// RISK: adding more STUN servers can lengthen how long ICE gathering
     /// takes to reach `iceGatheringState === 'complete'` when one of them
-    /// is unreachable — `door-video.html` waits up to 8s for gathering to
-    /// finish. Not measured by this change; flagged for the human's
-    /// hardware check.
+    /// is unreachable — `door-video.html` waits up to 15s, then rejects
+    /// negotiation rather than sending an incomplete non-trickle offer.
     public static let extraStunURLs = [
         "stun:stun1.l.google.com:19302",
         "stun:stun2.l.google.com:19302",
