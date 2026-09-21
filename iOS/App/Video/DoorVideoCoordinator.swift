@@ -53,6 +53,14 @@ final class DoorVideoCoordinator {
     /// auto-clear timer nils `session` out.
     private(set) var sessionState: DoorVideoSession.State = .idle
 
+    /// Mirrors the current session's `cooldownUntil` (bead gateopener-41m.9)
+    /// so `MainView` can tell the user the video panel is waiting out a
+    /// door-busy cooldown before it issues the `rtc/offer` PUT. `nil` when
+    /// no session exists, or the current session is not waiting out a
+    /// cooldown. Cleared to `nil` on `dismiss()` and whenever the auto-clear
+    /// timer nils `session` out — same lifecycle as `sessionState`.
+    private(set) var cooldownUntil: Date?
+
     /// Number of times `makeSession()` has actually been invoked (i.e. a
     /// NEW session was created, as opposed to an existing one being
     /// retained). `internal` (not `private`) so a unit test (bead
@@ -116,6 +124,7 @@ final class DoorVideoCoordinator {
         session = nil
         isPanelVisible = false
         sessionState = .idle
+        cooldownUntil = nil
     }
 
     /// Shared retain-or-replace policy for `startForOpen()`/`viewDoor()`:
@@ -137,14 +146,28 @@ final class DoorVideoCoordinator {
         sessionStartCount += 1
         session = newSession
         isPanelVisible = false
+        cooldownUntil = nil
 
         newSession.onStateChange = { [weak self] state in
             self?.handleStateChange(state, for: newSession)
+        }
+        newSession.onCooldownChange = { [weak self] cooldownUntil in
+            self?.handleCooldownChange(cooldownUntil, for: newSession)
         }
 
         Task {
             await newSession.start()
         }
+    }
+
+    /// Publishes `cooldownUntil` on every change to the current session's
+    /// own `cooldownUntil` (bead gateopener-41m.9). Guarded by identity
+    /// (`for: newSession`), same as `handleStateChange`, so a stale callback
+    /// from a session that has since been replaced/dismissed can never
+    /// clobber the current one.
+    private func handleCooldownChange(_ cooldownUntil: Date?, for changedSession: DoorVideoSession) {
+        guard session === changedSession else { return }
+        self.cooldownUntil = cooldownUntil
     }
 
     /// Publishes `isPanelVisible` on every state transition and schedules
@@ -184,6 +207,7 @@ final class DoorVideoCoordinator {
             guard let self, self.session === changedSession else { return }
             self.session = nil
             self.sessionState = .idle
+            self.cooldownUntil = nil
         }
     }
 }

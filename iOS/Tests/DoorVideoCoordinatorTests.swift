@@ -118,4 +118,90 @@ struct DoorVideoCoordinatorTests {
         #expect(coordinator.sessionState == .streaming)
         #expect(coordinator.isPanelVisible == true)
     }
+
+    // MARK: - cooldownUntil publishes and clears (bead gateopener-41m.9)
+
+    /// The coordinator mirrors its current session's `cooldownUntil` via
+    /// `onCooldownChange`, and clears it back to `nil` once the session
+    /// clears it (e.g. the cooldown wait finishes) — driven end-to-end
+    /// through a real session's `onCooldownChange` callback (not a fake),
+    /// using the same wiring `startOrRetain()` sets up for `onStateChange`.
+    ///
+    /// MUTATION CHECK: removing the `newSession.onCooldownChange = { ... }`
+    /// wiring in `DoorVideoCoordinator.startOrRetain()` would leave
+    /// `coordinator.cooldownUntil` `nil` forever, failing the first
+    /// `#expect(coordinator.cooldownUntil != nil)` below.
+    @Test func cooldownUntilPublishesThenClears() async {
+        let session = DoorVideoSession.debugStub(connectingDelay: 10, streamingDuration: 10)
+        let coordinator = DoorVideoCoordinator(makeSession: { session }, isEnabled: { true })
+
+        coordinator.startForOpen()
+        await Task.yield()
+
+        // No real cooldown occurs on the debug-stub timeline; drive the
+        // session's own `onCooldownChange` directly (as `waitOutCooldownIfNeeded()`
+        // would) to prove the coordinator's wiring/identity-guard/publish
+        // path works end-to-end.
+        let deadline = Date().addingTimeInterval(5)
+        session.onCooldownChange?(deadline)
+        #expect(coordinator.cooldownUntil == deadline)
+
+        session.onCooldownChange?(nil)
+        #expect(coordinator.cooldownUntil == nil)
+    }
+
+    /// `dismiss()` clears `cooldownUntil` immediately, mirroring
+    /// `sessionState`'s reset to `.idle`.
+    ///
+    /// MUTATION CHECK: removing `cooldownUntil = nil` from `dismiss()` would
+    /// leave a stale deadline behind after dismissal, failing the final
+    /// `#expect`.
+    @Test func dismissClearsCooldownUntil() async {
+        let session = DoorVideoSession.debugStub(connectingDelay: 10, streamingDuration: 10)
+        let coordinator = DoorVideoCoordinator(makeSession: { session }, isEnabled: { true })
+
+        coordinator.startForOpen()
+        await Task.yield()
+
+        session.onCooldownChange?(Date().addingTimeInterval(5))
+        #expect(coordinator.cooldownUntil != nil)
+
+        coordinator.dismiss()
+        #expect(coordinator.cooldownUntil == nil)
+    }
+
+    /// A stale `onCooldownChange` callback from a session that has since
+    /// been replaced must NOT clobber the current session's `cooldownUntil`
+    /// — the same identity guard `handleStateChange` already relies on.
+    ///
+    /// MUTATION CHECK: removing the `guard session === changedSession else
+    /// { return }` in `handleCooldownChange` would let the stale session's
+    /// callback below overwrite `coordinator.cooldownUntil` back to a
+    /// non-nil value, failing the final `#expect`.
+    @Test func staleCooldownCallbackFromReplacedSessionIsIgnored() async {
+        let firstSession = DoorVideoSession.debugStub(connectingDelay: 10, streamingDuration: 10)
+        var callCount = 0
+        let sessions = [firstSession, DoorVideoSession.debugStub(connectingDelay: 10, streamingDuration: 10)]
+        let coordinator = DoorVideoCoordinator(
+            makeSession: {
+                defer { callCount += 1 }
+                return sessions[callCount]
+            },
+            isEnabled: { true }
+        )
+
+        coordinator.startForOpen()
+        await Task.yield()
+
+        // Replace the session: stop the first one to let a fresh
+        // startForOpen() build a second.
+        coordinator.dismiss()
+        coordinator.startForOpen()
+        await Task.yield()
+
+        // The now-stale first session fires its callback late.
+        firstSession.onCooldownChange?(Date().addingTimeInterval(5))
+
+        #expect(coordinator.cooldownUntil == nil)
+    }
 }

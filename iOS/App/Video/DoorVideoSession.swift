@@ -156,6 +156,22 @@ public final class DoorVideoSession: NSObject {
                 // is guaranteed to leave a persisted log regardless of
                 // which code path produced it.
                 persistDiagnostics()
+
+                // Registry bookkeeping lives at this SAME choke point (bead
+                // gateopener-41m.9), for the identical reason: EVERY terminal
+                // transition — `stop()`, `endDueToLiveness(reason:)`,
+                // `endDueToNoFirstFrame()` (the first-frame-timeout path from
+                // gateopener-41m.8, which ends via `performLivenessTeardown`
+                // AFTER the offer was accepted), and every early-return
+                // `.failed` inside `start()` — passes through here exactly
+                // once (this `didSet` already only fires on a genuine value
+                // change). See `DoorVideoSessionRegistry.
+                // shouldRecordEnd(offerAccepted:)`'s doc comment for why a
+                // session that never had its offer accepted must NOT record
+                // an end.
+                if DoorVideoSessionRegistry.shouldRecordEnd(offerAccepted: offerAccepted) {
+                    registry.recordSessionEnded()
+                }
             case .streaming:
                 // Bead gateopener-672.30: iOS pauses/refuses inline media
                 // playback in a hidden (opacity-0) web view, and by the
@@ -188,12 +204,50 @@ public final class DoorVideoSession: NSObject {
     private let appSettings: AppSettings
     private let urlSession: URLSession
 
+    /// The `DoorVideoSessionRegistry` consulted for the door-busy cooldown
+    /// (bead gateopener-41m.9), mirroring macOS's `DoorVideoSession`, which
+    /// always uses `DoorVideoSessionRegistry.shared`. Injectable (default
+    /// `.shared`) purely so tests can supply an isolated instance rather
+    /// than mutating the process-wide singleton.
+    private let registry: DoorVideoSessionRegistry
+
+    /// Sleeps out the door-busy cooldown computed from `registry`. Injected
+    /// (default `Task.sleep(for:)`) so tests can observe/skip the actual
+    /// wait without a real delay.
+    private let cooldownSleep: (Duration) async throws -> Void
+
     /// Guards `stop()` idempotency and lets `start()`'s in-flight guards
     /// (`guard !hasStopped else { return }`) bail out promptly if `stop()`
     /// races an in-progress `start()`. `start()` itself is re-entrant per
     /// `GateOpenerCore.DoorVideoSessionRetention` — see that method's doc
     /// comment — rather than guarded by a separate "already started" flag.
     private var hasStopped = false
+
+    /// Set to `true` the instant an `rtc/offer` PUT is accepted (HTTP 200)
+    /// by the door. Consulted at every terminal transition (`.ended`,
+    /// `.failed`, `stop()`) via `DoorVideoSessionRegistry.
+    /// shouldRecordEnd(offerAccepted:)` to decide whether that transition
+    /// should call `registry.recordSessionEnded()` — a session that never
+    /// occupied the door's one session slot must NOT start a busy-cooldown
+    /// window for the NEXT attempt. Mirrors macOS's `DoorVideoSession.
+    /// offerAccepted` exactly.
+    private var offerAccepted = false
+
+    /// Non-`nil` while `start()` is sleeping out a door-busy cooldown before
+    /// issuing the `rtc/offer` PUT (bead gateopener-41m.9); the deadline the
+    /// wait is sleeping until. `nil` at every other time (before the wait
+    /// starts, after it ends, and on every terminal transition). Surfaced to
+    /// `DoorVideoCoordinator` via `onCooldownChange`.
+    private(set) var cooldownUntil: Date? {
+        didSet {
+            guard oldValue != cooldownUntil else { return }
+            onCooldownChange?(cooldownUntil)
+        }
+    }
+
+    /// Invoked on every `cooldownUntil` change. Always invoked on the main
+    /// actor, mirroring `onStateChange`.
+    public var onCooldownChange: ((Date?) -> Void)?
 
     private var pageLoadContinuation: CheckedContinuation<Void, Never>?
 
@@ -231,13 +285,17 @@ public final class DoorVideoSession: NSObject {
         gateClient: any GateOpening,
         appSettings: AppSettings,
         urlSession: URLSession = .shared,
-        firstFrameTimeout: TimeInterval = 10
+        firstFrameTimeout: TimeInterval = 10,
+        registry: DoorVideoSessionRegistry = .shared,
+        cooldownSleep: @escaping (Duration) async throws -> Void = { try await Task.sleep(for: $0) }
     ) {
         self.tokenManager = tokenManager
         self.gateClient = gateClient
         self.appSettings = appSettings
         self.urlSession = urlSession
         self.firstFrameTimeout = firstFrameTimeout
+        self.registry = registry
+        self.cooldownSleep = cooldownSleep
 
         let config = WKWebViewConfiguration()
         // Without these two, iOS refuses to autoplay the <video> element
@@ -407,9 +465,24 @@ public final class DoorVideoSession: NSObject {
 
         guard !hasStopped else { return }
 
+        // Wait out any remaining door-busy cooldown from a PRIOR session in
+        // this process (see `DoorVideoBusyPolicy`/`DoorVideoSessionRegistry`)
+        // before issuing the offer PUT at all. `state` stays `.connecting`
+        // throughout — mirrors macOS's `DoorVideoSession.start()` exactly.
+        await waitOutCooldownIfNeeded()
+
+        // `stop()` may have been called while sleeping out the cooldown
+        // above — no offer PUT may be sent in that case.
+        guard !hasStopped else { return }
+
         let answerSDP: String
         do {
             answerSDP = try await putOfferWithRetry(endpointId: endpointId, token: token, sdp: offerSDP)
+        } catch let DoorVideoSessionError.offer(outcome) {
+            Self.logger.error("rtc/offer failed: \(String(describing: outcome), privacy: .public)")
+            let message = DoorVideoBusyPolicy.failureMessage(for: outcome)
+            state = .failed(message)
+            return
         } catch {
             Self.logger.error("rtc/offer failed after retry: \(String(describing: error), privacy: .public)")
             state = .failed("Could not reach door camera")
@@ -445,6 +518,7 @@ public final class DoorVideoSession: NSObject {
     public func stop() {
         guard !hasStopped else { return }
         hasStopped = true
+        cooldownUntil = nil
 
         diagnostics.append("[\(Self.diagTimestamp())] terminal reason: stopped")
         persistDiagnostics()
@@ -590,6 +664,38 @@ public final class DoorVideoSession: NSObject {
             .replacingOccurrences(of: "$", with: "\\$")
         let js = "return await window.applyAnswer(`\(escaped)`);"
         _ = try await webView.callAsyncJavaScript(js, contentWorld: .page)
+    }
+
+    /// Consults `registry.waitBeforeOffer()` and, if positive, sets
+    /// `cooldownUntil` to the resulting deadline and sleeps it out via the
+    /// injected `cooldownSleep` closure before returning — a dedicated,
+    /// `WKWebView`-free seam (bead gateopener-41m.9) factored out of
+    /// `start()` so it can be exercised directly by a test (with a fake
+    /// `registry`/`cooldownSleep`) without driving the rest of `start()`'s
+    /// WKWebView/network pipeline.
+    ///
+    /// `cooldownUntil` is set BEFORE the sleep and cleared in a `defer` (so
+    /// it is also cleared if `cooldownSleep` throws, e.g. a cancelled
+    /// `Task.sleep` from `stop()` racing this wait) — a `stop()` called
+    /// during the wait leaves no stale `cooldownUntil` behind, and the
+    /// caller's own `guard !hasStopped` immediately after this returns is
+    /// what prevents the offer PUT itself from ever being sent in that case.
+    /// `state` is left untouched here — it stays whatever the caller already
+    /// set it to (`.connecting`) — this is not a new user-visible phase.
+    ///
+    /// `internal` (not `private`) so `@testable import GateOpener` test
+    /// targets can call it directly.
+    func waitOutCooldownIfNeeded() async {
+        let cooldown = registry.waitBeforeOffer()
+        guard cooldown > .zero else { return }
+
+        let deadline = Date().addingTimeInterval(
+            Double(cooldown.components.seconds) + Double(cooldown.components.attoseconds) / 1e18
+        )
+        cooldownUntil = deadline
+        diagnostics.append("[\(Self.diagTimestamp())] door-busy cooldown wait: \(deadline.timeIntervalSinceNow)s")
+        defer { cooldownUntil = nil }
+        try? await cooldownSleep(cooldown)
     }
 
     /// Calls `door-video.html`'s `window.ensurePlaying()` and appends the
@@ -758,6 +864,7 @@ public final class DoorVideoSession: NSObject {
     private func performLivenessTeardown(reason: String) -> Bool {
         guard !hasStopped else { return false }
         hasStopped = true
+        cooldownUntil = nil
 
         diagnostics.append("[\(Self.diagTimestamp())] terminal reason: \(reason)")
         persistDiagnostics()
@@ -817,12 +924,35 @@ public final class DoorVideoSession: NSObject {
 
     private struct OfferResponse: Decodable { let answer: String }
 
-    private func putOffer(endpointId: String, token: String, sdp: String, sessionId: String) async throws -> String {
+    /// Maps a `URLError` (the request never reached the door at all) to a
+    /// `DoorVideoBusyPolicy.OfferOutcome` via `DoorVideoBusyPolicy.classify`
+    /// — a pure, `WKWebView`/network-free seam (bead gateopener-41m.9) so
+    /// the "500 -> no retry, URLError -> retry" decision can be exercised in
+    /// a test without an actual `URLSession` round trip. `internal` (not
+    /// `private`) so `@testable import GateOpener` test targets can call it
+    /// directly.
+    static func classifyTransportFailure(_ urlError: URLError) -> DoorVideoBusyPolicy.OfferOutcome {
+        let transportError: DoorVideoBusyPolicy.OfferTransportError = urlError.code == .timedOut ? .timedOut : .other
+        return DoorVideoBusyPolicy.classify(httpStatus: nil, transportError: transportError)
+    }
+
+    /// A single `rtc/offer` PUT attempt, classified via
+    /// `DoorVideoBusyPolicy.classify(httpStatus:transportError:)` rather than
+    /// thrown as a raw HTTP-status/transport `Error` — mirrors macOS's
+    /// `DoorVideoSession.putOfferOnce` exactly (including the malformed-URL
+    /// fallback to `.network`, an unreachable-in-practice programmer-error
+    /// path).
+    private func putOfferOnce(
+        endpointId: String,
+        token: String,
+        sdp: String,
+        sessionId: String
+    ) async -> (outcome: DoorVideoBusyPolicy.OfferOutcome, answer: String?) {
         // '#' -> %23 only, matching the proven recipe (NOT full percent
         // encoding, which the door's signaling backend does not expect).
         let encodedEndpoint = endpointId.replacingOccurrences(of: "#", with: "%23")
         guard let url = URL(string: "\(ComelitAPI.baseURL)/servicerest/devicecom/endpoint/\(encodedEndpoint)/rtc/offer") else {
-            throw DoorVideoSessionError.invalidURL
+            return (.network, nil)
         }
         var request = URLRequest(url: url)
         request.httpMethod = "PUT"
@@ -830,73 +960,106 @@ public final class DoorVideoSession: NSObject {
         request.setValue("application/json", forHTTPHeaderField: "content-type")
         request.setValue("ktor-client", forHTTPHeaderField: "user-agent")
         let body: [String: String] = ["sessionId": sessionId, "offer": sdp]
-        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        guard let httpBody = try? JSONSerialization.data(withJSONObject: body) else {
+            return (.network, nil)
+        }
+        request.httpBody = httpBody
 
         let (data, response): (Data, URLResponse)
         do {
             (data, response) = try await urlSession.data(for: request)
+        } catch let urlError as URLError {
+            return (Self.classifyTransportFailure(urlError), nil)
         } catch {
-            throw DoorVideoSessionError.network
+            return (DoorVideoBusyPolicy.classify(httpStatus: nil, transportError: .other), nil)
         }
         guard let http = response as? HTTPURLResponse else {
-            throw DoorVideoSessionError.network
+            return (DoorVideoBusyPolicy.classify(httpStatus: nil, transportError: .other), nil)
         }
-        guard http.statusCode == 200 else {
-            throw DoorVideoSessionError.server(status: http.statusCode)
+        let outcome = DoorVideoBusyPolicy.classify(httpStatus: http.statusCode, transportError: nil)
+        guard outcome == .accepted else {
+            return (outcome, nil)
         }
-        let decoded = try JSONDecoder().decode(OfferResponse.self, from: data)
-        return decoded.answer
+        guard let decoded = try? JSONDecoder().decode(OfferResponse.self, from: data) else {
+            // The door said 200 but the body did not decode -- treat as a
+            // server-error outcome (distinct from `.doorBusy`/`.accepted`)
+            // rather than accepting a session with no usable answer SDP.
+            return (.serverError(http.statusCode), nil)
+        }
+        return (.accepted, decoded.answer)
     }
 
-    /// Wraps `putOffer` with a bounded retry — same semantics as macOS's
-    /// `DoorVideoSession.putOfferWithRetry`: 2 attempts total, retryable
-    /// only on HTTP 500/network errors, a fresh `sessionId` per attempt,
-    /// the SAME offer SDP reused across attempts.
+    /// Issues the `rtc/offer` PUT with the same policy as macOS's
+    /// `DoorVideoSession.putOfferWithRetry`: ONE attempt, classified via
+    /// `DoorVideoBusyPolicy.classify`. Per that policy's `shouldRetry`, the
+    /// ONLY retryable outcome is `.network` — retried exactly ONCE, after
+    /// 500ms, with a FRESH `sessionId`. Every other outcome (`.doorBusy`,
+    /// `.unauthorized`, `.serverError`, `.timedOut`) is NOT retried and
+    /// thrown immediately as `DoorVideoSessionError.offer(outcome)` so
+    /// `start()` can map the SPECIFIC outcome via
+    /// `DoorVideoBusyPolicy.failureMessage(for:)`.
+    ///
+    /// The SAME offer SDP is reused across the one allowed retry
+    /// (deliberately NOT regenerated) — see macOS's doc comment on the same
+    /// method for why.
+    ///
+    /// On `.accepted`, records `registry.recordSessionAccepted(at:)` and
+    /// sets `offerAccepted = true` (consulted at every terminal transition
+    /// via `DoorVideoSessionRegistry.shouldRecordEnd(offerAccepted:)`)
+    /// before returning the answer SDP.
+    ///
+    /// Every `await` in this func is followed by a `hasStopped` check before
+    /// any further diagnostics/registry side effect, so a `stop()` racing an
+    /// in-flight PUT or the retry's sleep cannot record a diag line or
+    /// registry mutation after the session has been torn down.
     private func putOfferWithRetry(endpointId: String, token: String, sdp: String) async throws -> String {
-        let policy = RetryPolicy(
-            maxAttempts: 2,
-            baseDelay: .milliseconds(500),
-            maxTotalDelay: .seconds(2),
-            requestTimeout: .seconds(5)
-        )
+        let maxAttempts = 2 // one attempt + at most one .network retry
 
-        var lastError: Error = DoorVideoSessionError.network
-        for attempt in 1...policy.maxAttempts {
+        for attempt in 1...maxAttempts {
+            guard !hasStopped else { throw DoorVideoSessionError.offer(.network) }
+
             let sessionId = UUID().uuidString.lowercased()
             let attemptStart = Date()
-            do {
-                let answer = try await putOffer(endpointId: endpointId, token: token, sdp: sdp, sessionId: sessionId)
-                let latencyMs = Int(Date().timeIntervalSince(attemptStart) * 1000)
-                Self.logger.notice("rtc/offer attempt \(attempt, privacy: .public)/\(policy.maxAttempts, privacy: .public) succeeded")
-                diagnostics.append("[\(Self.diagTimestamp())] rtc/offer attempt \(attempt)/\(policy.maxAttempts) status=200 latencyMs=\(latencyMs)")
-                return answer
-            } catch {
-                let latencyMs = Int(Date().timeIntervalSince(attemptStart) * 1000)
-                lastError = error
-                let retryable: Bool
-                if case DoorVideoSessionError.server(let status) = error, status == 500 {
-                    retryable = true
-                } else if case DoorVideoSessionError.network = error {
-                    retryable = true
-                } else {
-                    retryable = false
-                }
-                Self.logger.notice("rtc/offer attempt \(attempt, privacy: .public)/\(policy.maxAttempts, privacy: .public) failed: \(String(describing: error), privacy: .public), retryable=\(retryable, privacy: .public)")
-                let statusDescription: String
-                if case DoorVideoSessionError.server(let status) = error {
-                    statusDescription = "\(status)"
-                } else {
-                    statusDescription = "network-error"
-                }
-                diagnostics.append("[\(Self.diagTimestamp())] rtc/offer attempt \(attempt)/\(policy.maxAttempts) status=\(statusDescription) latencyMs=\(latencyMs) retryable=\(retryable)")
+            let (outcome, answer) = await putOfferOnce(endpointId: endpointId, token: token, sdp: sdp, sessionId: sessionId)
+            let latencyMs = Int(Date().timeIntervalSince(attemptStart) * 1000)
 
-                guard retryable, attempt < policy.maxAttempts else {
-                    throw error
-                }
-                try? await policy.sleep(policy.baseDelay)
+            guard !hasStopped else { throw DoorVideoSessionError.offer(.network) }
+
+            if outcome == .accepted, let answer {
+                Self.logger.notice("rtc/offer attempt \(attempt, privacy: .public)/\(maxAttempts, privacy: .public) succeeded")
+                diagnostics.append("[\(Self.diagTimestamp())] rtc/offer attempt \(attempt)/\(maxAttempts) status=200 latencyMs=\(latencyMs)")
+                offerAccepted = true
+                registry.recordSessionAccepted(at: Date())
+                return answer
             }
+
+            let retryable = DoorVideoBusyPolicy.shouldRetry(outcome)
+            Self.logger.notice("rtc/offer attempt \(attempt, privacy: .public)/\(maxAttempts, privacy: .public) failed: \(String(describing: outcome), privacy: .public), retryable=\(retryable, privacy: .public)")
+
+            let diagLabel = DoorVideoBusyPolicy.diagLabel(for: outcome)
+            let statusDescription: String
+            switch outcome {
+            case .doorBusy:
+                statusDescription = "500 \(diagLabel)"
+            case .serverError(let status):
+                statusDescription = "\(status) \(diagLabel)"
+            case .unauthorized, .timedOut, .network, .accepted:
+                statusDescription = diagLabel
+            }
+            diagnostics.append("[\(Self.diagTimestamp())] rtc/offer attempt \(attempt)/\(maxAttempts) status=\(statusDescription) latencyMs=\(latencyMs) retryable=\(retryable)")
+
+            guard !hasStopped else { throw DoorVideoSessionError.offer(outcome) }
+
+            guard retryable, attempt < maxAttempts else {
+                throw DoorVideoSessionError.offer(outcome)
+            }
+
+            try? await Task.sleep(for: .milliseconds(500))
+            guard !hasStopped else { throw DoorVideoSessionError.offer(outcome) }
         }
-        throw lastError
+        // Unreachable: the loop above always either returns or throws on
+        // its final iteration.
+        throw DoorVideoSessionError.offer(.network)
     }
 
     // MARK: - Diagnostics (bead gateopener-672.27)
@@ -993,14 +1156,29 @@ extension DoorVideoSession {
     ///     flipping to `.streaming`. Defaults to 2s.
     ///   - streamingDuration: How long `state` stays `.streaming` before
     ///     flipping to `.ended`. Defaults to 8s.
+    ///   - registry: The `DoorVideoSessionRegistry` this stub is constructed
+    ///     with. Defaults to a FRESH, isolated instance (NOT `.shared`) —
+    ///     bead gateopener-41m.9's edge case: `debugStub` must not consult
+    ///     the process-wide registry unless a caller opts in explicitly by
+    ///     passing one (e.g. a test asserting registry interaction), since
+    ///     other tests rely on `debugStub`'s instant, side-effect-free
+    ///     starts and must not have their timing perturbed by a busy-cooldown
+    ///     left behind by an unrelated real session. In practice this stub's
+    ///     canned timeline never calls into the registry either way (it never
+    ///     reaches `putOfferWithRetry` or the terminal-state registry hook's
+    ///     `offerAccepted` check, which is always `false` here) — the fresh
+    ///     instance is defensive/documentation-of-intent rather than
+    ///     load-bearing today.
     public static func debugStub(
         connectingDelay: TimeInterval = 2,
-        streamingDuration: TimeInterval = 8
+        streamingDuration: TimeInterval = 8,
+        registry: DoorVideoSessionRegistry = DoorVideoSessionRegistry()
     ) -> DoorVideoSession {
         let session = DoorVideoSession(
             tokenManager: TokenManager(api: ComelitAPI(), credentialStore: DebugStubNullCredentialStore()),
             gateClient: DebugStubNullGateOpening(),
-            appSettings: AppSettings(defaults: UserDefaults(suiteName: "ie.boboco.GateOpener.debugStub") ?? .standard)
+            appSettings: AppSettings(defaults: UserDefaults(suiteName: "ie.boboco.GateOpener.debugStub") ?? .standard),
+            registry: registry
         )
         session.debugStubTimeline = (connectingDelay: connectingDelay, streamingDuration: streamingDuration)
         return session
@@ -1049,9 +1227,12 @@ private struct DebugStubNullGateOpening: GateOpening {
 enum DoorVideoSessionError: Error, Equatable {
     case cameraNotFound
     case negotiationFailed
-    case invalidURL
-    case network
-    case server(status: Int)
+    /// Wraps a classified `rtc/offer` failure outcome so callers (`start()`)
+    /// can distinguish `.doorBusy`/`.unauthorized`/`.timedOut`/`.network`/
+    /// `.serverError` and map each to its own `DoorVideoSession.State.failed`
+    /// message via `DoorVideoBusyPolicy.failureMessage(for:)`. Mirrors
+    /// macOS's `DoorVideoSessionError.offer` exactly.
+    case offer(DoorVideoBusyPolicy.OfferOutcome)
 }
 
 // MARK: - WKNavigationDelegate
