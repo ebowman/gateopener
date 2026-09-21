@@ -155,6 +155,22 @@ final class DoorVideoCoordinator {
     /// any wait of its own.
     private let renewSleep: (Duration) async throws -> Void
 
+    /// Emits one-line, timestamped coordinator/pin events (bead
+    /// gateopener-41m.20) — "pin on", "pin off (user)", "pin renew #n
+    /// (after ended|failed: <message>)", "pin backoff <s>s (failures=n)",
+    /// "pin stop: <reason>", "cooldown wait <s>s", "dismiss (...)",
+    /// "auto-start (foreground)" — so a pinned viewing period's renewal/
+    /// backoff/stop history survives independently of any single session's
+    /// diagnostics.
+    ///
+    /// Defaults to a NO-OP so every existing test-construction call site
+    /// (`DoorVideoCoordinatorTests`, none of which pass `eventSink:`) stays
+    /// hermetic and unchanged — it never writes to any `UserDefaults`
+    /// unless a test opts in by passing its own sink. `GateOpenerIOSApp`
+    /// wires the real sink (a `VideoDiagnostics.appendEvent(_:to:)` writer
+    /// on the shared app-group defaults).
+    private let eventSink: (String) -> Void
+
     /// True while the video is pinned (bead gateopener-41m.14): while
     /// pinned, a session that finishes (`.ended`/`.failed`) is replaced
     /// with a fresh one per `pinPolicy`, instead of the panel simply
@@ -234,6 +250,7 @@ final class DoorVideoCoordinator {
     ///   - now: Defaults to `Date.init`. See `now`'s doc comment.
     ///   - renewSleep: Defaults to `Task.sleep(for:)`. See `renewSleep`'s doc
     ///     comment.
+    ///   - eventSink: Defaults to a no-op. See `eventSink`'s doc comment.
     init(
         makeSession: @escaping @MainActor () -> DoorVideoSession,
         isEnabled: @escaping () -> Bool,
@@ -241,7 +258,8 @@ final class DoorVideoCoordinator {
         autoClearDelay: Duration = .seconds(1),
         pinPolicy: DoorVideoPinPolicy = DoorVideoPinPolicy(),
         now: @escaping () -> Date = Date.init,
-        renewSleep: @escaping (Duration) async throws -> Void = { try await Task.sleep(for: $0) }
+        renewSleep: @escaping (Duration) async throws -> Void = { try await Task.sleep(for: $0) },
+        eventSink: @escaping (String) -> Void = { _ in }
     ) {
         self.makeSession = makeSession
         self.isEnabled = isEnabled
@@ -250,6 +268,7 @@ final class DoorVideoCoordinator {
         self.pinPolicy = pinPolicy
         self.now = now
         self.renewSleep = renewSleep
+        self.eventSink = eventSink
     }
 
     /// Time remaining in the current pin's total budget
@@ -278,6 +297,7 @@ final class DoorVideoCoordinator {
             consecutiveFailures = 0
             pinStopMessage = nil
             pinRenewalCount = 0
+            eventSink("pin on")
 
             let phase = session?.state.phase
             if phase != .connecting, phase != .streaming {
@@ -289,6 +309,7 @@ final class DoorVideoCoordinator {
             pinRenewalCount = 0
             renewTask?.cancel()
             renewTask = nil
+            eventSink("pin off (user)")
         }
     }
 
@@ -322,6 +343,7 @@ final class DoorVideoCoordinator {
     /// than replaced.
     func startForForeground() {
         guard isAutoStartEnabled() else { return }
+        eventSink("auto-start (foreground)")
         startOrRetain()
     }
 
@@ -331,7 +353,16 @@ final class DoorVideoCoordinator {
     /// gateopener-41m.14): both the user closing the panel and the app
     /// backgrounding are treated as ending any active pin, and the pin is
     /// never persisted across either.
-    func dismiss() {
+    ///
+    /// - Parameter reason: A short, human-readable tag identifying WHY this
+    ///   was called (bead gateopener-41m.20's `eventSink` event, logged as
+    ///   `"dismiss (<reason>)"`), e.g. `"user"` (the close button) or
+    ///   `"background"` (the scenePhase handler). Defaults to `"user"` so
+    ///   `MainView`'s existing close-button call site needs no change; the
+    ///   `scenePhase` handler in `GateOpenerIOSApp` passes `"background"`
+    ///   explicitly. Purely diagnostic — never changes this method's
+    ///   behavior or any pin/renewal logic.
+    func dismiss(reason: String = "user") {
         autoClearTask?.cancel()
         autoClearTask = nil
         renewTask?.cancel()
@@ -345,6 +376,7 @@ final class DoorVideoCoordinator {
         sessionState = .idle
         cooldownUntil = nil
         lastTerminal = .none
+        eventSink("dismiss (\(reason))")
     }
 
     /// Shared retain-or-replace policy for `startForOpen()`/`viewDoor()`:
@@ -421,6 +453,10 @@ final class DoorVideoCoordinator {
     /// clobber the current one.
     private func handleCooldownChange(_ cooldownUntil: Date?, for changedSession: DoorVideoSession) {
         guard session === changedSession else { return }
+        if let cooldownUntil, self.cooldownUntil == nil {
+            let seconds = max(0, Int(cooldownUntil.timeIntervalSince(now()).rounded()))
+            eventSink("cooldown wait \(seconds)s")
+        }
         self.cooldownUntil = cooldownUntil
     }
 
@@ -446,7 +482,7 @@ final class DoorVideoCoordinator {
             if reachedStreamingThisSession {
                 consecutiveFailures = 0
             }
-            handlePinnableTermination(.ended, for: changedSession) {
+            handlePinnableTermination(.ended, message: nil, for: changedSession) {
                 // `.ended` fades out; the session is cleared the same way
                 // as `.failed`, after the same short delay, so the panel's
                 // disappear animation has time to run.
@@ -459,7 +495,7 @@ final class DoorVideoCoordinator {
                 consecutiveFailures = 0
             }
             consecutiveFailures += 1
-            handlePinnableTermination(.failed, for: changedSession) {
+            handlePinnableTermination(.failed, message: message, for: changedSession) {
                 // `.failed` hides silently (no error alert) — `lastTerminal`
                 // carries the REAL message forward so `MainView`'s
                 // placeholder can show it (bead gateopener-41m.11) once
@@ -481,6 +517,10 @@ final class DoorVideoCoordinator {
     /// - Parameters:
     ///   - outcome: how `changedSession` finished, already translated to
     ///     `DoorVideoPinPolicy.SessionOutcome`.
+    ///   - message: the `.failed(message)` message when `outcome == .failed`,
+    ///     `nil` for `.ended` — used ONLY to build the `eventSink` "pin renew"
+    ///     event text (bead gateopener-41m.20); never affects any
+    ///     pin/renewal decision.
     ///   - changedSession: the session that just finished; only consulted
     ///     for the `.renew` case's identity/mount bookkeeping.
     ///   - whenNotRenewing: the pre-existing ended/failed handling (hide the
@@ -489,6 +529,7 @@ final class DoorVideoCoordinator {
     ///     session OR a pin that has just given up.
     private func handlePinnableTermination(
         _ outcome: DoorVideoPinPolicy.SessionOutcome,
+        message: String?,
         for changedSession: DoorVideoSession,
         whenNotRenewing: () -> Void
     ) {
@@ -503,6 +544,17 @@ final class DoorVideoCoordinator {
             pinnedElapsed: now().timeIntervalSince(pinStartedAt),
             consecutiveFailures: consecutiveFailures
         )
+
+        // "ended"/"failed: <message>" fragment shared by both the immediate
+        // and backoff "pin renew #n (after ...)" event lines below.
+        let afterDescription: String = {
+            switch outcome {
+            case .ended:
+                return "ended"
+            case .failed:
+                return "failed: \(message ?? "")"
+            }
+        }()
 
         switch decision {
         case .renew(let after):
@@ -520,6 +572,7 @@ final class DoorVideoCoordinator {
                 // `.none`), no `scheduleAutoClear`.
                 isPanelVisible = true
                 pinRenewalCount += 1
+                eventSink("pin renew #\(pinRenewalCount) (after \(afterDescription))")
                 startSession(resetPanelVisible: false)
             } else {
                 // Failure backoff: leave the just-failed `changedSession`
@@ -532,6 +585,7 @@ final class DoorVideoCoordinator {
                 // and the identity guard above already ignores any further
                 // (there are none) callbacks from the terminal session.
                 isPanelVisible = true
+                eventSink("pin backoff \(Int(after))s (failures=\(consecutiveFailures))")
                 renewTask = Task { [weak self] in
                     guard let self else { return }
                     do {
@@ -543,6 +597,7 @@ final class DoorVideoCoordinator {
                     guard self.session === changedSession else { return }
                     self.isPanelVisible = true
                     self.pinRenewalCount += 1
+                    self.eventSink("pin renew #\(self.pinRenewalCount) (after \(afterDescription))")
                     self.startSession(resetPanelVisible: false)
                 }
             }
@@ -550,6 +605,7 @@ final class DoorVideoCoordinator {
             isPinned = false
             pinnedSince = nil
             pinStopMessage = DoorVideoPinPolicy.stopMessage(reason)
+            eventSink("pin stop: \(reason)")
             whenNotRenewing()
         }
     }

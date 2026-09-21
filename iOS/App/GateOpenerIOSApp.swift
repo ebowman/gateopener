@@ -105,7 +105,10 @@ struct GateOpenerIOSApp: App {
                 )
             },
             isEnabled: { environment.appSettings.autoShowDoorVideoOnOpen },
-            isAutoStartEnabled: { environment.appSettings.autoStartDoorVideoOnLaunch }
+            isAutoStartEnabled: { environment.appSettings.autoStartDoorVideoOnLaunch },
+            eventSink: { line in
+                VideoDiagnostics.appendEvent(line, to: SharedContainer.sharedDefaults() ?? .standard)
+            }
         )
 
         _environment = State(initialValue: environment)
@@ -141,7 +144,7 @@ struct GateOpenerIOSApp: App {
                 // .stop()` is idempotent, so this is always safe to call
                 // even if nothing is running) — bead gateopener-672.12 step
                 // "Wire scenePhase".
-                doorVideoCoordinator.dismiss()
+                doorVideoCoordinator.dismiss(reason: "background")
                 #if DEBUG
                 // Backgrounding also stops an in-flight `--video-harness`
                 // session, independent of `doorVideoCoordinator` (the
