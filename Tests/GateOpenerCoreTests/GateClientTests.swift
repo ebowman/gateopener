@@ -694,3 +694,208 @@ final class SleepRecorder: @unchecked Sendable {
     // attempts / HTTP requests if it were).
     #expect(script.requestCount == 0)
 }
+
+// MARK: - open: attemptObserver (gateopener-41m.1)
+
+/// A thread-safe recording fake `OpenAttemptObserving`, same `NSLock` +
+/// `@unchecked Sendable` idiom as `RequestScript`/`SleepRecorder` above.
+final class RecordingAttemptObserver: OpenAttemptObserving, @unchecked Sendable {
+    private let lock = NSLock()
+    private var _records: [OpenAttemptRecord] = []
+
+    var records: [OpenAttemptRecord] {
+        lock.lock()
+        defer { lock.unlock() }
+        return _records
+    }
+
+    func record(_ record: OpenAttemptRecord) {
+        lock.lock()
+        _records.append(record)
+        lock.unlock()
+    }
+}
+
+/// (a) 500, 500, 202 -> 3 records, willRetry true/true/false, last is
+/// success(202).
+@Test func attemptObserverRecordsThreeAttemptsOn500x2ThenSuccess() async throws {
+    let script = RequestScript(statuses: [500, 500, 202])
+    let session = makeSequencedSession(script: script)
+
+    let (tokenManager, _) = makeTokenManager()
+    let observer = RecordingAttemptObserver()
+    let client = GateClient(
+        session: session,
+        tokenManager: tokenManager,
+        retryPolicy: .noDelay(maxAttempts: 3),
+        attemptObserver: observer
+    )
+
+    try await client.open(endpointId: "VIP#OD#SB100001.1")
+
+    let records = observer.records
+    #expect(records.count == 3)
+    #expect(records.map(\.willRetry) == [true, true, false])
+    #expect(records[0].outcome == .httpFailure(status: 500))
+    #expect(records[1].outcome == .httpFailure(status: 500))
+    #expect(records[2].outcome == .success(status: 202))
+}
+
+/// (b) transport error then 202 -> first record is `.transportFailure` with
+/// the scripted `URLError` code.
+@Test func attemptObserverRecordsTransportFailureWithScriptedURLErrorCode() async throws {
+    let script = RequestScript(responses: [
+        .transportError(.networkConnectionLost),
+        ScriptedResponse(status: 202),
+    ])
+    let session = makeSequencedSession(script: script)
+
+    let (tokenManager, _) = makeTokenManager()
+    let observer = RecordingAttemptObserver()
+    let client = GateClient(
+        session: session,
+        tokenManager: tokenManager,
+        retryPolicy: .noDelay(),
+        attemptObserver: observer
+    )
+
+    try await client.open(endpointId: "VIP#OD#SB100001.1")
+
+    let records = observer.records
+    #expect(records.count == 2)
+    #expect(records[0].outcome == .transportFailure(urlErrorCode: URLError.networkConnectionLost.rawValue))
+    #expect(records[0].willRetry == true)
+    #expect(records[1].outcome == .success(status: 202))
+    #expect(records[1].willRetry == false)
+}
+
+/// (c) 403 -> 1 record, willRetry false.
+@Test func attemptObserverRecordsSingleNonRetryable403() async throws {
+    let script = RequestScript(statuses: [403, 202, 202])
+    let session = makeSequencedSession(script: script)
+
+    let (tokenManager, _) = makeTokenManager()
+    let observer = RecordingAttemptObserver()
+    let client = GateClient(
+        session: session,
+        tokenManager: tokenManager,
+        retryPolicy: .noDelay(),
+        attemptObserver: observer
+    )
+
+    await #expect(throws: Error.self) {
+        try await client.open(endpointId: "VIP#OD#SB100001.1")
+    }
+
+    let records = observer.records
+    #expect(records.count == 1)
+    #expect(records[0].outcome == .httpFailure(status: 403))
+    #expect(records[0].willRetry == false)
+}
+
+/// (d) 401 then 202 -> 2 records; the 401 attempt is recorded as
+/// `.httpFailure(401)` with `willRetry: true`.
+@Test func attemptObserverRecordsTwoAttemptsOn401ThenSuccess() async throws {
+    let script = RequestScript(statuses: [401, 202])
+    let session = makeSequencedSession(script: script)
+
+    let store = MockCredentialStore()
+    let issuing = MockTokenIssuing()
+    try store.saveCredentials(username: "alice", password: "s3cret")
+    try store.saveTokens(
+        TokenSet(accessToken: "the-token", refreshToken: "rt", expiresIn: 3600, tokenType: "bearer")
+    )
+    let tokenManager = TokenManager(api: issuing, credentialStore: store)
+
+    let observer = RecordingAttemptObserver()
+    let client = GateClient(
+        session: session,
+        tokenManager: tokenManager,
+        retryPolicy: .noDelay(),
+        attemptObserver: observer
+    )
+
+    try await client.open(endpointId: "VIP#OD#SB100001.1")
+
+    let records = observer.records
+    #expect(records.count == 2)
+    #expect(records[0].outcome == .httpFailure(status: 401))
+    #expect(records[0].willRetry == true)
+    #expect(records[1].outcome == .success(status: 202))
+    #expect(records[1].willRetry == false)
+}
+
+/// (e) token-resolution failure -> 1 `.tokenFailure` record and zero HTTP
+/// requests.
+@Test func attemptObserverRecordsTokenFailureWithZeroHTTPRequests() async throws {
+    let script = RequestScript(statuses: [202, 202, 202])
+    let session = makeSequencedSession(script: script)
+
+    let store = MockCredentialStore()
+    let issuing = MockTokenIssuing()
+    try store.saveCredentials(username: "alice", password: "wrong-password")
+    issuing.loginResult = .failure(ComelitError.invalidCredentials)
+    let tokenManager = TokenManager(api: issuing, credentialStore: store)
+
+    let observer = RecordingAttemptObserver()
+    let client = GateClient(
+        session: session,
+        tokenManager: tokenManager,
+        retryPolicy: .noDelay(maxAttempts: 3),
+        attemptObserver: observer
+    )
+
+    await #expect(throws: ComelitError.invalidCredentials) {
+        try await client.open(endpointId: "VIP#OD#SB100001.1")
+    }
+
+    #expect(script.requestCount == 0)
+
+    let records = observer.records
+    #expect(records.count == 1)
+    #expect(records[0].willRetry == false)
+    if case .tokenFailure = records[0].outcome {
+        // expected
+    } else {
+        Issue.record("expected .tokenFailure, got \(records[0].outcome)")
+    }
+}
+
+/// (f) attempt numbers are 1-based and `maxAttempts` matches the policy.
+@Test func attemptObserverRecordsAreOneBasedWithMatchingMaxAttempts() async throws {
+    let script = RequestScript(statuses: [500, 500, 500, 500, 500])
+    let session = makeSequencedSession(script: script)
+
+    let (tokenManager, _) = makeTokenManager()
+    let observer = RecordingAttemptObserver()
+    let client = GateClient(
+        session: session,
+        tokenManager: tokenManager,
+        retryPolicy: .noDelay(maxAttempts: 3),
+        attemptObserver: observer
+    )
+
+    await #expect(throws: Error.self) {
+        try await client.open(endpointId: "VIP#OD#SB100001.1")
+    }
+
+    let records = observer.records
+    #expect(records.map(\.attempt) == [1, 2, 3])
+    #expect(records.allSatisfy { $0.maxAttempts == 3 })
+}
+
+/// `attemptObserver` defaults to `nil`: `open` must behave identically to
+/// every pre-existing (non-observer) test in this file with no observer
+/// wired up at all -- this is a direct check that the parameter is optional
+/// and source-compatible with every existing call site.
+@Test func attemptObserverDefaultsToNilAndOpenStillSucceeds() async throws {
+    let script = RequestScript(statuses: [202])
+    let session = makeSequencedSession(script: script)
+
+    let (tokenManager, _) = makeTokenManager()
+    let client = GateClient(session: session, tokenManager: tokenManager, retryPolicy: .noDelay())
+
+    try await client.open(endpointId: "VIP#OD#SB100001.1")
+
+    #expect(script.requestCount == 1)
+}

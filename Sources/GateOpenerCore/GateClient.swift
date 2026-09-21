@@ -201,17 +201,29 @@ public struct GateClient: Sendable {
     private let tokenManager: TokenManager
     private let baseURL: String
     private let retryPolicy: RetryPolicy
+    /// Optional observer notified once per `open(endpointId:)` attempt. `nil`
+    /// by default, in which case `open` behaves exactly as if the observer
+    /// did not exist (see `OpenAttemptObserving`'s doc comment).
+    private let attemptObserver: (any OpenAttemptObserving)?
+    /// Injectable clock, used only to timestamp/measure attempts reported to
+    /// `attemptObserver`. Defaults to the real `Date()`/`ContinuousClock` so
+    /// production behavior is unchanged; tests can inject a fixed sequence.
+    private let now: @Sendable () -> Date
 
     public init(
         session: URLSession = .shared,
         tokenManager: TokenManager,
         baseURL: String = ComelitAPI.baseURL,
-        retryPolicy: RetryPolicy = .default
+        retryPolicy: RetryPolicy = .default,
+        attemptObserver: (any OpenAttemptObserving)? = nil,
+        now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.session = session
         self.tokenManager = tokenManager
         self.baseURL = baseURL
         self.retryPolicy = retryPolicy
+        self.attemptObserver = attemptObserver
+        self.now = now
     }
 
     // MARK: - Discovery
@@ -405,24 +417,62 @@ public struct GateClient: Sendable {
                 // This throw is unconditional and never consults
                 // `isRetryable(_:)` -- token-resolution failures are not
                 // eligible for retry at all, regardless of their type.
+                //
+                // Reported to `attemptObserver` as a single `.tokenFailure`
+                // record, `willRetry: false`, BEFORE the token failure is
+                // rethrown -- this happens before any HTTP request for this
+                // attempt, so there is no request duration to measure
+                // (`elapsedMilliseconds` is 0).
+                report(
+                    attempt: attempt,
+                    startedAt: now(),
+                    outcome: .tokenFailure(description: String(describing: error)),
+                    willRetry: false
+                )
                 throw error
             }
+
+            // Timestamp captured just before issuing this attempt's HTTP
+            // request, so `elapsedMilliseconds` measures only the request
+            // itself -- never any backoff sleep, which happens after the
+            // observer has already been notified for this attempt.
+            let attemptStartedAt = now()
 
             // Outcome of ONE HTTP attempt, classified into exactly one of:
             // success, a thrown 401 (needs its own one-shot handling above
             // ordinary retry), or an error to hand to `isRetryable(_:)`.
+            //
+            // `performRequestPreservingRawError` (rather than
+            // `performRequest`, used by `discover`) is used here so the
+            // ORIGINAL thrown error -- before it is wrapped into
+            // `ComelitError.network(String)`, which erases its type -- is
+            // still available to classify as a `URLError` for the
+            // `.transportFailure(urlErrorCode:)` observer outcome below.
             do {
-                let (data, response) = try await performRequest(request)
+                let (data, response) = try await performRequestPreservingRawError(request)
 
                 guard let httpResponse = response as? HTTPURLResponse else {
                     let error = ComelitError.network("non-HTTP response from endpoint/power")
                     lastError = error
-                    if attempt == retryPolicy.maxAttempts || !isRetryable(error) { throw error }
+                    let willRetry = !(attempt == retryPolicy.maxAttempts || !isRetryable(error))
+                    report(
+                        attempt: attempt,
+                        startedAt: attemptStartedAt,
+                        outcome: .transportFailure(urlErrorCode: -1),
+                        willRetry: willRetry
+                    )
+                    if !willRetry { throw error }
                     try await backoffAndAdvance(attempt: attempt, totalDelay: &totalDelay)
                     continue
                 }
 
                 if httpResponse.statusCode == 202 || httpResponse.statusCode == 200 {
+                    report(
+                        attempt: attempt,
+                        startedAt: attemptStartedAt,
+                        outcome: .success(status: httpResponse.statusCode),
+                        willRetry: false
+                    )
                     return
                 }
 
@@ -434,12 +484,25 @@ public struct GateClient: Sendable {
                     if !didInvalidateFor401 {
                         didInvalidateFor401 = true
                         await tokenManager.invalidate()
-                        if attempt == retryPolicy.maxAttempts { throw error }
+                        let willRetry = attempt != retryPolicy.maxAttempts
+                        report(
+                            attempt: attempt,
+                            startedAt: attemptStartedAt,
+                            outcome: .httpFailure(status: 401),
+                            willRetry: willRetry
+                        )
+                        if !willRetry { throw error }
                         try await backoffAndAdvance(attempt: attempt, totalDelay: &totalDelay)
                         continue
                     } else {
                         // Already retried once for a 401 with a fresh token
                         // and still got 401: do not loop forever.
+                        report(
+                            attempt: attempt,
+                            startedAt: attemptStartedAt,
+                            outcome: .httpFailure(status: 401),
+                            willRetry: false
+                        )
                         throw error
                     }
                 }
@@ -449,18 +512,43 @@ public struct GateClient: Sendable {
 
                 guard isRetryable(error) else {
                     // Non-retryable 4xx (e.g. 400, 403): fail fast.
+                    report(
+                        attempt: attempt,
+                        startedAt: attemptStartedAt,
+                        outcome: .httpFailure(status: httpResponse.statusCode),
+                        willRetry: false
+                    )
                     throw error
                 }
 
-                if attempt == retryPolicy.maxAttempts { throw error }
+                let willRetry = attempt != retryPolicy.maxAttempts
+                report(
+                    attempt: attempt,
+                    startedAt: attemptStartedAt,
+                    outcome: .httpFailure(status: httpResponse.statusCode),
+                    willRetry: willRetry
+                )
+                if !willRetry { throw error }
                 try await backoffAndAdvance(attempt: attempt, totalDelay: &totalDelay)
                 continue
             } catch {
-                // Reached for: transport errors thrown by `performRequest`
-                // (already wrapped as `ComelitError.network` -- see below),
-                // and the non-HTTP-response / non-retryable-status / 401
-                // cases above that `throw` out of the inner `do` once their
-                // own attempt budget or retryability check says to stop.
+                // Cancellation is never reported and always rethrown as-is
+                // -- an observer record for a cancelled attempt would be
+                // misleading (no outcome was actually decided), and `open`
+                // must still propagate cancellation exactly as before this
+                // bead's change.
+                if error is CancellationError { throw error }
+
+                // Reached for: transport errors thrown by
+                // `performRequestPreservingRawError` (a `RawTransportError`
+                // wrapping the original error -- see below), and the
+                // non-HTTP-response / non-retryable-status / 401 cases above
+                // that `throw` out of the inner `do` once their own attempt
+                // budget or retryability check says to stop (already
+                // reported to `attemptObserver` at their own throw site
+                // above, where the concrete HTTP status was known -- see
+                // `RawTransportError` handling below for why they are not
+                // reported again here).
                 //
                 // A single call to `isRetryable(_:)` decides retry vs.
                 // rethrow for EVERYTHING that lands here, so a transport
@@ -471,16 +559,43 @@ public struct GateClient: Sendable {
                 // handling could run, since `performRequest` had already
                 // wrapped the error).
                 let classified: Error
-                if let comelitError = error as? ComelitError {
+                if let rawTransportError = error as? RawTransportError {
+                    // A genuine transport failure from
+                    // `performRequestPreservingRawError`, not yet reported to
+                    // `attemptObserver` -- report it here, with the real
+                    // `URLError.code.rawValue` when available.
+                    classified = ComelitError.network(rawTransportError.underlying.localizedDescription)
+                    lastError = classified
+                    let willRetry = !(attempt == retryPolicy.maxAttempts || !isRetryable(classified))
+                    let urlErrorCode = (rawTransportError.underlying as? URLError)?.code.rawValue ?? -1
+                    report(
+                        attempt: attempt,
+                        startedAt: attemptStartedAt,
+                        outcome: .transportFailure(urlErrorCode: urlErrorCode),
+                        willRetry: willRetry
+                    )
+                } else if let comelitError = error as? ComelitError {
+                    // Already reported above, at its own throw site.
                     classified = comelitError
+                    lastError = classified
                 } else {
-                    // Should not normally happen (performRequest wraps
-                    // everything into ComelitError.network), but handle
-                    // defensively: treat unknown thrown errors as
-                    // transport-like and retryable.
-                    classified = ComelitError.network(error.localizedDescription)
+                    // Should not normally happen (every error reaching here
+                    // is either a `RawTransportError` or a `ComelitError`
+                    // thrown above), but handle defensively: treat unknown
+                    // thrown errors as transport-like and retryable, and
+                    // report them (never previously reported, since they are
+                    // neither of the recognized cases above).
+                    let fallback = ComelitError.network(error.localizedDescription)
+                    classified = fallback
+                    lastError = classified
+                    let willRetry = !(attempt == retryPolicy.maxAttempts || !isRetryable(fallback))
+                    report(
+                        attempt: attempt,
+                        startedAt: attemptStartedAt,
+                        outcome: .transportFailure(urlErrorCode: -1),
+                        willRetry: willRetry
+                    )
                 }
-                lastError = classified
 
                 if attempt == retryPolicy.maxAttempts || !isRetryable(classified) {
                     throw classified
@@ -550,6 +665,60 @@ public struct GateClient: Sendable {
         } catch {
             throw ComelitError.network(error.localizedDescription)
         }
+    }
+
+    /// Like `performRequest`, but on transport failure throws
+    /// `RawTransportError` (preserving the original, un-stringified error)
+    /// instead of immediately wrapping into `ComelitError.network(String)`.
+    ///
+    /// Used only by `open`, which needs the original error's type (to
+    /// extract `URLError.code.rawValue` for the `.transportFailure`
+    /// observer outcome reported to `attemptObserver`) before it is
+    /// classified. `discover` and everything else keep using
+    /// `performRequest`, which is unaffected by this addition.
+    private func performRequestPreservingRawError(_ request: URLRequest) async throws -> (Data, URLResponse) {
+        do {
+            return try await session.data(for: request)
+        } catch {
+            throw RawTransportError(underlying: error)
+        }
+    }
+
+    /// Wraps a transport-layer error exactly as thrown by `URLSession`,
+    /// before any stringification/classification -- used only internally by
+    /// `open` (via `performRequestPreservingRawError`) so the original
+    /// error's type (typically `URLError`) is still inspectable when
+    /// building the `.transportFailure(urlErrorCode:)` observer outcome.
+    private struct RawTransportError: Error {
+        let underlying: Error
+    }
+
+    /// Notify `attemptObserver` (if any) of one attempt's outcome. A no-op
+    /// when `attemptObserver` is `nil`. Synchronous and non-throwing, and
+    /// never called while holding any lock, per `OpenAttemptObserving`'s
+    /// contract.
+    private func report(
+        attempt: Int,
+        startedAt: Date,
+        outcome: OpenAttemptOutcome,
+        willRetry: Bool
+    ) {
+        guard let attemptObserver else { return }
+        let elapsedSeconds = now().timeIntervalSince(startedAt)
+        // Never negative even if `now()` is a test-injected clock that isn't
+        // monotonic; never a fractional millisecond lost to rounding-down
+        // for typical (sub-second) request durations.
+        let elapsedMilliseconds = Int(max(0, elapsedSeconds) * 1000)
+        attemptObserver.record(
+            OpenAttemptRecord(
+                timestamp: startedAt,
+                attempt: attempt,
+                maxAttempts: retryPolicy.maxAttempts,
+                outcome: outcome,
+                elapsedMilliseconds: elapsedMilliseconds,
+                willRetry: willRetry
+            )
+        )
     }
 
     /// Percent-encode an endpointId for use as a single URL path component.
