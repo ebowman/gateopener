@@ -29,6 +29,7 @@ public final class AppSettings: @unchecked Sendable {
         static let cachedGates = "ie.boboco.GateOpener.cachedGates"
         static let allowOpenWhileLocked = "ie.boboco.GateOpener.allowOpenWhileLocked"
         static let autoStartDoorVideoOnLaunch = "ie.boboco.GateOpener.autoStartDoorVideoOnLaunch"
+        static let cachedCameraEndpointId = "ie.boboco.GateOpener.cachedCameraEndpointId"
 
         /// All keys owned by `AppSettings`. Used by `reset()` so unrelated
         /// UserDefaults keys (e.g. from other parts of the app, or the test
@@ -36,7 +37,7 @@ public final class AppSettings: @unchecked Sendable {
         static let all = [
             aptId, selectedEndpointId, selectedEndpointName, lastDiscoveryDate, shortcutPreference,
             showOpenConfirmationOverlay, autoShowDoorVideoOnOpen, cachedGates, allowOpenWhileLocked,
-            autoStartDoorVideoOnLaunch,
+            autoStartDoorVideoOnLaunch, cachedCameraEndpointId,
         ]
     }
 
@@ -238,6 +239,29 @@ public final class AppSettings: @unchecked Sendable {
                 : defaults.bool(forKey: Keys.autoStartDoorVideoOnLaunch)
         }
         set { defaults.set(newValue, forKey: Keys.autoStartDoorVideoOnLaunch) }
+    }
+
+    /// The door-camera endpoint id discovered by a PAST video session (bead
+    /// gateopener-41m.19), cached so a later video session in the same
+    /// install can skip a live `gateClient.discover(aptId:)` round trip
+    /// entirely. Deliberately SEPARATE from `cachedGates` above:
+    /// `cachedGates` only ever holds the FILTERED candidate-gate list
+    /// (`GateClient.candidateGates(from:)`, restricted to power-controller/
+    /// `LOCK_GENERIC` endpoints — see `GateController.performFirstTimeSetup`/
+    /// `refreshGates`), so the camera endpoint (a `VIP`-suffixed id) can
+    /// never appear in it. `nil` means "no camera id cached yet" (first run,
+    /// or invalidated — see below) — a live discovery is required in that
+    /// case, distinguishing "we have never looked" from "we looked and there
+    /// is definitively no camera" (the latter is a per-call
+    /// `DoorVideoSessionError.cameraNotFound`, never cached).
+    ///
+    /// Setting `nil` removes the key. `DoorVideoSession` clears this back to
+    /// `nil` if a cached id's `rtc/offer` PUT ever comes back HTTP 404/410
+    /// (endpoint unknown), self-healing a stale cache without an operator
+    /// having to sign out.
+    public var cachedCameraEndpointId: String? {
+        get { defaults.string(forKey: Keys.cachedCameraEndpointId) }
+        set { defaults.set(newValue, forKey: Keys.cachedCameraEndpointId) }
     }
 
     /// True if and only if a non-empty `selectedEndpointId` is present.

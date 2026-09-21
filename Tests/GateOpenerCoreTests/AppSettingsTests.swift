@@ -387,4 +387,66 @@ struct AppSettingsTests {
 
         #expect(settings.cachedGates == [])
     }
+
+    // MARK: - cachedCameraEndpointId (bead gateopener-41m.19)
+
+    @Test func cachedCameraEndpointIdDefaultsToNilWhenUnset() {
+        let (defaults, cleanup) = makeSuite()
+        defer { cleanup() }
+
+        let settings = AppSettings(defaults: defaults)
+
+        #expect(settings.cachedCameraEndpointId == nil)
+    }
+
+    @Test func cachedCameraEndpointIdRoundTrips() {
+        let (defaults, cleanup) = makeSuite()
+        defer { cleanup() }
+
+        let settings = AppSettings(defaults: defaults)
+        settings.cachedCameraEndpointId = "endpoint-id_VIP#EN#SB100001"
+
+        #expect(settings.cachedCameraEndpointId == "endpoint-id_VIP#EN#SB100001")
+
+        // A second instance over the same suite must see the same value —
+        // proves this is actually persisted to `defaults`, not just held
+        // in an in-memory property (mutation check: an in-memory-only
+        // implementation would fail this second assertion).
+        let settingsB = AppSettings(defaults: defaults)
+        #expect(settingsB.cachedCameraEndpointId == "endpoint-id_VIP#EN#SB100001")
+    }
+
+    @Test func cachedCameraEndpointIdSetNilRemovesTheKey() {
+        let (defaults, cleanup) = makeSuite()
+        defer { cleanup() }
+
+        let settings = AppSettings(defaults: defaults)
+        settings.cachedCameraEndpointId = "endpoint-id_VIP#EN#SB100001"
+
+        // Mutation check: confirm the value is actually non-nil BEFORE
+        // clearing it, so the post-clear assertion below is proven to
+        // distinguish "clearing it worked" from "it was never set".
+        #expect(settings.cachedCameraEndpointId != nil)
+
+        settings.cachedCameraEndpointId = nil
+
+        #expect(settings.cachedCameraEndpointId == nil)
+    }
+
+    @Test func resetClearsCachedCameraEndpointId() {
+        let (defaults, cleanup) = makeSuite()
+        defer { cleanup() }
+
+        let settings = AppSettings(defaults: defaults)
+        settings.cachedCameraEndpointId = "endpoint-id_VIP#EN#SB100001"
+
+        // Mutation check: confirm the value is actually non-nil BEFORE
+        // reset(), so the post-reset assertion below is proven to
+        // distinguish "reset cleared it" from "it was never set".
+        #expect(settings.cachedCameraEndpointId != nil)
+
+        settings.reset()
+
+        #expect(settings.cachedCameraEndpointId == nil)
+    }
 }

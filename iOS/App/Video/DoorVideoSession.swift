@@ -403,14 +403,32 @@ public final class DoorVideoSession: NSObject {
 
         state = .connecting
 
-        guard let endpointId = try? await resolveCameraEndpointId() else {
-            // No camera endpoint discovered: fail immediately. See
-            // `resolveCameraEndpointId()`'s doc comment — when a camera was
-            // already known from a previous discovery
-            // (`appSettings.cachedGates`), this makes NO network call at
-            // all; only a genuinely stale/empty cache falls through to a
-            // live discovery round trip.
+        let endpointId: String
+        do {
+            endpointId = try await resolveCameraEndpointId()
+        } catch DoorVideoSessionError.cameraNotFound {
+            // A live discovery genuinely found no camera endpoint anywhere
+            // -- this IS "No camera", the only case that message should be
+            // used for. See `resolveCameraEndpointId()`'s doc comment: when
+            // a camera id was already cached (from `appSettings.
+            // cachedCameraEndpointId` or, failing that, `appSettings.
+            // cachedGates`), this makes NO network call at all; only a
+            // genuinely stale/empty cache falls through to a live discovery
+            // round trip.
             state = .failed("No camera")
+            return
+        } catch {
+            // Bead gateopener-41m.19 ROOT CAUSE fix: any OTHER failure from
+            // discovery (timeout, 5xx, offline blip, token failure) is NOT
+            // "no camera" -- it is a failed attempt to find out. Reporting
+            // it as "No camera" is what caused three transient discovery
+            // failures in a row to burn a pinned session's whole failure
+            // budget. The underlying error's SANITIZED description (case
+            // name / status code only, never a response body) is logged to
+            // diagnostics for later triage.
+            let sanitized = TokenFailureDescription.sanitizedTokenFailureDescription(error)
+            diagnostics.append("[\(Self.diagTimestamp())] camera discovery failed: \(sanitized)")
+            state = .failed("Could not reach door camera")
             return
         }
         diagnostics.append("[\(Self.diagTimestamp())] camera endpoint chosen: \(endpointId)")
@@ -489,6 +507,16 @@ public final class DoorVideoSession: NSObject {
             answerSDP = try await putOfferWithRetry(endpointId: endpointId, token: token, sdp: offerSDP)
         } catch let DoorVideoSessionError.offer(outcome) {
             Self.logger.error("rtc/offer failed: \(String(describing: outcome), privacy: .public)")
+            // Bead gateopener-41m.19 STEP 3: a 404/410 means the door/cloud
+            // no longer recognizes this endpoint id at all -- clear the
+            // cache so the NEXT session rediscovers rather than repeatedly
+            // retrying a dead id. Deliberately NOT done for `.doorBusy`
+            // (500, a normal transient condition), `.timedOut`, or
+            // `.network` -- see `shouldInvalidateCachedCamera(forHTTPStatus:)`'s
+            // doc comment.
+            if case .serverError(let status) = outcome, Self.shouldInvalidateCachedCamera(forHTTPStatus: status) {
+                appSettings.cachedCameraEndpointId = nil
+            }
             let message = DoorVideoBusyPolicy.failureMessage(for: outcome)
             state = .failed(message)
             return
@@ -574,33 +602,88 @@ public final class DoorVideoSession: NSObject {
 
     // MARK: - Camera endpoint selection
 
-    /// Selects the door camera endpoint: `friendlyName` containing "entry"
-    /// (case-insensitive) takes priority; otherwise the first endpoint
-    /// whose id ends with the known camera id suffix (`VIP#EN#SB100001`,
-    /// matched as the final `_`-separated id component). Mirrors the macOS
-    /// `DoorVideoSession.resolveCameraEndpointId()`/
-    /// `endpointIdMatchesCameraSuffix` matching logic exactly.
+    /// Selects the door camera endpoint id, in this order (bead
+    /// gateopener-41m.19, replacing the earlier `cachedGates`-first policy
+    /// that could never actually hit — see `resolveCameraEndpointId(cachedId:
+    /// cachedEndpoints:discover:persist:)`'s doc comment for the full
+    /// rationale):
     ///
-    /// Cache-then-live-discovery policy (the "no camera -> `.failed`
-    /// immediately, with no network call" edge case from this bead):
-    /// `appSettings.cachedGates` — the last locally-persisted discovery
-    /// result `GateController.discover()` already wrote, a synchronous,
-    /// no-network read — is checked FIRST. If it already contains a camera
-    /// match, that endpoint id is returned immediately with zero network
-    /// calls. Only when the cache is empty or has no camera match does this
-    /// fall back to a live `gateClient.discover(aptId:)` round trip (the
-    /// cache may simply be stale/never populated, e.g. first run before
-    /// Settings has ever loaded gates) — a live "no camera anywhere" result
-    /// is what throws `DoorVideoSessionError.cameraNotFound`.
+    ///  1. `appSettings.cachedCameraEndpointId`, if non-`nil` — a camera id
+    ///     a PAST session already discovered and persisted. Zero network
+    ///     calls.
+    ///  2. `appSettings.cachedGates` — the filtered gate-candidate cache
+    ///     (harmless to keep checking; see the seam's doc comment for why
+    ///     this can never actually match in practice, but it costs nothing
+    ///     and a future relaxation of `candidateGates` filtering could make
+    ///     it match).
+    ///  3. A live `gateClient.discover(aptId: nil)` round trip. On success,
+    ///     the found id is persisted to `appSettings.cachedCameraEndpointId`
+    ///     so the NEXT session (in this run or a future one) skips this
+    ///     round trip entirely.
+    ///
+    /// Delegates the actual ordering/persistence logic to the static,
+    /// network/WKWebView-free seam below so it is directly unit-testable.
     private func resolveCameraEndpointId() async throws -> String {
-        if let cached = Self.findCameraEndpointId(in: appSettings.cachedGates) {
+        try await Self.resolveCameraEndpointId(
+            cachedId: appSettings.cachedCameraEndpointId,
+            cachedEndpoints: appSettings.cachedGates,
+            discover: { try await self.gateClient.discover(aptId: nil) },
+            persist: { self.appSettings.cachedCameraEndpointId = $0 }
+        )
+    }
+
+    /// Pure(ish) ordering seam backing `resolveCameraEndpointId()`, factored
+    /// out so a test can exercise it with a canned `cachedId`/`cachedEndpoints`
+    /// and an injected `discover`/`persist` closure — no network, no
+    /// `WKWebView`, no real `AppSettings`.
+    ///
+    /// - Parameters:
+    ///   - cachedId: `appSettings.cachedCameraEndpointId` at call time. When
+    ///     non-`nil`, this is returned IMMEDIATELY with zero calls to
+    ///     `discover`/`persist` — this is the whole point of the cache (bead
+    ///     gateopener-41m.19's field report: every video session was paying
+    ///     for a live discovery round trip, and any transient discovery
+    ///     failure was being reported as "No camera").
+    ///   - cachedEndpoints: `appSettings.cachedGates` at call time — checked
+    ///     SECOND, only when `cachedId == nil`. Kept for parity with the
+    ///     pre-existing behavior and because it costs nothing, but as of this
+    ///     bead's root-cause finding this can never actually contain a camera
+    ///     match in production: `GateController.performFirstTimeSetup`/
+    ///     `refreshGates` only ever assign it `GateClient.candidateGates(from:)`
+    ///     output, which is filtered to power-controller/`LOCK_GENERIC`
+    ///     endpoints and therefore excludes the camera's `VIP`-suffixed id.
+    ///   - discover: Performs a live discovery round trip. Called ONLY when
+    ///     neither `cachedId` nor `cachedEndpoints` yields a match.
+    ///   - persist: Called with the discovered camera endpoint id
+    ///     immediately after a SUCCESSFUL `discover` match, before returning
+    ///     — writes `appSettings.cachedCameraEndpointId` in the real caller.
+    ///     NEVER called when `discover` throws, and NEVER called when
+    ///     `discover` succeeds but finds no camera (that path throws
+    ///     `DoorVideoSessionError.cameraNotFound` instead, leaving any
+    ///     existing cached value untouched).
+    /// - Throws: Whatever `discover` throws, propagated unchanged (nothing is
+    ///   persisted in that case); or `DoorVideoSessionError.cameraNotFound` if
+    ///   `discover` succeeds but no endpoint matches
+    ///   `findCameraEndpointId(in:)` (nothing is persisted in that case
+    ///   either).
+    static func resolveCameraEndpointId(
+        cachedId: String?,
+        cachedEndpoints: [Endpoint],
+        discover: () async throws -> [Endpoint],
+        persist: (String) -> Void
+    ) async throws -> String {
+        if let cachedId {
+            return cachedId
+        }
+        if let cached = findCameraEndpointId(in: cachedEndpoints) {
             return cached
         }
 
-        let endpoints = try await gateClient.discover(aptId: nil)
-        guard let found = Self.findCameraEndpointId(in: endpoints) else {
+        let endpoints = try await discover()
+        guard let found = findCameraEndpointId(in: endpoints) else {
             throw DoorVideoSessionError.cameraNotFound
         }
+        persist(found)
         return found
     }
 
@@ -943,6 +1026,33 @@ public final class DoorVideoSession: NSObject {
     static func classifyTransportFailure(_ urlError: URLError) -> DoorVideoBusyPolicy.OfferOutcome {
         let transportError: DoorVideoBusyPolicy.OfferTransportError = urlError.code == .timedOut ? .timedOut : .other
         return DoorVideoBusyPolicy.classify(httpStatus: nil, transportError: transportError)
+    }
+
+    /// Bead gateopener-41m.19 STEP 3 (stale-cache self-heal): whether an
+    /// `rtc/offer` PUT's HTTP response status means the endpoint id used for
+    /// that PUT is no longer valid and `appSettings.cachedCameraEndpointId`
+    /// should be cleared so the NEXT session performs a fresh live discovery
+    /// rather than repeatedly retrying a dead cached id.
+    ///
+    /// `true` ONLY for `404` (endpoint unknown to the door/cloud) and `410`
+    /// (endpoint gone — treated identically to 404 per this bead's brief,
+    /// since distinguishing them offers no different action). Every other
+    /// status — in particular `500` (door busy, a normal transient
+    /// condition, NOT a sign the endpoint id is wrong) and any other
+    /// 4xx/5xx — returns `false`. Also `false` for a `nil` status (timeouts
+    /// and other transport/network failures never reached the door at all,
+    /// so they say nothing about whether the endpoint id itself is valid).
+    ///
+    /// `internal` (not `private`) so `@testable import GateOpener` test
+    /// targets can call it directly without exercising a real `URLSession`
+    /// round trip.
+    static func shouldInvalidateCachedCamera(forHTTPStatus status: Int?) -> Bool {
+        switch status {
+        case 404, 410:
+            return true
+        default:
+            return false
+        }
     }
 
     /// A single `rtc/offer` PUT attempt, classified via
