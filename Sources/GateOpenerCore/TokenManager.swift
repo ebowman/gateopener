@@ -199,17 +199,48 @@ public actor TokenManager {
 
         // Try a refresh first, using whichever token (stored, preferentially,
         // else the stale in-memory one) carries a refresh token.
-        if let refreshable = stored ?? cachedToken,
-           refreshable.refreshToken != nil,
-           let refreshed = try? await api.refresh(refreshable) {
-            try credentialStore.saveTokens(refreshed)
-            cachedToken = refreshed
-            return refreshed.accessToken
+        if let refreshable = stored ?? cachedToken, refreshable.refreshToken != nil {
+            do {
+                let refreshed = try await api.refresh(refreshable)
+                try credentialStore.saveTokens(refreshed)
+                cachedToken = refreshed
+                return refreshed.accessToken
+            } catch let error as ComelitError {
+                if isTransportFailure(error) {
+                    // The network is genuinely bad right now (or the server
+                    // is failing/rate-limiting): escalating to a full
+                    // 2-request login would just add more load-bearing
+                    // round trips on top of a connection that already
+                    // can't complete one. If the token we already hold is
+                    // still (really, without the 5-minute skew) unexpired,
+                    // hand it back rather than throwing -- it's still
+                    // valid, just inside the proactive-renewal window.
+                    // Otherwise rethrow so the caller sees the real
+                    // network/server failure instead of a misleading login
+                    // failure.
+                    if refreshable.expiresAt > now() {
+                        return refreshable.accessToken
+                    }
+                    throw error
+                }
+                // Any other ComelitError (4xx such as invalid_grant,
+                // .invalidCredentials, .decoding, .missingRefreshToken)
+                // falls through below to a full login exactly as before --
+                // these mean the refresh token itself was
+                // rejected/consumed/rotated, and a full login is the
+                // correct, load-bearing self-healing path.
+            }
+            // A non-`ComelitError` thrown here (e.g. from
+            // `credentialStore.saveTokens`) also falls through to the full
+            // login below, matching the pre-existing `try?` behaviour for
+            // any refresh-path failure that isn't a recognized transport
+            // failure.
         }
 
-        // Refresh was unavailable or failed for any reason (expired/revoked
-        // refresh token, network error, etc.) -- silently fall through to a
-        // full login rather than surfacing the refresh failure.
+        // Refresh was unavailable, or failed with a non-transport error
+        // (expired/revoked refresh token, malformed response, etc.) --
+        // silently fall through to a full login rather than surfacing the
+        // refresh failure.
         guard let credentials = try credentialStore.loadCredentials() else {
             throw TokenManagerError.notConfigured
         }
@@ -221,5 +252,21 @@ public actor TokenManager {
         try credentialStore.saveTokens(loggedIn)
         cachedToken = loggedIn
         return loggedIn.accessToken
+    }
+
+    /// True for the `ComelitError` cases that indicate the failure is a
+    /// transport/availability problem (network is down, or the server is
+    /// failing/overloaded) rather than the refresh token itself being
+    /// rejected. These are exactly the cases where escalating to a full
+    /// login would add more doomed round trips rather than fix anything.
+    private func isTransportFailure(_ error: ComelitError) -> Bool {
+        switch error {
+        case .network:
+            return true
+        case .server(let status, _):
+            return status >= 500 || status == 429
+        case .invalidCredentials, .decoding, .missingRefreshToken:
+            return false
+        }
     }
 }

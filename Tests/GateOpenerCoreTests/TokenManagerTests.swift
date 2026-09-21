@@ -380,6 +380,141 @@ private func makeTokenSet(
     #expect(issuing.loginCallCount == 0)
 }
 
+// MARK: - Network/server failure on refresh must not escalate to login (gateopener-41m.5)
+
+@Test func refreshNetworkFailureWithTrulyExpiredTokenThrowsAndDoesNotLogin() async throws {
+    let store = MockCredentialStore()
+    let issuing = MockTokenIssuing()
+    // Truly expired (not merely inside the skew window).
+    let expired = makeTokenSet(accessToken: "old-token", expiresIn: -10)
+    try store.saveCredentials(username: "alice", password: "s3cret")
+    try store.saveTokens(expired)
+    issuing.refreshResult = .failure(ComelitError.network("offline"))
+
+    let manager = TokenManager(api: issuing, credentialStore: store)
+
+    await #expect(throws: ComelitError.network("offline")) {
+        _ = try await manager.accessToken()
+    }
+
+    #expect(issuing.refreshCallCount == 1)
+    #expect(issuing.loginCallCount == 0)
+}
+
+@Test func refreshServer500WithTrulyExpiredTokenThrowsAndDoesNotLogin() async throws {
+    let store = MockCredentialStore()
+    let issuing = MockTokenIssuing()
+    let expired = makeTokenSet(accessToken: "old-token", expiresIn: -10)
+    try store.saveCredentials(username: "alice", password: "s3cret")
+    try store.saveTokens(expired)
+    issuing.refreshResult = .failure(ComelitError.server(status: 500, body: "boom"))
+
+    let manager = TokenManager(api: issuing, credentialStore: store)
+
+    await #expect(throws: ComelitError.server(status: 500, body: "boom")) {
+        _ = try await manager.accessToken()
+    }
+
+    #expect(issuing.refreshCallCount == 1)
+    #expect(issuing.loginCallCount == 0)
+}
+
+@Test func refreshServer429WithTrulyExpiredTokenThrowsAndDoesNotLogin() async throws {
+    let store = MockCredentialStore()
+    let issuing = MockTokenIssuing()
+    let expired = makeTokenSet(accessToken: "old-token", expiresIn: -10)
+    try store.saveCredentials(username: "alice", password: "s3cret")
+    try store.saveTokens(expired)
+    issuing.refreshResult = .failure(ComelitError.server(status: 429, body: "rate limited"))
+
+    let manager = TokenManager(api: issuing, credentialStore: store)
+
+    await #expect(throws: ComelitError.server(status: 429, body: "rate limited")) {
+        _ = try await manager.accessToken()
+    }
+
+    #expect(issuing.refreshCallCount == 1)
+    #expect(issuing.loginCallCount == 0)
+}
+
+@Test func refreshServer400StillFallsThroughToLogin() async throws {
+    let store = MockCredentialStore()
+    let issuing = MockTokenIssuing()
+    let expired = makeTokenSet(accessToken: "old-token", expiresIn: -10)
+    let loggedIn = makeTokenSet(accessToken: "login-token", expiresIn: 3600)
+    try store.saveCredentials(username: "alice", password: "s3cret")
+    try store.saveTokens(expired)
+    issuing.refreshResult = .failure(ComelitError.server(status: 400, body: "invalid_grant"))
+    issuing.loginResult = .success(loggedIn)
+
+    let manager = TokenManager(api: issuing, credentialStore: store)
+    let token = try await manager.accessToken()
+
+    #expect(token == "login-token")
+    #expect(issuing.refreshCallCount == 1)
+    #expect(issuing.loginCallCount == 1)
+}
+
+@Test func refreshNetworkFailureWithinSkewGraceReturnsStoredTokenWithoutLogin() async throws {
+    let store = MockCredentialStore()
+    let issuing = MockTokenIssuing()
+    let receivedAt = Date()
+    // Real expiry is 2 minutes in the future -- inside the 5-minute skew
+    // window (so `isExpired()` treats it as needing renewal) but NOT
+    // actually expired yet.
+    let nearExpiry = makeTokenSet(accessToken: "near-expiry", expiresIn: 120)
+    try store.saveCredentials(username: "alice", password: "s3cret")
+    try store.saveTokens(nearExpiry)
+    issuing.refreshResult = .failure(ComelitError.network("offline"))
+
+    // now = expiry - 2min, i.e. `receivedAt` itself in this setup.
+    let manager = TokenManager(api: issuing, credentialStore: store, now: { receivedAt })
+
+    let token = try await manager.accessToken()
+
+    #expect(token == "near-expiry")
+    #expect(issuing.refreshCallCount == 1)
+    #expect(issuing.loginCallCount == 0)
+}
+
+@Test func refreshServer500WithinSkewGraceReturnsStoredTokenWithoutLogin() async throws {
+    let store = MockCredentialStore()
+    let issuing = MockTokenIssuing()
+    let receivedAt = Date()
+    let nearExpiry = makeTokenSet(accessToken: "near-expiry", expiresIn: 120)
+    try store.saveCredentials(username: "alice", password: "s3cret")
+    try store.saveTokens(nearExpiry)
+    issuing.refreshResult = .failure(ComelitError.server(status: 503, body: "unavailable"))
+
+    let manager = TokenManager(api: issuing, credentialStore: store, now: { receivedAt })
+
+    let token = try await manager.accessToken()
+
+    #expect(token == "near-expiry")
+    #expect(issuing.refreshCallCount == 1)
+    #expect(issuing.loginCallCount == 0)
+}
+
+@Test func prewarmSwallowsNetworkFailureAndLeavesOldTokensStored() async throws {
+    let store = MockCredentialStore()
+    let issuing = MockTokenIssuing()
+    let fixedNow = Date()
+    let soonToExpire = makeTokenSet(accessToken: "soon-to-expire", expiresIn: 300)
+    try store.saveCredentials(username: "alice", password: "s3cret")
+    try store.saveTokens(soonToExpire)
+    issuing.refreshResult = .failure(ComelitError.network("offline"))
+
+    let manager = TokenManager(api: issuing, credentialStore: store, now: { fixedNow })
+
+    await manager.prewarm() // must not throw
+
+    #expect(issuing.refreshCallCount == 1)
+    #expect(issuing.loginCallCount == 0)
+
+    let persisted = try store.loadTokens()
+    #expect(persisted?.accessToken == "soon-to-expire")
+}
+
 // MARK: - prewarm() tests
 
 @Test func prewarmWithFreshTokenMakesNoNetworkCall() async throws {
