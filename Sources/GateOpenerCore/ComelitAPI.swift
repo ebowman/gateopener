@@ -10,7 +10,16 @@ import CryptoKit
 /// the HTTP status code the server happens to return for it.
 public enum ComelitError: Error, Equatable, Sendable {
     case invalidCredentials
-    case network(String)
+    /// `code` is the originating `URLError.code.rawValue` when the failure
+    /// came from a `URLError` (offline, timed out, host unreachable, etc.),
+    /// and `nil` for every other transport-failure origin (invalid URL,
+    /// non-HTTP response, JSON body encoding failure, ...). Defaulted to
+    /// `nil` so every pre-existing `.network(message)` call site keeps
+    /// compiling unchanged; only call sites that actually observe a
+    /// `URLError` populate it, so `GateErrorMessage` can distinguish
+    /// "offline"/"timed out" from a generic transport failure without
+    /// parsing `message`.
+    case network(String, code: Int? = nil)
     case server(status: Int, body: String)
     case decoding(String)
     case missingRefreshToken
@@ -248,7 +257,13 @@ public struct ComelitAPI: Sendable {
     /// having to pattern-match back out of a thrown `ComelitError`.
     private enum TokenAttemptOutcome {
         case response(data: Data, httpResponse: HTTPURLResponse)
-        case transportFailure(String)
+        /// `code` is the originating `URLError.code.rawValue` when the
+        /// transport failure came from a `URLError`, `nil` otherwise (e.g.
+        /// an invalid URL or non-HTTP response) -- threaded straight into
+        /// `ComelitError.network(_:code:)` at the throw site in
+        /// `performTokenRequest` so an offline/timed-out token refresh maps
+        /// to the same specific message as an offline gate open.
+        case transportFailure(String, code: Int?)
     }
 
     /// POST to `/o-auth-2/token`, optionally retrying EXACTLY ONCE after a
@@ -277,8 +292,8 @@ public struct ComelitAPI: Sendable {
         }
 
         switch outcome {
-        case .transportFailure(let description):
-            throw ComelitError.network(description)
+        case .transportFailure(let description, let code):
+            throw ComelitError.network(description, code: code)
         case .response(let data, let httpResponse):
             let bodyString = String(data: data, encoding: .utf8) ?? ""
 
@@ -317,7 +332,7 @@ public struct ComelitAPI: Sendable {
     /// decision before any error-mapping happens.
     private func attemptTokenRequest(form: [String: String]) async -> TokenAttemptOutcome {
         guard let url = URL(string: "\(Self.baseURL)/o-auth-2/token") else {
-            return .transportFailure("invalid URL for /o-auth-2/token")
+            return .transportFailure("invalid URL for /o-auth-2/token", code: nil)
         }
 
         var request = URLRequest(url: url)
@@ -334,11 +349,11 @@ public struct ComelitAPI: Sendable {
         do {
             let (data, response) = try await session.data(for: request)
             guard let httpResponse = response as? HTTPURLResponse else {
-                return .transportFailure("non-HTTP response from /o-auth-2/token")
+                return .transportFailure("non-HTTP response from /o-auth-2/token", code: nil)
             }
             return .response(data: data, httpResponse: httpResponse)
         } catch {
-            return .transportFailure(error.localizedDescription)
+            return .transportFailure(error.localizedDescription, code: (error as? URLError)?.code.rawValue)
         }
     }
 

@@ -34,15 +34,120 @@ private struct WeirdError: Error {}
     #expect(message == "Wrong username or password")
 }
 
+/// `.network` with no `code` (e.g. an invalid URL or non-HTTP response, not
+/// a `URLError`), `.missingRefreshToken`, and a `.server` status that is
+/// neither >= 500 nor 429 (gateopener-41m.7's mapping leaves these
+/// unchanged) all still map to the original generic fallback.
 @Test func shortNetworkServerAndMissingRefreshTokenMapToCouldNotReachTheGate() throws {
     #expect(GateErrorMessage.short(for: ComelitError.network("offline")) == "Could not reach the gate")
-    #expect(GateErrorMessage.short(for: ComelitError.server(status: 500, body: "boom")) == "Could not reach the gate")
+    #expect(GateErrorMessage.short(for: ComelitError.server(status: 400, body: "boom")) == "Could not reach the gate")
     #expect(GateErrorMessage.short(for: ComelitError.missingRefreshToken) == "Could not reach the gate")
 }
 
 @Test func shortDecodingMapsToCouldNotReachTheGate() throws {
     let message = GateErrorMessage.short(for: ComelitError.decoding("bad json"))
     #expect(message == "Could not reach the gate")
+}
+
+// MARK: - gateopener-41m.7: specific failure messages by URLError code / HTTP status
+//
+// One assertion per row of the bead's mapping table, plus a sweep (below)
+// asserting every produced string is <= 32 characters (the small-widget /
+// speakable-dialog bound).
+
+@Test func shortNetworkNotConnectedToInternetMapsToNoInternetConnection() throws {
+    let message = GateErrorMessage.short(
+        for: ComelitError.network("offline", code: URLError.notConnectedToInternet.rawValue)
+    )
+    #expect(message == "No internet connection")
+}
+
+@Test func shortNetworkDataNotAllowedMapsToNoInternetConnection() throws {
+    let message = GateErrorMessage.short(
+        for: ComelitError.network("cellular data disabled", code: URLError.dataNotAllowed.rawValue)
+    )
+    #expect(message == "No internet connection")
+}
+
+@Test func shortNetworkInternationalRoamingOffMapsToNoInternetConnection() throws {
+    let message = GateErrorMessage.short(
+        for: ComelitError.network("roaming disabled", code: URLError.internationalRoamingOff.rawValue)
+    )
+    #expect(message == "No internet connection")
+}
+
+@Test func shortNetworkTimedOutMapsToNetworkTooSlow() throws {
+    let message = GateErrorMessage.short(
+        for: ComelitError.network("timed out", code: URLError.timedOut.rawValue)
+    )
+    #expect(message == "Network too slow - try again")
+}
+
+@Test func shortNetworkConnectionLostMapsToNetworkTooSlow() throws {
+    let message = GateErrorMessage.short(
+        for: ComelitError.network("connection lost", code: URLError.networkConnectionLost.rawValue)
+    )
+    #expect(message == "Network too slow - try again")
+}
+
+/// `cannotFindHost`/`cannotConnectToHost`/`dnsLookupFailed`/
+/// `secureConnectionFailed`, and any other transport `URLError` code not
+/// explicitly listed in the mapping, keep the unchanged generic message.
+@Test func shortNetworkOtherTransportURLErrorCodesMapToCouldNotReachTheGateUnchanged() throws {
+    let codes = [
+        URLError.cannotFindHost.rawValue,
+        URLError.cannotConnectToHost.rawValue,
+        URLError.dnsLookupFailed.rawValue,
+        URLError.secureConnectionFailed.rawValue,
+    ]
+    for code in codes {
+        let message = GateErrorMessage.short(for: ComelitError.network("transport failure", code: code))
+        #expect(message == "Could not reach the gate")
+    }
+}
+
+@Test func shortServer500MapsToGateServiceErrorWithStatus() throws {
+    let message = GateErrorMessage.short(for: ComelitError.server(status: 500, body: "boom"))
+    #expect(message == "Gate service error (500)")
+}
+
+@Test func shortServer503MapsToGateServiceErrorWithStatus() throws {
+    let message = GateErrorMessage.short(for: ComelitError.server(status: 503, body: "unavailable"))
+    #expect(message == "Gate service error (503)")
+}
+
+@Test func shortServer429MapsToGateServiceBusy() throws {
+    let message = GateErrorMessage.short(for: ComelitError.server(status: 429, body: "rate limited"))
+    #expect(message == "Gate service busy - try again")
+}
+
+/// Every string `GateErrorMessage.short(for:)` can produce must fit the
+/// small widget and be speakable -- bounded at 32 characters.
+@Test func shortAllMappedMessagesAreAtMost32Characters() throws {
+    let errors: [Error] = [
+        ComelitError.invalidCredentials,
+        ComelitError.network("offline"),
+        ComelitError.network("offline", code: URLError.notConnectedToInternet.rawValue),
+        ComelitError.network("cellular data disabled", code: URLError.dataNotAllowed.rawValue),
+        ComelitError.network("roaming disabled", code: URLError.internationalRoamingOff.rawValue),
+        ComelitError.network("timed out", code: URLError.timedOut.rawValue),
+        ComelitError.network("connection lost", code: URLError.networkConnectionLost.rawValue),
+        ComelitError.network("transport failure", code: URLError.cannotFindHost.rawValue),
+        ComelitError.server(status: 400, body: "boom"),
+        ComelitError.server(status: 500, body: "boom"),
+        ComelitError.server(status: 503, body: "unavailable"),
+        ComelitError.server(status: 429, body: "rate limited"),
+        ComelitError.decoding("bad json"),
+        ComelitError.missingRefreshToken,
+        GateClientError.noGateFound,
+        GateClientError.noEndpointsFound,
+        KeychainError.loadFailed(status: errSecInteractionNotAllowed),
+        KeychainError.decodeFailed,
+    ]
+    for error in errors {
+        let message = GateErrorMessage.short(for: error)
+        #expect(message.count <= 32, "'\(message)' (for \(error)) exceeds 32 characters")
+    }
 }
 
 /// `URLError` is not special-cased by `short(for:)` (unlike `signIn(for:)`

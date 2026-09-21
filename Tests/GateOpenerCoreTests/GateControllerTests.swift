@@ -334,8 +334,12 @@ private func makeController(
         Issue.record("expected .failed, got \(controller.state)")
         return
     }
-    #expect(message == "Could not reach the gate")
-    #expect(!message.contains("500"))
+    // gateopener-41m.7: `.server(status: 500)` now maps to a specific
+    // "Gate service error (<status>)" message (see `GateErrorMessage`)
+    // rather than the generic "Could not reach the gate" -- the status code
+    // itself is safe to surface (unlike the response body, still excluded
+    // below), and is exactly what the mapping is meant to convey.
+    #expect(message == "Gate service error (500)")
     #expect(!message.contains("very long body"))
     #expect(message.count < 60)
 }

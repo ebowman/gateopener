@@ -663,10 +663,18 @@ public struct GateClient: Sendable {
                     // `performRequestPreservingRawError`, not yet reported to
                     // `attemptObserver` -- report it here, with the real
                     // `URLError.code.rawValue` when available.
-                    classified = ComelitError.network(rawTransportError.underlying.localizedDescription)
+                    let underlyingURLErrorCode = (rawTransportError.underlying as? URLError)?.code.rawValue
+                    classified = ComelitError.network(
+                        rawTransportError.underlying.localizedDescription,
+                        code: underlyingURLErrorCode
+                    )
                     lastError = classified
                     let willRetry = !(attempt == retryPolicy.maxAttempts || !isRetryable(classified))
-                    let urlErrorCode = (rawTransportError.underlying as? URLError)?.code.rawValue ?? -1
+                    // `urlErrorCode` here is the `.transportFailure` observer
+                    // outcome's own `-1`-sentinel-on-unknown convention
+                    // (unrelated to and unchanged by `ComelitError.network`'s
+                    // new `code:`, which is `nil`, not `-1`, when unknown).
+                    let urlErrorCode = underlyingURLErrorCode ?? -1
                     report(
                         attempt: attempt,
                         startedAt: attemptStartedAt,
@@ -762,7 +770,7 @@ public struct GateClient: Sendable {
         do {
             return try await session.data(for: request)
         } catch {
-            throw ComelitError.network(error.localizedDescription)
+            throw ComelitError.network(error.localizedDescription, code: (error as? URLError)?.code.rawValue)
         }
     }
 
