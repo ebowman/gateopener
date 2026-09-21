@@ -112,6 +112,26 @@ struct DoorVideoPinPolicyTests {
         )
     }
 
+    /// A stale `consecutiveFailures` count must NEVER stop an `.ended`
+    /// outcome — only `.failed` can trigger `tooManyFailures` (rule 3 is
+    /// explicitly gated on `outcome == .failed`). This matters because the
+    /// coordinator resets `consecutiveFailures` to `0` on `.streaming`, but
+    /// a caller bug that failed to reset it before an `.ended` outcome
+    /// must not silently turn into a wrongful stop.
+    ///
+    /// MUTATION CHECK: removing the `outcome == .failed` guard from rule 3
+    /// (`if outcome == .failed, consecutiveFailures >= failureLimit`),
+    /// leaving only `consecutiveFailures >= failureLimit`, would make this
+    /// call return `.stop(.tooManyFailures)` instead, failing the
+    /// `#expect` below.
+    @Test func endedWithStaleHighFailureCountStillRenewsImmediately() {
+        let policy = DoorVideoPinPolicy()
+        #expect(
+            policy.decide(isPinned: true, outcome: .ended, pinnedElapsed: 0, consecutiveFailures: 99)
+                == .renew(after: 0)
+        )
+    }
+
     // MARK: - Defensive: negative pinnedElapsed treated as 0
 
     @Test func negativePinnedElapsedTreatedAsZeroInDecide() {

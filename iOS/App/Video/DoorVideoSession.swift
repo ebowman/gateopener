@@ -265,12 +265,14 @@ public final class DoorVideoSession: NSObject {
     private var livenessTask: Task<Void, Never>?
 
     #if DEBUG
-    /// Set only by `debugStub(connectingDelay:streamingDuration:)` below.
-    /// When non-`nil`, `start()` skips ALL real work (no network, no
+    /// Set only by `debugStub(connectingDelay:streamingDuration:failAfter:)`
+    /// below. When non-`nil`, `start()` skips ALL real work (no network, no
     /// WKWebView page load, no token resolution) and instead runs this
-    /// canned `.connecting` -> `.streaming` -> `.ended` timeline — see that
-    /// factory's doc comment.
-    private var debugStubTimeline: (connectingDelay: TimeInterval, streamingDuration: TimeInterval)?
+    /// canned timeline — see that factory's doc comment. `failAfter == nil`
+    /// runs the normal `.connecting` -> `.streaming` -> `.ended` timeline;
+    /// `failAfter == message` instead finishes as `.failed(message)` after
+    /// `connectingDelay` (never reaching `.streaming`).
+    private var debugStubTimeline: (connectingDelay: TimeInterval, streamingDuration: TimeInterval, failAfter: String?)?
     #endif
 
     /// - Parameter appSettings: Supplies `cachedGates` — the last
@@ -382,6 +384,13 @@ public final class DoorVideoSession: NSObject {
         lastFrameAt = nil
         livenessTask?.cancel()
         livenessTask = nil
+        // CARRY-OVER from 41m.9 review: without this reset, a replayed
+        // instance that fails BEFORE this new attempt's `rtc/offer` is
+        // accepted would still read the PREVIOUS attempt's `offerAccepted
+        // == true`, wrongly recording a session end / starting a bogus 15s
+        // busy-cooldown for an attempt that never actually occupied the
+        // door's one session slot.
+        offerAccepted = false
 
         #if DEBUG
         if let timeline = debugStubTimeline {
@@ -1153,9 +1162,16 @@ extension DoorVideoSession {
     ///
     /// - Parameters:
     ///   - connectingDelay: How long `state` stays `.connecting` before
-    ///     flipping to `.streaming`. Defaults to 2s.
+    ///     flipping to `.streaming` (or, when `failAfter` is non-`nil`, to
+    ///     `.failed`). Defaults to 2s.
     ///   - streamingDuration: How long `state` stays `.streaming` before
-    ///     flipping to `.ended`. Defaults to 8s.
+    ///     flipping to `.ended`. Defaults to 8s. Ignored when `failAfter` is
+    ///     non-`nil`, since that timeline never reaches `.streaming`.
+    ///   - failAfter: When non-`nil` (bead gateopener-41m.14, for testing
+    ///     `DoorVideoPinPolicy`-driven renewal on a `.failed` outcome), the
+    ///     stub finishes as `.failed(failAfter)` after `connectingDelay`
+    ///     instead of ever reaching `.streaming`. `nil` (the default) runs
+    ///     the normal `.connecting` -> `.streaming` -> `.ended` timeline.
     ///   - registry: The `DoorVideoSessionRegistry` this stub is constructed
     ///     with. Defaults to a FRESH, isolated instance (NOT `.shared`) —
     ///     bead gateopener-41m.9's edge case: `debugStub` must not consult
@@ -1172,6 +1188,7 @@ extension DoorVideoSession {
     public static func debugStub(
         connectingDelay: TimeInterval = 2,
         streamingDuration: TimeInterval = 8,
+        failAfter: String? = nil,
         registry: DoorVideoSessionRegistry = DoorVideoSessionRegistry()
     ) -> DoorVideoSession {
         let session = DoorVideoSession(
@@ -1180,7 +1197,7 @@ extension DoorVideoSession {
             appSettings: AppSettings(defaults: UserDefaults(suiteName: "ie.boboco.GateOpener.debugStub") ?? .standard),
             registry: registry
         )
-        session.debugStubTimeline = (connectingDelay: connectingDelay, streamingDuration: streamingDuration)
+        session.debugStubTimeline = (connectingDelay: connectingDelay, streamingDuration: streamingDuration, failAfter: failAfter)
         return session
     }
 
@@ -1189,10 +1206,16 @@ extension DoorVideoSession {
     /// observable effect, matching what `DoorVideoView` needs to render the
     /// "Connecting…" overlay and then the (blank, since no real page is
     /// loaded) streaming state.
-    fileprivate func runDebugStubTimeline(_ timeline: (connectingDelay: TimeInterval, streamingDuration: TimeInterval)) async {
+    fileprivate func runDebugStubTimeline(_ timeline: (connectingDelay: TimeInterval, streamingDuration: TimeInterval, failAfter: String?)) async {
         state = .connecting
         try? await Task.sleep(for: .seconds(timeline.connectingDelay))
         guard !hasStopped else { return }
+
+        if let failureMessage = timeline.failAfter {
+            hasStopped = true
+            state = .failed(failureMessage)
+            return
+        }
 
         state = .streaming
         try? await Task.sleep(for: .seconds(timeline.streamingDuration))

@@ -134,6 +134,69 @@ final class DoorVideoCoordinator {
     /// timer is ever pending.
     private var autoClearTask: Task<Void, Never>?
 
+    /// Pure renew-or-stop policy for a PINNED session finishing (bead
+    /// gateopener-41m.14). Stateless — this coordinator owns
+    /// `consecutiveFailures` and the pin's elapsed-time bookkeeping
+    /// (`pinnedSince`) and hands both to `decide(...)` on every `.ended`/
+    /// `.failed` transition of the pinned session.
+    private let pinPolicy: DoorVideoPinPolicy
+
+    /// Injected clock, following the `autoClearDelay` precedent, so tests
+    /// can simulate `pinnedElapsed` reaching `pinPolicy.maxPinnedDuration`
+    /// without a real multi-minute wait.
+    private let now: () -> Date
+
+    /// Injected sleep used ONLY for a pinned session's failure backoff
+    /// (`pinPolicy`'s `.renew(after:)` with `after > 0`) so tests can make
+    /// that wait instant. Deliberately NOT used for the door-busy cooldown
+    /// itself — `DoorVideoSession.start()` already waits that out
+    /// internally (bead gateopener-41m.9), so an `after == 0` renewal here
+    /// is always safe to start immediately without this coordinator adding
+    /// any wait of its own.
+    private let renewSleep: (Duration) async throws -> Void
+
+    /// True while the video is pinned (bead gateopener-41m.14): while
+    /// pinned, a session that finishes (`.ended`/`.failed`) is replaced
+    /// with a fresh one per `pinPolicy`, instead of the panel simply
+    /// hiding. Never persisted — always `false` on a fresh coordinator.
+    private(set) var isPinned = false
+
+    /// When the CURRENT pin started (bead gateopener-41m.14), i.e. the most
+    /// recent `setPinned(true)` call — NOT reset by individual session
+    /// renewals, so `pinPolicy`'s `maxPinnedDuration` budget is measured
+    /// against the whole pinned period. `nil` while unpinned.
+    private(set) var pinnedSince: Date?
+
+    /// Short, human-readable reason the pin most recently stopped itself
+    /// (`DoorVideoPinPolicy.stopMessage(_:)`), or `nil` if the pin was never
+    /// engaged, is still active, or was stopped by the user (`dismiss()`/
+    /// `setPinned(false)`, neither of which sets this — only a policy-driven
+    /// `.stop(reason)` does). Cleared by `setPinned(true)` and by any new
+    /// user-initiated start (`viewDoor()`/`startForOpen()`/
+    /// `startForForeground()` via `startOrRetain()`).
+    private(set) var pinStopMessage: String?
+
+    /// Number of consecutive `.failed` outcomes on the CURRENT pin, INCLUDING
+    /// the one about to be decided — reset to `0` whenever a pinned session
+    /// reaches `.streaming` (and therefore also on the `.ended` that
+    /// naturally follows a streaming session), and whenever the pin itself
+    /// (re)starts via `setPinned(true)`. `DoorVideoPinPolicy` itself is
+    /// stateless; this is the bookkeeping it depends on.
+    private var consecutiveFailures = 0
+
+    /// Whether `.streaming` was reached during the CURRENT session, checked
+    /// when that session finishes to decide whether to reset
+    /// `consecutiveFailures`. Reset to `false` every time a new session
+    /// starts.
+    private var reachedStreamingThisSession = false
+
+    /// The single pending pinned-renewal task (bead gateopener-41m.14's
+    /// failure-backoff path, `pinPolicy`'s `.renew(after:)` with
+    /// `after > 0`). At most one is ever outstanding: cancelled and
+    /// replaced by `startOrRetain()`, `dismiss()`, and `setPinned(false)`,
+    /// and by a fresh renewal superseding an earlier one.
+    private var renewTask: Task<Void, Never>?
+
     /// - Parameters:
     ///   - makeSession: Builds a fresh `DoorVideoSession` per replace. See
     ///     `makeSession`'s doc comment.
@@ -144,16 +207,65 @@ final class DoorVideoCoordinator {
     ///     is `{ true }`.
     ///   - autoClearDelay: Defaults to 1 second (this bead's brief). Exposed
     ///     for tests so they need not wait a full second.
+    ///   - pinPolicy: Defaults to `DoorVideoPinPolicy()`. See `pinPolicy`'s
+    ///     doc comment.
+    ///   - now: Defaults to `Date.init`. See `now`'s doc comment.
+    ///   - renewSleep: Defaults to `Task.sleep(for:)`. See `renewSleep`'s doc
+    ///     comment.
     init(
         makeSession: @escaping @MainActor () -> DoorVideoSession,
         isEnabled: @escaping () -> Bool,
         isAutoStartEnabled: @escaping () -> Bool = { true },
-        autoClearDelay: Duration = .seconds(1)
+        autoClearDelay: Duration = .seconds(1),
+        pinPolicy: DoorVideoPinPolicy = DoorVideoPinPolicy(),
+        now: @escaping () -> Date = Date.init,
+        renewSleep: @escaping (Duration) async throws -> Void = { try await Task.sleep(for: $0) }
     ) {
         self.makeSession = makeSession
         self.isEnabled = isEnabled
         self.isAutoStartEnabled = isAutoStartEnabled
         self.autoClearDelay = autoClearDelay
+        self.pinPolicy = pinPolicy
+        self.now = now
+        self.renewSleep = renewSleep
+    }
+
+    /// Time remaining in the current pin's total budget
+    /// (`pinPolicy.maxPinnedDuration`), or `nil` while unpinned. See
+    /// `DoorVideoPinPolicy.remaining(pinnedElapsed:)`.
+    var pinRemaining: TimeInterval? {
+        guard isPinned, let pinnedSince else { return nil }
+        return pinPolicy.remaining(pinnedElapsed: now().timeIntervalSince(pinnedSince))
+    }
+
+    /// Pins (or unpins) the door video (bead gateopener-41m.14).
+    ///
+    /// `true`: marks the pin as started now, resets the failure count, and
+    /// clears any previous `pinStopMessage`; if no session is currently
+    /// connecting/streaming, starts one via `startOrRetain()` (which itself
+    /// also clears `pinStopMessage`, harmlessly redundant with the clear
+    /// here).
+    ///
+    /// `false`: clears all pin state and cancels any pending renew task,
+    /// but deliberately does NOT touch the current session — it keeps
+    /// playing to its natural end, per this bead's STEPS.
+    func setPinned(_ on: Bool) {
+        if on {
+            isPinned = true
+            pinnedSince = now()
+            consecutiveFailures = 0
+            pinStopMessage = nil
+
+            let phase = session?.state.phase
+            if phase != .connecting, phase != .streaming {
+                startOrRetain()
+            }
+        } else {
+            isPinned = false
+            pinnedSince = nil
+            renewTask?.cancel()
+            renewTask = nil
+        }
     }
 
     /// Called on the SAME synchronous path as a gate-open request
@@ -191,10 +303,17 @@ final class DoorVideoCoordinator {
 
     /// Stops and discards the current session immediately (no animation
     /// delay) — used for the panel's explicit dismiss (X) button and for
-    /// backgrounding (`scenePhase == .background`).
+    /// backgrounding (`scenePhase == .background`). Always unpins (bead
+    /// gateopener-41m.14): both the user closing the panel and the app
+    /// backgrounding are treated as ending any active pin, and the pin is
+    /// never persisted across either.
     func dismiss() {
         autoClearTask?.cancel()
         autoClearTask = nil
+        renewTask?.cancel()
+        renewTask = nil
+        isPinned = false
+        pinnedSince = nil
         session?.stop()
         session = nil
         isPanelVisible = false
@@ -215,13 +334,46 @@ final class DoorVideoCoordinator {
         let decision = DoorVideoSessionRetention.decision(forExistingPhase: session?.state.phase)
         guard decision == .replace else { return }
 
+        // A new user/foreground-initiated start supersedes any pending
+        // pinned-renewal backoff: cancel it so at most one new session is
+        // ever created for this seam (bead gateopener-41m.14's "startForOpen()
+        // during a backoff wait -> exactly one new session").
+        renewTask?.cancel()
+        renewTask = nil
+        pinStopMessage = nil
+
+        startSession()
+    }
+
+    /// Builds and starts a genuinely fresh `DoorVideoSession` via
+    /// `makeSession()` and wires it up as the current session. Shared by
+    /// `startOrRetain()` and the pinned-renewal paths
+    /// (`handleStateChange(_:for:)`'s `.renew` handling) so there is exactly
+    /// ONE place that ever creates+starts a session — renewal must ALWAYS
+    /// use a fresh instance via `makeSession()`, never `start()` on an ended
+    /// instance (its script message handlers/navigation delegate are torn
+    /// down by `stop()`/`endDueToLiveness`, so a reused instance is silently
+    /// broken).
+    /// - Parameter resetPanelVisible: `true` (the default, used by
+    ///     `startOrRetain()`) resets `isPanelVisible` to `false` before the
+    ///     new session's own `.connecting` transition sets it back to `true`
+    ///     — the normal "nothing is showing yet" starting point. A PINNED
+    ///     `.renew(after: 0)` renewal passes `false` instead: `isPanelVisible`
+    ///     is already `true` from the session that just ended (it was
+    ///     `.connecting`/`.streaming` a moment ago), and this bead's design
+    ///     explicitly requires the panel to stay visible with no flash
+    ///     across that renew seam.
+    private func startSession(resetPanelVisible: Bool = true) {
         autoClearTask?.cancel()
         autoClearTask = nil
 
         let newSession = makeSession()
         sessionStartCount += 1
+        reachedStreamingThisSession = false
         session = newSession
-        isPanelVisible = false
+        if resetPanelVisible {
+            isPanelVisible = false
+        }
         cooldownUntil = nil
         lastTerminal = .none
 
@@ -260,23 +412,118 @@ final class DoorVideoCoordinator {
         switch state {
         case .idle:
             isPanelVisible = false
-        case .connecting, .streaming:
+        case .connecting:
             isPanelVisible = true
+        case .streaming:
+            isPanelVisible = true
+            reachedStreamingThisSession = true
         case .ended:
-            // `.ended` fades out; the session is cleared the same way as
-            // `.failed`, after the same short delay, so the panel's
-            // disappear animation has time to run.
-            isPanelVisible = false
-            lastTerminal = .ended
-            scheduleAutoClear(for: changedSession)
+            if reachedStreamingThisSession {
+                consecutiveFailures = 0
+            }
+            handlePinnableTermination(.ended, for: changedSession) {
+                // `.ended` fades out; the session is cleared the same way
+                // as `.failed`, after the same short delay, so the panel's
+                // disappear animation has time to run.
+                self.isPanelVisible = false
+                self.lastTerminal = .ended
+                self.scheduleAutoClear(for: changedSession)
+            }
         case .failed(let message):
-            // `.failed` hides silently (no error alert) — `lastTerminal`
-            // carries the REAL message forward so `MainView`'s placeholder
-            // can show it (bead gateopener-41m.11) once `session` itself is
-            // cleared below.
-            isPanelVisible = false
-            lastTerminal = .failed(message)
-            scheduleAutoClear(for: changedSession)
+            if reachedStreamingThisSession {
+                consecutiveFailures = 0
+            }
+            consecutiveFailures += 1
+            handlePinnableTermination(.failed, for: changedSession) {
+                // `.failed` hides silently (no error alert) — `lastTerminal`
+                // carries the REAL message forward so `MainView`'s
+                // placeholder can show it (bead gateopener-41m.11) once
+                // `session` itself is cleared below.
+                self.isPanelVisible = false
+                self.lastTerminal = .failed(message)
+                self.scheduleAutoClear(for: changedSession)
+            }
+        }
+    }
+
+    /// Shared `.ended`/`.failed` handling for a PINNED session (bead
+    /// gateopener-41m.14): asks `pinPolicy` what to do and either renews or
+    /// stops the pin; when unpinned (`pinPolicy` immediately returns
+    /// `.stop(.notPinned)`), falls through unchanged to `whenNotRenewing`
+    /// (today's existing ended/failed handling), exactly as before this
+    /// bead.
+    ///
+    /// - Parameters:
+    ///   - outcome: how `changedSession` finished, already translated to
+    ///     `DoorVideoPinPolicy.SessionOutcome`.
+    ///   - changedSession: the session that just finished; only consulted
+    ///     for the `.renew` case's identity/mount bookkeeping.
+    ///   - whenNotRenewing: the pre-existing ended/failed handling (hide the
+    ///     panel, publish `lastTerminal`, schedule auto-clear) — run
+    ///     whenever the policy says `.stop(_:)`, i.e. for an unpinned
+    ///     session OR a pin that has just given up.
+    private func handlePinnableTermination(
+        _ outcome: DoorVideoPinPolicy.SessionOutcome,
+        for changedSession: DoorVideoSession,
+        whenNotRenewing: () -> Void
+    ) {
+        guard isPinned, let pinStartedAt = pinnedSince else {
+            whenNotRenewing()
+            return
+        }
+
+        let decision = pinPolicy.decide(
+            isPinned: true,
+            outcome: outcome,
+            pinnedElapsed: now().timeIntervalSince(pinStartedAt),
+            consecutiveFailures: consecutiveFailures
+        )
+
+        switch decision {
+        case .renew(let after):
+            renewTask?.cancel()
+            if after <= 0 {
+                // Create + start the replacement SYNCHRONOUSLY inside this
+                // handler so `session` is never `nil` between sessions and
+                // `isPanelVisible` stays true throughout — this is what
+                // stops `startForOpen()`/`viewDoor()` racing a second offer
+                // during the gap (they see a `.connecting` session and
+                // retain). Skip the hide/auto-clear path entirely:
+                // `isPanelVisible` is left exactly as it was (`true`, since
+                // the just-ended session was `.connecting`/`.streaming`
+                // right before this), no `lastTerminal` change (stays
+                // `.none`), no `scheduleAutoClear`.
+                isPanelVisible = true
+                startSession(resetPanelVisible: false)
+            } else {
+                // Failure backoff: leave the just-failed `changedSession`
+                // mounted as `session` and `isPanelVisible` as it already
+                // was (true, from `.connecting`/`.streaming` before the
+                // failure) so the UI does not flash the "failed" placeholder
+                // during the wait — simpler than pre-creating the
+                // replacement and delaying only its `start()`, since it
+                // needs no extra "is this session started yet" bookkeeping
+                // and the identity guard above already ignores any further
+                // (there are none) callbacks from the terminal session.
+                isPanelVisible = true
+                renewTask = Task { [weak self] in
+                    guard let self else { return }
+                    do {
+                        try await self.renewSleep(.seconds(after))
+                    } catch {
+                        return
+                    }
+                    guard !Task.isCancelled else { return }
+                    guard self.session === changedSession else { return }
+                    self.isPanelVisible = true
+                    self.startSession(resetPanelVisible: false)
+                }
+            }
+        case .stop(let reason):
+            isPinned = false
+            pinnedSince = nil
+            pinStopMessage = DoorVideoPinPolicy.stopMessage(reason)
+            whenNotRenewing()
         }
     }
 

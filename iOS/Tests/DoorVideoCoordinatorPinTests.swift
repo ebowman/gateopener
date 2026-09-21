@@ -1,0 +1,436 @@
+import Foundation
+import Testing
+import GateOpenerCore
+@testable import GateOpener
+
+/// Tests for `DoorVideoCoordinator`'s pin state and bounded session renewal
+/// (bead gateopener-41m.14): `setPinned(_:)`, `pinPolicy`-driven renew/stop
+/// decisions on `.ended`/`.failed`, and the pin's interaction with
+/// `startOrRetain()`/`dismiss()`.
+@MainActor
+struct DoorVideoCoordinatorPinTests {
+    /// Polls `condition` until it returns `true` or `timeout` elapses,
+    /// mirroring the inline poll loops in `DoorVideoCoordinatorTests`.
+    private func waitUntil(timeout: TimeInterval = 2, _ condition: () -> Bool) async {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !condition(), Date() < deadline {
+            await Task.yield()
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+    }
+
+    /// No-op sleep so failure-backoff renewals in tests are instant rather
+    /// than waiting out `pinPolicy.failureBackoff` for real.
+    private func instantRenewSleep(_ duration: Duration) async throws {}
+
+    // MARK: - pinned + stub ends -> second session created
+
+    /// MUTATION CHECK: removing the `.renew` handling's `startSession()`
+    /// call in `DoorVideoCoordinator.handlePinnableTermination(_:for:whenNotRenewing:)`
+    /// (i.e. making `.renew(after: 0)` fall through to `whenNotRenewing()`
+    /// instead) would leave `sessionStartCount == 1` and eventually clear
+    /// `session` to `nil`, failing both assertions below.
+    @Test func pinnedSessionEndingStartsSecondSession() async {
+        var callCount = 0
+        let coordinator = DoorVideoCoordinator(
+            makeSession: {
+                defer { callCount += 1 }
+                // Fast connecting/streaming so `.ended` fires quickly; the
+                // SECOND session must stay `.connecting` long enough for
+                // assertions to observe it before it also ends.
+                return callCount == 0
+                    ? DoorVideoSession.debugStub(connectingDelay: 0.02, streamingDuration: 0.02)
+                    : DoorVideoSession.debugStub(connectingDelay: 10, streamingDuration: 10)
+            },
+            isEnabled: { true }
+        )
+
+        coordinator.setPinned(true)
+        await waitUntil { coordinator.sessionStartCount == 2 }
+
+        #expect(coordinator.sessionStartCount == 2)
+        #expect(coordinator.session != nil)
+    }
+
+    /// `session` is non-nil and `isPanelVisible` stays `true` throughout the
+    /// `.renew(after: 0)` seam -- the replacement must be created
+    /// synchronously inside the state-change handler, never leaving a gap
+    /// where `session == nil` or the panel flashes hidden.
+    ///
+    /// MUTATION CHECK: making the `after == 0` renewal go through
+    /// `whenNotRenewing()` (today's ended handling: `isPanelVisible = false`,
+    /// `scheduleAutoClear`) even once before starting the new session would
+    /// make `isPanelVisible` observably `false` at some point during the
+    /// poll, failing the loop's invariant check.
+    @Test func sessionNonNilAndPanelVisibleAcrossRenewSeam() async {
+        var callCount = 0
+        let coordinator = DoorVideoCoordinator(
+            makeSession: {
+                defer { callCount += 1 }
+                return callCount == 0
+                    ? DoorVideoSession.debugStub(connectingDelay: 0.02, streamingDuration: 0.02)
+                    : DoorVideoSession.debugStub(connectingDelay: 10, streamingDuration: 10)
+            },
+            isEnabled: { true }
+        )
+
+        coordinator.setPinned(true)
+        // Wait for the FIRST session to actually become visible before
+        // starting the no-flash/no-nil-gap watch below -- the initial
+        // `isPanelVisible == false` before any session has even reached
+        // `.connecting` is not the seam this test is about.
+        await waitUntil { coordinator.isPanelVisible }
+
+        var sawNilSession = false
+        var sawHiddenPanel = false
+        let deadline = Date().addingTimeInterval(2)
+        while coordinator.sessionStartCount < 2, Date() < deadline {
+            if coordinator.session == nil { sawNilSession = true }
+            if !coordinator.isPanelVisible { sawHiddenPanel = true }
+            await Task.yield()
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+
+        #expect(coordinator.sessionStartCount == 2)
+        #expect(!sawNilSession)
+        #expect(!sawHiddenPanel)
+    }
+
+    /// `lastTerminal` stays `.none` across a renewal -- a renewing pin never
+    /// shows the "ended"/"failed" placeholder mid-pin.
+    ///
+    /// MUTATION CHECK: removing `lastTerminal = .none`'s implicit
+    /// preservation (i.e. calling `whenNotRenewing()` -- which sets
+    /// `lastTerminal = .ended` -- even on the renew path) would make this
+    /// fail once the first session ends.
+    @Test func lastTerminalStaysNoneAcrossRenewal() async {
+        var callCount = 0
+        let coordinator = DoorVideoCoordinator(
+            makeSession: {
+                defer { callCount += 1 }
+                return callCount == 0
+                    ? DoorVideoSession.debugStub(connectingDelay: 0.02, streamingDuration: 0.02)
+                    : DoorVideoSession.debugStub(connectingDelay: 10, streamingDuration: 10)
+            },
+            isEnabled: { true }
+        )
+
+        coordinator.setPinned(true)
+        await waitUntil { coordinator.sessionStartCount == 2 }
+
+        #expect(coordinator.sessionStartCount == 2)
+        #expect(coordinator.lastTerminal == .none)
+    }
+
+    // MARK: - unpinned -> no renewal (existing behaviour)
+
+    /// MUTATION CHECK: making `handlePinnableTermination` renew even when
+    /// `isPinned == false` (e.g. removing the `guard isPinned` early return)
+    /// would make `sessionStartCount` become 2 instead of staying at 1.
+    @Test func unpinnedSessionEndingDoesNotRenew() async {
+        let coordinator = DoorVideoCoordinator(
+            makeSession: { DoorVideoSession.debugStub(connectingDelay: 0.02, streamingDuration: 0.02) },
+            isEnabled: { true }
+        )
+
+        coordinator.startForOpen()
+        await waitUntil { coordinator.lastTerminal == .ended }
+
+        // Give any (incorrect) renewal a chance to happen.
+        try? await Task.sleep(for: .milliseconds(100))
+
+        #expect(coordinator.sessionStartCount == 1)
+        #expect(coordinator.lastTerminal == .ended)
+    }
+
+    // MARK: - 3 consecutive failing stubs -> unpinned with message, exactly 3 sessions
+
+    /// MUTATION CHECK: removing `consecutiveFailures += 1` from
+    /// `DoorVideoCoordinator.handleStateChange(_:for:)`'s `.failed` branch
+    /// would make `pinPolicy.decide(...)` never see `consecutiveFailures >=
+    /// maxConsecutiveFailures`, so the pin would keep renewing past 3
+    /// sessions, failing the `sessionStartCount == 3` assertion.
+    @Test func threeConsecutiveFailuresUnpinsWithMessage() async {
+        var callCount = 0
+        let coordinator = DoorVideoCoordinator(
+            makeSession: {
+                defer { callCount += 1 }
+                return DoorVideoSession.debugStub(connectingDelay: 0.02, failAfter: "boom \(callCount)")
+            },
+            isEnabled: { true },
+            pinPolicy: DoorVideoPinPolicy(maxConsecutiveFailures: 3, failureBackoff: 0),
+            renewSleep: instantRenewSleep
+        )
+
+        coordinator.setPinned(true)
+        await waitUntil(timeout: 3) { !coordinator.isPinned }
+
+        #expect(coordinator.isPinned == false)
+        #expect(coordinator.pinStopMessage == "Camera unavailable - unpinned")
+        #expect(coordinator.sessionStartCount == 3)
+    }
+
+    // MARK: - injected now() past 300s -> "Stream ended - tap to resume", no new session
+
+    /// MUTATION CHECK: removing the `pinnedElapsed` computation (passing `0`
+    /// unconditionally instead of `now().timeIntervalSince(pinStartedAt)`)
+    /// would never trigger `.maxDuration`, so `sessionStartCount` would
+    /// become 2 and `pinStopMessage` would stay `nil`.
+    @Test func maxDurationReachedStopsPinWithMessageAndNoNewSession() async {
+        var currentTime = Date()
+        let coordinator = DoorVideoCoordinator(
+            makeSession: { DoorVideoSession.debugStub(connectingDelay: 0.02, streamingDuration: 0.02) },
+            isEnabled: { true },
+            pinPolicy: DoorVideoPinPolicy(maxPinnedDuration: 300),
+            now: { currentTime }
+        )
+
+        coordinator.setPinned(true)
+        await waitUntil { coordinator.sessionStartCount == 1 }
+
+        // Advance the injected clock past the pin's budget before the first
+        // session's `.ended` fires.
+        currentTime = currentTime.addingTimeInterval(301)
+
+        await waitUntil { !coordinator.isPinned }
+
+        #expect(coordinator.isPinned == false)
+        #expect(coordinator.pinStopMessage == "Stream ended - tap to resume")
+        #expect(coordinator.sessionStartCount == 1)
+    }
+
+    // MARK: - dismiss() while pinned -> unpinned, no further sessions even after renew delay
+
+    /// MUTATION CHECK: removing `isPinned = false` from `dismiss()` would
+    /// leave the pin active; if the pending renew task were not cancelled
+    /// either, `sessionStartCount` would grow past 1 once the (non-instant)
+    /// backoff elapses.
+    @Test func dismissWhilePinnedUnpinsAndPreventsFurtherSessions() async {
+        var callCount = 0
+        let coordinator = DoorVideoCoordinator(
+            makeSession: {
+                defer { callCount += 1 }
+                return DoorVideoSession.debugStub(connectingDelay: 0.02, failAfter: "boom")
+            },
+            isEnabled: { true },
+            pinPolicy: DoorVideoPinPolicy(maxConsecutiveFailures: 3, failureBackoff: 5)
+            // Real renewSleep (not instant): the backoff must still be
+            // pending when dismiss() arrives below, otherwise this test
+            // would not actually exercise cancellation.
+        )
+
+        coordinator.setPinned(true)
+        await waitUntil { coordinator.sessionStartCount == 1 }
+        // Let the first session fail and enter its (real, 5s) backoff wait.
+        await waitUntil(timeout: 1) { coordinator.session?.state.phase == .failed }
+
+        coordinator.dismiss()
+
+        #expect(coordinator.isPinned == false)
+
+        // Wait comfortably longer than a mistaken short backoff (but well
+        // under the real 5s one) to prove no renewal sneaks through.
+        try? await Task.sleep(for: .milliseconds(300))
+
+        #expect(coordinator.sessionStartCount == 1)
+        #expect(coordinator.session == nil)
+    }
+
+    // MARK: - startForOpen() during a backoff wait -> exactly one new session
+
+    /// MUTATION CHECK: removing `renewTask?.cancel(); renewTask = nil` from
+    /// `DoorVideoCoordinator.startOrRetain()` would let the pending renewal
+    /// ALSO fire once its backoff elapses, producing a second, unwanted
+    /// session on top of the one `startForOpen()` triggers here -- observed
+    /// as `sessionStartCount` exceeding 2.
+    @Test func startForOpenDuringBackoffWaitStartsExactlyOneNewSession() async {
+        var callCount = 0
+        let coordinator = DoorVideoCoordinator(
+            makeSession: {
+                defer { callCount += 1 }
+                if callCount == 0 {
+                    return DoorVideoSession.debugStub(connectingDelay: 0.02, failAfter: "boom")
+                }
+                return DoorVideoSession.debugStub(connectingDelay: 10, streamingDuration: 10)
+            },
+            isEnabled: { true },
+            pinPolicy: DoorVideoPinPolicy(maxConsecutiveFailures: 5, failureBackoff: 5)
+            // Real renewSleep (not instant): the backoff must still be
+            // pending when startForOpen() arrives below.
+        )
+
+        coordinator.setPinned(true)
+        await waitUntil { coordinator.sessionStartCount == 1 }
+        await waitUntil(timeout: 1) { coordinator.session?.state.phase == .failed }
+
+        // The pinned session failed and is backing off (5s); a user-driven
+        // startForOpen() arrives during that wait.
+        coordinator.startForOpen()
+        await Task.yield()
+
+        #expect(coordinator.sessionStartCount == 2)
+
+        // Wait past the original backoff window to prove the cancelled
+        // renewal never ALSO fires a third session.
+        try? await Task.sleep(for: .milliseconds(200))
+        #expect(coordinator.sessionStartCount == 2)
+    }
+
+    // MARK: - failure after a session that reached .streaming counts as failure #1
+
+    /// MUTATION CHECK: removing the `if reachedStreamingThisSession {
+    /// consecutiveFailures = 0 }` reset in `DoorVideoCoordinator
+    /// .handleStateChange(_:for:)` would make this failure count as
+    /// consecutive failure #2 (carried over from a prior session's own
+    /// failure), which with `maxConsecutiveFailures: 2` would incorrectly
+    /// stop the pin instead of renewing -- failing the `isPinned == true`
+    /// assertion below.
+    @Test func failureAfterStreamingSessionCountsAsFirstFailure() async {
+        var callCount = 0
+        let coordinator = DoorVideoCoordinator(
+            makeSession: {
+                defer { callCount += 1 }
+                switch callCount {
+                case 0:
+                    // Reaches .streaming, then ends normally.
+                    return DoorVideoSession.debugStub(connectingDelay: 0.02, streamingDuration: 0.02)
+                case 1:
+                    // Fails -- this must be treated as failure #1, not #2.
+                    return DoorVideoSession.debugStub(connectingDelay: 0.02, failAfter: "boom")
+                default:
+                    return DoorVideoSession.debugStub(connectingDelay: 10, streamingDuration: 10)
+                }
+            },
+            isEnabled: { true },
+            pinPolicy: DoorVideoPinPolicy(maxConsecutiveFailures: 2, failureBackoff: 0),
+            renewSleep: instantRenewSleep
+        )
+
+        coordinator.setPinned(true)
+        // First session: streaming -> ended -> renew -> second session
+        // (which fails) -> should still renew (failure #1 of 2), not stop.
+        await waitUntil(timeout: 3) { coordinator.sessionStartCount == 3 }
+
+        #expect(coordinator.sessionStartCount == 3)
+        #expect(coordinator.isPinned == true)
+    }
+
+    // MARK: - pinStopMessage cleared by a subsequent viewDoor()
+
+    /// MUTATION CHECK: removing `pinStopMessage = nil` from
+    /// `DoorVideoCoordinator.startOrRetain()` would leave the stale message
+    /// behind after the user taps "View door" again, failing the final
+    /// `#expect`.
+    @Test func pinStopMessageClearedBySubsequentViewDoor() async {
+        var callCount = 0
+        let coordinator = DoorVideoCoordinator(
+            makeSession: {
+                defer { callCount += 1 }
+                return DoorVideoSession.debugStub(connectingDelay: 0.02, failAfter: "boom \(callCount)")
+            },
+            isEnabled: { true },
+            pinPolicy: DoorVideoPinPolicy(maxConsecutiveFailures: 1, failureBackoff: 0),
+            renewSleep: instantRenewSleep
+        )
+
+        coordinator.setPinned(true)
+        await waitUntil { coordinator.pinStopMessage != nil }
+        #expect(coordinator.pinStopMessage == "Camera unavailable - unpinned")
+
+        coordinator.viewDoor()
+        await Task.yield()
+
+        #expect(coordinator.pinStopMessage == nil)
+    }
+
+    // MARK: - setPinned(true) clears pinStopMessage too
+
+    /// MUTATION CHECK: removing `pinStopMessage = nil` from `setPinned(true)`
+    /// would leave a stale message behind when the user re-pins directly
+    /// (rather than via `viewDoor()`), failing the final `#expect`.
+    @Test func setPinnedTrueClearsPinStopMessage() async {
+        var callCount = 0
+        let coordinator = DoorVideoCoordinator(
+            makeSession: {
+                defer { callCount += 1 }
+                return DoorVideoSession.debugStub(connectingDelay: 0.02, failAfter: "boom \(callCount)")
+            },
+            isEnabled: { true },
+            pinPolicy: DoorVideoPinPolicy(maxConsecutiveFailures: 1, failureBackoff: 0),
+            renewSleep: instantRenewSleep
+        )
+
+        coordinator.setPinned(true)
+        await waitUntil { coordinator.pinStopMessage != nil }
+        #expect(coordinator.pinStopMessage == "Camera unavailable - unpinned")
+
+        coordinator.setPinned(true)
+        #expect(coordinator.pinStopMessage == nil)
+    }
+
+    // MARK: - unpin mid-stream lets the current session end normally, no renewal
+
+    /// MUTATION CHECK: `setPinned(false)` NOT cancelling `renewTask` (were
+    /// one somehow pending) or a leftover `isPinned` check firing anyway
+    /// would make `sessionStartCount` exceed 1 once the current session
+    /// reaches `.ended`.
+    @Test func unpinMidStreamEndsNormallyWithNoRenewal() async {
+        let coordinator = DoorVideoCoordinator(
+            makeSession: { DoorVideoSession.debugStub(connectingDelay: 0.02, streamingDuration: 0.05) },
+            isEnabled: { true }
+        )
+
+        coordinator.setPinned(true)
+        await waitUntil { coordinator.sessionState == .streaming }
+
+        coordinator.setPinned(false)
+        #expect(coordinator.isPinned == false)
+
+        await waitUntil { coordinator.lastTerminal == .ended }
+
+        #expect(coordinator.sessionStartCount == 1)
+        #expect(coordinator.lastTerminal == .ended)
+    }
+
+    // MARK: - setPinned(true) with no active session starts one via startOrRetain()
+
+    /// MUTATION CHECK: removing the `if phase != .connecting, phase !=
+    /// .streaming { startOrRetain() }` call from `setPinned(true)` would
+    /// leave `sessionStartCount == 0` after pinning with nothing playing.
+    @Test func setPinnedTrueWithNoSessionStartsOne() async {
+        let coordinator = DoorVideoCoordinator(
+            makeSession: { DoorVideoSession.debugStub(connectingDelay: 10, streamingDuration: 10) },
+            isEnabled: { true }
+        )
+
+        coordinator.setPinned(true)
+        await Task.yield()
+
+        #expect(coordinator.sessionStartCount == 1)
+        #expect(coordinator.isPinned == true)
+        #expect(coordinator.pinnedSince != nil)
+    }
+
+    // MARK: - pinRemaining
+
+    /// MUTATION CHECK: removing the `guard isPinned` in `pinRemaining` (or
+    /// always returning a non-nil value) would make the first `#expect ==
+    /// nil` fail.
+    @Test func pinRemainingNilWhenUnpinnedThenComputedWhenPinned() async {
+        var currentTime = Date()
+        let coordinator = DoorVideoCoordinator(
+            makeSession: { DoorVideoSession.debugStub(connectingDelay: 10, streamingDuration: 10) },
+            isEnabled: { true },
+            pinPolicy: DoorVideoPinPolicy(maxPinnedDuration: 300),
+            now: { currentTime }
+        )
+
+        #expect(coordinator.pinRemaining == nil)
+
+        coordinator.setPinned(true)
+        #expect(coordinator.pinRemaining == 300)
+
+        currentTime = currentTime.addingTimeInterval(100)
+        #expect(coordinator.pinRemaining == 200)
+    }
+}
