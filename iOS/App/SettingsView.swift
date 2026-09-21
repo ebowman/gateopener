@@ -95,6 +95,7 @@ struct SettingsView: View {
                 lockScreenSection
                 accountSection
                 videoDiagnosticsSection
+                diagnosticsSection
                 aboutSection
             }
             // Reading `refreshToken` here (even though its value is never
@@ -431,6 +432,21 @@ struct SettingsView: View {
         VideoDiagnostics.clearHistory(in: defaults)
         defaults.removeObject(forKey: VideoDiagnostics.defaultsKey)
         reloadVideoDiagnostics()
+    }
+
+    // MARK: - Diagnostics
+
+    /// Bead gateopener-41m.3: entry point to `OpenHistoryView`, so the
+    /// operator can see WHY an Action Button/widget/app open failed (and
+    /// share the history) without needing to reproduce it live.
+    private var diagnosticsSection: some View {
+        Section {
+            NavigationLink("Open history") {
+                OpenHistoryView(journal: environment.openAttemptJournal)
+            }
+        } header: {
+            Text("Diagnostics")
+        }
     }
 
     // MARK: - About
