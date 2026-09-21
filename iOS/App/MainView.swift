@@ -426,7 +426,14 @@ struct MainView: View {
     /// USER close, per `DoorVideoCoordinator.dismiss()`'s doc comment). This
     /// also always unpins (`dismiss()`'s own behavior), same as backgrounding.
     private func sessionVideo(session: DoorVideoSession, overlay: DoorVideoSlotContent.SessionOverlay) -> some View {
-        DoorVideoView(session: session, state: doorVideoCoordinator.sessionState)
+        // `DoorVideoSessionHost` (bead gateopener-41m.18) owns the
+        // `.id(ObjectIdentifier(session))` identity that forces a remount on
+        // a pinned renewal (a new `DoorVideoSession` instance swapped in
+        // while this view stays on the same `.session` structural branch) —
+        // see that type's doc comment for the full rationale. The overlays
+        // below are applied OUTSIDE that identity so the pin/close/countdown
+        // chrome does not flicker across a renewal.
+        DoorVideoSessionHost(session: session, state: doorVideoCoordinator.sessionState)
             .overlay {
                 switch overlay {
                 case .busyRetry(let secondsRemaining):
