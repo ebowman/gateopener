@@ -133,7 +133,8 @@ struct GateOpenerIOSApp: App {
             #endif
         }
         .onChange(of: scenePhase) { _, newPhase in
-            guard newPhase == .active else {
+            switch Self.videoAction(for: newPhase) {
+            case .dismiss:
                 // Backgrounding always dismisses any live door-video panel
                 // (WebRTC would be suspended by the system anyway, and
                 // `DoorVideoCoordinator.dismiss()` -> `DoorVideoSession
@@ -148,12 +149,67 @@ struct GateOpenerIOSApp: App {
                 // comment).
                 videoHarnessSession?.stop()
                 #endif
-                return
+            case .none:
+                // `.inactive` (bead gateopener-41m.17): a brief Notification
+                // Center/Control Center pull-down, app-switcher peek, call
+                // banner, Face ID, or system alert must NOT tear down a
+                // live/connecting door-video session — the app is still
+                // foreground and WebRTC keeps running underneath. Do
+                // nothing to the video session OR any other per-phase work
+                // below (token prewarm, snapshot publish, foreground
+                // auto-start all wait for the next real `.active`).
+                break
+            case .startIfAppropriate:
+                Task { await environment.tokenManager.prewarm() }
+                environment.publishSnapshot()
+                startDoorVideoForForegroundIfAppropriate()
             }
-            Task { await environment.tokenManager.prewarm() }
-            environment.publishSnapshot()
-            startDoorVideoForForegroundIfAppropriate()
         }
+    }
+
+    /// Pure scenePhase -> video-lifecycle decision (bead gateopener-41m.17),
+    /// extracted so it is unit-testable without a live `App`/`Scene`.
+    ///
+    /// - `.background` -> `.dismiss`: matches the pre-existing behavior —
+    ///   the system may suspend/terminate the process at any point once
+    ///   backgrounded, so any live session is torn down immediately (see the
+    ///   `.dismiss` case's own comment at the call site for why this is
+    ///   always safe).
+    /// - `.inactive` -> `.none`: a brief, foreground-adjacent interruption
+    ///   (Notification Center, Control Center, app-switcher peek, a call
+    ///   banner, Face ID, or a system alert) that historically ALSO
+    ///   dismissed the panel — costing the user a fresh `rtc/offer` inside
+    ///   the door's ~15s busy window on every such blip once auto-start
+    ///   (gateopener-41m.12) landed. No concrete reason tying the dismiss to
+    ///   `.inactive` specifically (as opposed to `.background`) was found in
+    ///   history or `bd memories` — see this bead's investigation — so the
+    ///   video session and pin state are left untouched here.
+    /// - `.active` -> `.startIfAppropriate`: unchanged — prewarm, publish
+    ///   the widget snapshot, and (subject to
+    ///   `startDoorVideoForForegroundIfAppropriate()`'s own guards)
+    ///   start-or-retain door video.
+    /// - `@unknown default` -> `.none`: a future scenePhase case is treated
+    ///   conservatively as "do nothing to the video", matching `.inactive`
+    ///   rather than risking a spurious dismiss on a phase this code does
+    ///   not yet understand.
+    static func videoAction(for phase: ScenePhase) -> ScenePhaseVideoAction {
+        switch phase {
+        case .background:
+            return .dismiss
+        case .inactive:
+            return .none
+        case .active:
+            return .startIfAppropriate
+        @unknown default:
+            return .none
+        }
+    }
+
+    /// See `videoAction(for:)`.
+    enum ScenePhaseVideoAction: Equatable {
+        case dismiss
+        case none
+        case startIfAppropriate
     }
 
     /// Shared guard for auto-starting door video on foreground/cold-launch
