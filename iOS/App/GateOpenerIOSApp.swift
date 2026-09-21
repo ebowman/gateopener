@@ -98,7 +98,8 @@ struct GateOpenerIOSApp: App {
                     appSettings: environment.appSettings
                 )
             },
-            isEnabled: { environment.appSettings.autoShowDoorVideoOnOpen }
+            isEnabled: { environment.appSettings.autoShowDoorVideoOnOpen },
+            isAutoStartEnabled: { environment.appSettings.autoStartDoorVideoOnLaunch }
         )
 
         _environment = State(initialValue: environment)
@@ -145,7 +146,36 @@ struct GateOpenerIOSApp: App {
             }
             Task { await environment.tokenManager.prewarm() }
             environment.publishSnapshot()
+            startDoorVideoForForegroundIfAppropriate()
         }
+    }
+
+    /// Shared guard for auto-starting door video on foreground/cold-launch
+    /// (bead gateopener-41m.12): called from the `scenePhase == .active`
+    /// branch above AND from `mainContent`'s cold-launch `.task` below.
+    /// Calling this twice for the same foreground transition (which happens
+    /// on a cold launch where `scenePhase` starts `.inactive` then flips to
+    /// `.active`, firing BOTH the `.task` — guarded to check `scenePhase ==
+    /// .active` at the moment it runs — and this `onChange` handler) is
+    /// harmless: `DoorVideoCoordinator.startForForeground()` ->
+    /// `startOrRetain()` retains an already-connecting/streaming session
+    /// rather than starting a second one.
+    ///
+    /// Deliberately does NOT start video when:
+    ///   - `observable.state == .needsSetup` — `SignInView` is showing, not
+    ///     `MainView`, so there is nowhere for the video panel to appear and
+    ///     starting a session here would waste a network round trip the user
+    ///     can't even see.
+    ///   - `DebugLaunchOptions.widgetPreviewOnLaunch` / `.videoHarnessOnLaunch`
+    ///     — both debug harnesses replace or bypass the normal `MainView`
+    ///     video slot; auto-starting here would double up with (or race)
+    ///     whatever those harnesses already do.
+    private func startDoorVideoForForegroundIfAppropriate() {
+        #if DEBUG
+        guard !DebugLaunchOptions.widgetPreviewOnLaunch, !DebugLaunchOptions.videoHarnessOnLaunch else { return }
+        #endif
+        guard observable.state != .needsSetup else { return }
+        doorVideoCoordinator.startForForeground()
     }
 
     @ViewBuilder
@@ -156,6 +186,26 @@ struct GateOpenerIOSApp: App {
             appSettings: environment.appSettings,
             doorVideoCoordinator: doorVideoCoordinator
         )
+            // Cold-launch auto-start (bead gateopener-41m.12):
+            // `.onChange(of: scenePhase)` above never fires for the
+            // INITIAL scenePhase value, only on subsequent transitions — so
+            // a cold launch that starts directly `.active` would otherwise
+            // never call `startForForeground()` at all. Guarded to check
+            // `scenePhase == .active` at the moment this task actually runs
+            // (not merely "always run on first appearance"), because on a
+            // cold launch scenePhase is often still `.inactive` here and
+            // only flips to `.active` a moment later — in which case the
+            // `onChange` handler fires instead and this guard correctly
+            // no-ops, avoiding a double start (which would be harmless
+            // anyway — see `startDoorVideoForForegroundIfAppropriate`'s doc
+            // comment — but there is no reason to invite it). Also
+            // guarantees a background launch (e.g. `BackgroundOpenRunner`
+            // waking the process with no UI ever shown) never starts video:
+            // scenePhase is never `.active` in that case.
+            .task {
+                guard scenePhase == .active else { return }
+                startDoorVideoForForegroundIfAppropriate()
+            }
             #if DEBUG
             // `--run-intent` (bead gateopener-672.13 verification):
             // drives `OpenGateIntent` directly, without any

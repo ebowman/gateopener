@@ -205,6 +205,105 @@ struct DoorVideoCoordinatorTests {
         #expect(coordinator.cooldownUntil == nil)
     }
 
+    // MARK: - startForForeground (bead gateopener-41m.12)
+
+    /// `isAutoStartEnabled: { false }` must make `startForForeground()` a
+    /// complete no-op: zero factory invocations, zero session starts.
+    ///
+    /// MUTATION CHECK: removing `guard isAutoStartEnabled() else { return }`
+    /// from `DoorVideoCoordinator.startForForeground()` makes this call fall
+    /// through to `startOrRetain()`, so `sessionStartCount`/
+    /// `factoryCallCount` both become 1 instead of 0.
+    @Test func startForForegroundWithAutoStartDisabledStartsNoSession() async {
+        let (factory, factoryCallCount) = makeCountingFactory()
+        let coordinator = DoorVideoCoordinator(
+            makeSession: factory,
+            isEnabled: { true },
+            isAutoStartEnabled: { false }
+        )
+
+        coordinator.startForForeground()
+        await Task.yield()
+
+        #expect(coordinator.sessionStartCount == 0)
+        #expect(factoryCallCount.value == 0)
+    }
+
+    /// `isAutoStartEnabled: { true }` makes a single `startForForeground()`
+    /// call start exactly one session.
+    ///
+    /// MUTATION CHECK: inverting `guard isAutoStartEnabled() else { return }`
+    /// to `guard !isAutoStartEnabled() else { return }` would make this call
+    /// a no-op, failing both `== 1` assertions below.
+    @Test func startForForegroundWithAutoStartEnabledStartsOneSession() async {
+        let (factory, factoryCallCount) = makeCountingFactory()
+        let coordinator = DoorVideoCoordinator(
+            makeSession: factory,
+            isEnabled: { true },
+            isAutoStartEnabled: { true }
+        )
+
+        coordinator.startForForeground()
+        await Task.yield()
+
+        #expect(coordinator.sessionStartCount == 1)
+        #expect(factoryCallCount.value == 1)
+    }
+
+    /// Two `startForForeground()` calls back-to-back (mirroring a cold
+    /// launch's `.task` and the `scenePhase` `onChange` handler both firing
+    /// for the same transition) must start exactly ONE session — the second
+    /// call lands while the first is still `.connecting` and is retained,
+    /// not replaced.
+    ///
+    /// MUTATION CHECK: removing the retention early-return in
+    /// `DoorVideoCoordinator.startOrRetain()` — i.e. deleting
+    /// `guard decision == .replace else { return }` — makes the SECOND
+    /// `startForForeground()` call also build and start a fresh session, so
+    /// `sessionStartCount` becomes 2, failing the assertion below.
+    @Test func twoStartForForegroundCallsBackToBackStartExactlyOneSession() async {
+        let (factory, factoryCallCount) = makeCountingFactory()
+        let coordinator = DoorVideoCoordinator(
+            makeSession: factory,
+            isEnabled: { true },
+            isAutoStartEnabled: { true }
+        )
+
+        coordinator.startForForeground()
+        await Task.yield()
+        coordinator.startForForeground()
+        await Task.yield()
+
+        #expect(coordinator.sessionStartCount == 1)
+        #expect(factoryCallCount.value == 1)
+    }
+
+    /// `startForForeground()` followed by `startForOpen()` (e.g. the app
+    /// foregrounds and auto-starts video, then the user immediately taps
+    /// "Open Gate") must retain the SAME session, not start a second one —
+    /// the two entry points share the same retention policy via
+    /// `startOrRetain()`.
+    ///
+    /// MUTATION CHECK: removing `guard decision == .replace else { return }`
+    /// in `startOrRetain()` makes the `startForOpen()` call also build and
+    /// start a fresh session, taking `sessionStartCount` to 2.
+    @Test func startForForegroundThenStartForOpenStartsExactlyOneSession() async {
+        let (factory, factoryCallCount) = makeCountingFactory()
+        let coordinator = DoorVideoCoordinator(
+            makeSession: factory,
+            isEnabled: { true },
+            isAutoStartEnabled: { true }
+        )
+
+        coordinator.startForForeground()
+        await Task.yield()
+        coordinator.startForOpen()
+        await Task.yield()
+
+        #expect(coordinator.sessionStartCount == 1)
+        #expect(factoryCallCount.value == 1)
+    }
+
     // MARK: - lastTerminal (bead gateopener-41m.11)
 
     /// A session reaching `.ended` sets `lastTerminal = .ended`, mirroring

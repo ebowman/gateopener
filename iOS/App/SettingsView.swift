@@ -191,8 +191,11 @@ struct SettingsView: View {
     private var videoSection: some View {
         Section {
             Toggle("Show door camera when opening", isOn: autoShowDoorVideoOnOpenBinding)
+            Toggle("Show door camera when app opens", isOn: autoStartDoorVideoOnLaunchBinding)
         } header: {
             Text("Video")
+        } footer: {
+            Text("Starts the live camera whenever you open GateOpener.")
         }
     }
 
@@ -201,6 +204,16 @@ struct SettingsView: View {
             get: { appSettings.autoShowDoorVideoOnOpen },
             set: { newValue in
                 appSettings.autoShowDoorVideoOnOpen = newValue
+                refreshToken += 1
+            }
+        )
+    }
+
+    private var autoStartDoorVideoOnLaunchBinding: Binding<Bool> {
+        Binding(
+            get: { appSettings.autoStartDoorVideoOnLaunch },
+            set: { newValue in
+                appSettings.autoStartDoorVideoOnLaunch = newValue
                 refreshToken += 1
             }
         )

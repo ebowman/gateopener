@@ -243,6 +243,70 @@ struct AppSettingsTests {
         #expect(settings.allowOpenWhileLocked)
     }
 
+    // MARK: - autoStartDoorVideoOnLaunch (bead gateopener-41m.12)
+
+    @Test func autoStartDoorVideoOnLaunchDefaultsToTrueWhenUnset() {
+        let (defaults, cleanup) = makeSuite()
+        defer { cleanup() }
+
+        let settings = AppSettings(defaults: defaults)
+
+        #expect(settings.autoStartDoorVideoOnLaunch)
+    }
+
+    @Test func autoStartDoorVideoOnLaunchSetFalseReadsFalseOnSameInstance() {
+        let (defaults, cleanup) = makeSuite()
+        defer { cleanup() }
+
+        let settings = AppSettings(defaults: defaults)
+        settings.autoStartDoorVideoOnLaunch = false
+
+        #expect(!settings.autoStartDoorVideoOnLaunch)
+    }
+
+    @Test func autoStartDoorVideoOnLaunchSetFalsePersistsAcrossNewInstance() {
+        let (defaults, cleanup) = makeSuite()
+        defer { cleanup() }
+
+        let settingsA = AppSettings(defaults: defaults)
+        settingsA.autoStartDoorVideoOnLaunch = false
+
+        let settingsB = AppSettings(defaults: defaults)
+        #expect(!settingsB.autoStartDoorVideoOnLaunch)
+    }
+
+    @Test func autoStartDoorVideoOnLaunchSetTruePersists() {
+        let (defaults, cleanup) = makeSuite()
+        defer { cleanup() }
+
+        let settings = AppSettings(defaults: defaults)
+        settings.autoStartDoorVideoOnLaunch = false
+        settings.autoStartDoorVideoOnLaunch = true
+
+        #expect(settings.autoStartDoorVideoOnLaunch)
+
+        let settingsB = AppSettings(defaults: defaults)
+        #expect(settingsB.autoStartDoorVideoOnLaunch)
+    }
+
+    @Test func resetRestoresAutoStartDoorVideoOnLaunchDefault() {
+        let (defaults, cleanup) = makeSuite()
+        defer { cleanup() }
+
+        let settings = AppSettings(defaults: defaults)
+        settings.autoStartDoorVideoOnLaunch = false
+
+        // Mutation check: confirm the value is actually false BEFORE
+        // reset(), so the post-reset assertion below is proven to
+        // distinguish "reset restored the default" from "it was never
+        // changed".
+        #expect(!settings.autoStartDoorVideoOnLaunch)
+
+        settings.reset()
+
+        #expect(settings.autoStartDoorVideoOnLaunch)
+    }
+
     @Test func twoInstancesOverSameSuiteSeeEachOthersWrites() {
         let (defaults, cleanup) = makeSuite()
         defer { cleanup() }

@@ -28,6 +28,7 @@ public final class AppSettings: @unchecked Sendable {
         static let autoShowDoorVideoOnOpen = "ie.boboco.GateOpener.autoShowDoorVideoOnOpen"
         static let cachedGates = "ie.boboco.GateOpener.cachedGates"
         static let allowOpenWhileLocked = "ie.boboco.GateOpener.allowOpenWhileLocked"
+        static let autoStartDoorVideoOnLaunch = "ie.boboco.GateOpener.autoStartDoorVideoOnLaunch"
 
         /// All keys owned by `AppSettings`. Used by `reset()` so unrelated
         /// UserDefaults keys (e.g. from other parts of the app, or the test
@@ -35,6 +36,7 @@ public final class AppSettings: @unchecked Sendable {
         static let all = [
             aptId, selectedEndpointId, selectedEndpointName, lastDiscoveryDate, shortcutPreference,
             showOpenConfirmationOverlay, autoShowDoorVideoOnOpen, cachedGates, allowOpenWhileLocked,
+            autoStartDoorVideoOnLaunch,
         ]
     }
 
@@ -213,6 +215,29 @@ public final class AppSettings: @unchecked Sendable {
                 : defaults.bool(forKey: Keys.allowOpenWhileLocked)
         }
         set { defaults.set(newValue, forKey: Keys.allowOpenWhileLocked) }
+    }
+
+    /// Whether the live door-camera video should start automatically
+    /// whenever the app is opened or returned to (bead gateopener-41m.12),
+    /// independent of `autoShowDoorVideoOnOpen` above (which governs
+    /// starting video alongside a gate OPEN, not app launch/foreground).
+    /// Defaults to `true` — the user should see the door as soon as they
+    /// open the app, with no configuration required.
+    public var autoStartDoorVideoOnLaunch: Bool {
+        get {
+            // Same absent-key-means-true handling as
+            // `showOpenConfirmationOverlay`/`autoShowDoorVideoOnOpen`/
+            // `allowOpenWhileLocked` above, and for the same reason:
+            // `UserDefaults.bool(forKey:)`'s `false`-for-absent-key default
+            // would silently ship this feature OFF for every user who has
+            // never touched the toggle, which is the opposite of the
+            // required default. Do not "simplify" this back to
+            // `defaults.bool(forKey:)`.
+            defaults.object(forKey: Keys.autoStartDoorVideoOnLaunch) == nil
+                ? true
+                : defaults.bool(forKey: Keys.autoStartDoorVideoOnLaunch)
+        }
+        set { defaults.set(newValue, forKey: Keys.autoStartDoorVideoOnLaunch) }
     }
 
     /// True if and only if a non-empty `selectedEndpointId` is present.

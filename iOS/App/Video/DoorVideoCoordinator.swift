@@ -30,6 +30,28 @@ final class DoorVideoCoordinator {
     /// action independent of the auto-show preference.
     private let isEnabled: () -> Bool
 
+    /// Whether auto-starting video on app launch/foreground is currently
+    /// enabled (`AppSettings.autoStartDoorVideoOnLaunch`, bead
+    /// gateopener-41m.12). Read fresh on every `startForForeground()` call —
+    /// same reasoning as `isEnabled` above. Deliberately a SEPARATE closure
+    /// from `isEnabled`: launch/foreground auto-start and open-triggered
+    /// auto-start are independent user preferences (see
+    /// `AppSettings.autoStartDoorVideoOnLaunch`'s doc comment).
+    ///
+    /// Defaults to `{ true }` so every existing test-construction call site
+    /// (`DoorVideoCoordinatorTests`, all of which pass only `makeSession:`/
+    /// `isEnabled:`) keeps compiling unchanged. This default is safe for
+    /// those tests specifically because none of them call
+    /// `startForForeground()` — they only exercise `startForOpen()`/
+    /// `viewDoor()`/`dismiss()`, so the default's value never affects a
+    /// `sessionStartCount` assertion. A default of `{ false }` would be the
+    /// "safer-looking" choice in isolation, but is NOT required for
+    /// compilation or test correctness here, and would silently make any
+    /// FUTURE test that forgets to pass `isAutoStartEnabled:` and then calls
+    /// `startForForeground()` fail confusingly (zero sessions where one was
+    /// expected) rather than matching the shipped default (auto-start ON).
+    private let isAutoStartEnabled: () -> Bool
+
     /// The current session, or `nil` when nothing has ever started, or the
     /// most recent session has fully cleared (see `scheduleAutoClear`).
     private(set) var session: DoorVideoSession?
@@ -117,15 +139,20 @@ final class DoorVideoCoordinator {
     ///     `makeSession`'s doc comment.
     ///   - isEnabled: Read fresh on every `startForOpen()`. See `isEnabled`'s
     ///     doc comment.
+    ///   - isAutoStartEnabled: Read fresh on every `startForForeground()`.
+    ///     See `isAutoStartEnabled`'s doc comment, including why its default
+    ///     is `{ true }`.
     ///   - autoClearDelay: Defaults to 1 second (this bead's brief). Exposed
     ///     for tests so they need not wait a full second.
     init(
         makeSession: @escaping @MainActor () -> DoorVideoSession,
         isEnabled: @escaping () -> Bool,
+        isAutoStartEnabled: @escaping () -> Bool = { true },
         autoClearDelay: Duration = .seconds(1)
     ) {
         self.makeSession = makeSession
         self.isEnabled = isEnabled
+        self.isAutoStartEnabled = isAutoStartEnabled
         self.autoClearDelay = autoClearDelay
     }
 
@@ -144,6 +171,21 @@ final class DoorVideoCoordinator {
     /// the auto-show-on-open behavior. A tap while a session is already
     /// live (connecting/streaming) is a no-op beyond retaining it.
     func viewDoor() {
+        startOrRetain()
+    }
+
+    /// Starts (or retains) a session on app launch/foreground (bead
+    /// gateopener-41m.12), called from `GateOpenerIOSApp` on cold launch and
+    /// on every `scenePhase == .active` transition. No-ops entirely when
+    /// `isAutoStartEnabled()` is false. Otherwise applies the same
+    /// start-or-retain policy as `startForOpen()`/`viewDoor()` — in
+    /// particular, calling this twice back-to-back (e.g. once from a cold
+    /// launch's `.task` and once from the `scenePhase` handler firing for
+    /// the same transition) starts at most one session, since the second
+    /// call lands while the first is `.connecting` and is retained rather
+    /// than replaced.
+    func startForForeground() {
+        guard isAutoStartEnabled() else { return }
         startOrRetain()
     }
 
