@@ -16,6 +16,14 @@ actor MockGateOpening: GateOpening {
     /// The endpoint id(s) passed to `open(endpointId:)`, in call order.
     private(set) var openedEndpointIds: [String] = []
 
+    /// Optional observer notified once per `open(endpointId:)` call (bead
+    /// gateopener-41m.2), mirroring `GateClient`'s own `attemptObserver`
+    /// seam so mock mode's `EventLog` wiring (`AppDelegate.makeGateController`)
+    /// stays exactly analogous to the real (non-mock) branch's — a single
+    /// `.success` record per call, since `MockGateOpening` never retries or
+    /// fails. `nil` by default; only ever set by mock-mode construction.
+    private let attemptObserver: (any OpenAttemptObserving)?
+
     /// A fixed, obviously-fake endpoint so `.needsSetup` never appears in
     /// mock mode (mock mode exists to test the click plumbing, not the
     /// first-time-setup flow).
@@ -25,6 +33,10 @@ actor MockGateOpening: GateOpening {
         capabilities: ["PowerController"],
         displayCategories: ["LOCK_GENERIC"]
     )
+
+    init(attemptObserver: (any OpenAttemptObserving)? = nil) {
+        self.attemptObserver = attemptObserver
+    }
 
     func discover(aptId: String?) async throws -> [Endpoint] {
         [Self.mockEndpoint]
@@ -36,6 +48,16 @@ actor MockGateOpening: GateOpening {
         // Simulate a short, realistic-ish delay so the `.opening` UI state
         // is visibly observable, without the ~2s of a real call.
         try? await Task.sleep(for: .milliseconds(400))
+        attemptObserver?.record(
+            OpenAttemptRecord(
+                timestamp: Date(),
+                attempt: 1,
+                maxAttempts: 1,
+                outcome: .success(status: 202),
+                elapsedMilliseconds: 400,
+                willRetry: false
+            )
+        )
     }
 }
 

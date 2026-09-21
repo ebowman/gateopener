@@ -861,6 +861,42 @@ final class RecordingAttemptObserver: OpenAttemptObserving, @unchecked Sendable 
     }
 }
 
+/// Secrets hygiene: a token failure caused by `ComelitError.server` (which
+/// carries up to 300 raw characters of the auth server's response body)
+/// must never leak that body into the persisted `.tokenFailure` description
+/// -- only the sanitized "server(<status>)" form.
+@Test func attemptObserverTokenFailureDescriptionNeverContainsServerResponseBody() async throws {
+    let script = RequestScript(statuses: [202])
+    let session = makeSequencedSession(script: script)
+
+    let store = MockCredentialStore()
+    let issuing = MockTokenIssuing()
+    try store.saveCredentials(username: "alice", password: "s3cret")
+    issuing.loginResult = .failure(ComelitError.server(status: 500, body: "SECRET"))
+    let tokenManager = TokenManager(api: issuing, credentialStore: store)
+
+    let observer = RecordingAttemptObserver()
+    let client = GateClient(
+        session: session,
+        tokenManager: tokenManager,
+        retryPolicy: .noDelay(),
+        attemptObserver: observer
+    )
+
+    await #expect(throws: ComelitError.server(status: 500, body: "SECRET")) {
+        try await client.open(endpointId: "VIP#OD#SB100001.1")
+    }
+
+    let records = observer.records
+    #expect(records.count == 1)
+    if case .tokenFailure(let description) = records[0].outcome {
+        #expect(!description.contains("SECRET"))
+        #expect(description == "server(500)")
+    } else {
+        Issue.record("expected .tokenFailure, got \(records[0].outcome)")
+    }
+}
+
 /// (f) attempt numbers are 1-based and `maxAttempts` matches the policy.
 @Test func attemptObserverRecordsAreOneBasedWithMatchingMaxAttempts() async throws {
     let script = RequestScript(statuses: [500, 500, 500, 500, 500])

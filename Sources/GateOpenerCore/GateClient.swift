@@ -17,6 +17,56 @@ public enum GateClientError: Error, Equatable, Sendable {
     case noGateFound
 }
 
+// MARK: - Sanitized error descriptions for persistence
+
+/// Produces a short, bounded description of a token-resolution failure that
+/// is SAFE to persist to disk (via `OpenAttemptJournal`/`OpenAttemptRecord`).
+///
+/// This exists because `String(describing: error)` on a `ComelitError` can
+/// include up to 300 characters of the raw auth-server response body (see
+/// `ComelitError.server(status:body:)`), which may contain sensitive detail
+/// from the server. This helper NEVER includes response bodies, server
+/// messages, usernames, or tokens -- only the error's case name and, for
+/// `.server`, the HTTP status code.
+public enum TokenFailureDescription {
+    /// See the enum's doc comment for the sanitization rules.
+    public static func sanitizedTokenFailureDescription(_ error: Error) -> String {
+        if let comelitError = error as? ComelitError {
+            switch comelitError {
+            case .invalidCredentials:
+                return "invalidCredentials"
+            case .network:
+                return "network"
+            case .server(let status, _):
+                return "server(\(status))"
+            case .decoding:
+                return "decoding"
+            case .missingRefreshToken:
+                return "missingRefreshToken"
+            }
+        }
+        if let tokenManagerError = error as? TokenManagerError {
+            switch tokenManagerError {
+            case .notConfigured:
+                return "notConfigured"
+            }
+        }
+        if let keychainError = error as? KeychainError {
+            switch keychainError {
+            case .saveFailed:
+                return "saveFailed"
+            case .loadFailed:
+                return "loadFailed"
+            case .deleteFailed:
+                return "deleteFailed"
+            case .decodeFailed:
+                return "decodeFailed"
+            }
+        }
+        return String(describing: type(of: error))
+    }
+}
+
 // MARK: - Endpoint model
 
 /// A single device/endpoint returned by the Comelit discovery API.
@@ -426,7 +476,7 @@ public struct GateClient: Sendable {
                 report(
                     attempt: attempt,
                     startedAt: now(),
-                    outcome: .tokenFailure(description: String(describing: error)),
+                    outcome: .tokenFailure(description: TokenFailureDescription.sanitizedTokenFailureDescription(error)),
                     willRetry: false
                 )
                 throw error
