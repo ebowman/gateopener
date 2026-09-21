@@ -204,4 +204,138 @@ struct DoorVideoCoordinatorTests {
 
         #expect(coordinator.cooldownUntil == nil)
     }
+
+    // MARK: - lastTerminal (bead gateopener-41m.11)
+
+    /// A session reaching `.ended` sets `lastTerminal = .ended`, mirroring
+    /// `sessionState`'s own publish of the transition.
+    ///
+    /// MUTATION CHECK: removing `lastTerminal = .ended` from
+    /// `DoorVideoCoordinator.handleStateChange(_:for:)`'s `.ended` branch
+    /// would leave `coordinator.lastTerminal` stuck at `.none`, failing the
+    /// final `#expect`.
+    @Test func sessionEndingSetsLastTerminalEnded() async {
+        let coordinator = DoorVideoCoordinator(
+            makeSession: { DoorVideoSession.debugStub(connectingDelay: 0.02, streamingDuration: 0.02) },
+            isEnabled: { true }
+        )
+
+        coordinator.startForOpen()
+
+        let deadline = Date().addingTimeInterval(2)
+        while coordinator.lastTerminal == .none, Date() < deadline {
+            await Task.yield()
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+
+        #expect(coordinator.lastTerminal == .ended)
+    }
+
+    /// A session reaching `.failed(message)` sets `lastTerminal =
+    /// .failed(message)`, carrying the REAL message through — driven via a
+    /// direct `onStateChange` callback (rather than the debug stub, which
+    /// never fails) since this only needs to prove the coordinator's own
+    /// wiring, not any particular session's failure path.
+    ///
+    /// MUTATION CHECK: removing `lastTerminal = .failed(message)` from
+    /// `handleStateChange(_:for:)`'s `.failed` branch would leave
+    /// `coordinator.lastTerminal` at `.none`, failing the `#expect`.
+    /// Collapsing `.ended`/`.failed` onto the same `lastTerminal` value
+    /// would fail the distinctness assertion below.
+    @Test func sessionFailingSetsLastTerminalFailedWithMessage() async {
+        let session = DoorVideoSession.debugStub(connectingDelay: 10, streamingDuration: 10)
+        let coordinator = DoorVideoCoordinator(makeSession: { session }, isEnabled: { true })
+
+        coordinator.startForOpen()
+        await Task.yield()
+
+        session.onStateChange?(.failed("Door camera busy"))
+
+        #expect(coordinator.lastTerminal == .failed("Door camera busy"))
+        #expect(coordinator.lastTerminal != .ended)
+    }
+
+    /// Starting a NEW session (a `.replace` decision) resets `lastTerminal`
+    /// back to `.none`, so a stale failure/ended reason from a previous
+    /// session never leaks into the fresh session's `.connecting`
+    /// placeholder.
+    ///
+    /// MUTATION CHECK: removing `lastTerminal = .none` from
+    /// `DoorVideoCoordinator.startOrRetain()` would leave `lastTerminal` at
+    /// `.failed("Door camera busy")` from the first session, failing the
+    /// final `#expect`.
+    @Test func startingNewSessionResetsLastTerminalToNone() async {
+        var callCount = 0
+        let sessions = [
+            DoorVideoSession.debugStub(connectingDelay: 10, streamingDuration: 10),
+            DoorVideoSession.debugStub(connectingDelay: 10, streamingDuration: 10),
+        ]
+        let coordinator = DoorVideoCoordinator(
+            makeSession: {
+                defer { callCount += 1 }
+                return sessions[callCount]
+            },
+            isEnabled: { true }
+        )
+
+        coordinator.startForOpen()
+        await Task.yield()
+        sessions[0].onStateChange?(.failed("Door camera busy"))
+        #expect(coordinator.lastTerminal == .failed("Door camera busy"))
+
+        // Replace: stop the first session, then start a fresh one.
+        coordinator.dismiss()
+        coordinator.startForOpen()
+        await Task.yield()
+
+        #expect(coordinator.lastTerminal == .none)
+    }
+
+    /// A USER-initiated `dismiss()` (the panel's close button) resets
+    /// `lastTerminal` to `.none` — the user has acknowledged whatever
+    /// happened, so the placeholder returns to the neutral "Tap to view
+    /// door" state on the next render.
+    ///
+    /// MUTATION CHECK: removing `lastTerminal = .none` from `dismiss()`
+    /// would leave `lastTerminal` at `.failed(...)` after the close button
+    /// is pressed, failing the final `#expect`.
+    @Test func userDismissResetsLastTerminalToNone() async {
+        let session = DoorVideoSession.debugStub(connectingDelay: 10, streamingDuration: 10)
+        let coordinator = DoorVideoCoordinator(makeSession: { session }, isEnabled: { true })
+
+        coordinator.startForOpen()
+        await Task.yield()
+        session.onStateChange?(.failed("Door camera busy"))
+        #expect(coordinator.lastTerminal == .failed("Door camera busy"))
+
+        coordinator.dismiss()
+
+        #expect(coordinator.lastTerminal == .none)
+    }
+
+    /// The scenePhase-driven backgrounding path calls the SAME `dismiss()`
+    /// method as the user's close button (see `GateOpenerIOSApp`'s
+    /// `scenePhase` handler) — this test documents/locks in that shared
+    /// path also resets `lastTerminal` to `.none`, per this bead's STEPS
+    /// ("scenePhase-driven dismiss() keeps the value .none").
+    ///
+    /// MUTATION CHECK: since backgrounding and user-close share the exact
+    /// same `dismiss()` implementation, this test would fail under the same
+    /// mutation as `userDismissResetsLastTerminalToNone` above — it exists
+    /// separately to document that this is a deliberate, accepted shared
+    /// behavior rather than an untested assumption.
+    @Test func scenePhaseDismissAlsoResetsLastTerminalToNone() async {
+        let session = DoorVideoSession.debugStub(connectingDelay: 10, streamingDuration: 10)
+        let coordinator = DoorVideoCoordinator(makeSession: { session }, isEnabled: { true })
+
+        coordinator.startForOpen()
+        await Task.yield()
+        session.onStateChange?(.ended)
+        #expect(coordinator.lastTerminal == .ended)
+
+        // `GateOpenerIOSApp`'s scenePhase handler calls this exact method.
+        coordinator.dismiss()
+
+        #expect(coordinator.lastTerminal == .none)
+    }
 }

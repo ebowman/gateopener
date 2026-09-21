@@ -61,6 +61,39 @@ final class DoorVideoCoordinator {
     /// timer nils `session` out — same lifecycle as `sessionState`.
     private(set) var cooldownUntil: Date?
 
+    /// How the most recent session (if any) most recently finished, used by
+    /// `MainView`'s permanent video slot (bead gateopener-41m.11) to choose
+    /// between the plain "Tap to view door" placeholder and the
+    /// "Retry"-with-message placeholder once `session` itself has been
+    /// auto-cleared to `nil`. Unlike `sessionState`/`cooldownUntil`, this is
+    /// NOT reset by `scheduleAutoClear` — it is the one piece of state that
+    /// must survive the session being cleared, precisely so the placeholder
+    /// can keep showing "why" after the session object itself is gone.
+    ///
+    /// Reset to `.none`:
+    ///   - whenever a NEW session actually starts (`startOrRetain()`), so a
+    ///     stale "failed"/"ended" reason from a previous session never
+    ///     leaks into a fresh one's `.connecting` placeholder;
+    ///   - whenever the USER explicitly closes the panel (the `dismiss()`
+    ///     call from `MainView`'s close (X) button) — the user has
+    ///     acknowledged whatever happened, so the placeholder should go back
+    ///     to the neutral "Tap to view door" state.
+    ///
+    /// Deliberately NOT reset by the scenePhase-driven `dismiss()` call
+    /// `GateOpenerIOSApp` makes when the app backgrounds — per this bead's
+    /// STEPS, that path shares the same `dismiss()` method as the user's
+    /// close button, and both resetting to `.none` is the documented,
+    /// accepted behavior (backgrounding is treated the same as the user
+    /// closing the panel).
+    private(set) var lastTerminal: LastTerminal = .none
+
+    /// See `lastTerminal`.
+    enum LastTerminal: Equatable {
+        case none
+        case ended
+        case failed(String)
+    }
+
     /// Number of times `makeSession()` has actually been invoked (i.e. a
     /// NEW session was created, as opposed to an existing one being
     /// retained). `internal` (not `private`) so a unit test (bead
@@ -125,6 +158,7 @@ final class DoorVideoCoordinator {
         isPanelVisible = false
         sessionState = .idle
         cooldownUntil = nil
+        lastTerminal = .none
     }
 
     /// Shared retain-or-replace policy for `startForOpen()`/`viewDoor()`:
@@ -147,6 +181,7 @@ final class DoorVideoCoordinator {
         session = newSession
         isPanelVisible = false
         cooldownUntil = nil
+        lastTerminal = .none
 
         newSession.onStateChange = { [weak self] state in
             self?.handleStateChange(state, for: newSession)
@@ -185,12 +220,20 @@ final class DoorVideoCoordinator {
             isPanelVisible = false
         case .connecting, .streaming:
             isPanelVisible = true
-        case .ended, .failed:
-            // `.failed` hides silently (no error alert) and `.ended` fades
-            // out — both routes clear the session the same way, after the
-            // same short delay, so the panel's disappear animation has time
-            // to run either way.
+        case .ended:
+            // `.ended` fades out; the session is cleared the same way as
+            // `.failed`, after the same short delay, so the panel's
+            // disappear animation has time to run.
             isPanelVisible = false
+            lastTerminal = .ended
+            scheduleAutoClear(for: changedSession)
+        case .failed(let message):
+            // `.failed` hides silently (no error alert) — `lastTerminal`
+            // carries the REAL message forward so `MainView`'s placeholder
+            // can show it (bead gateopener-41m.11) once `session` itself is
+            // cleared below.
+            isPanelVisible = false
+            lastTerminal = .failed(message)
             scheduleAutoClear(for: changedSession)
         }
     }

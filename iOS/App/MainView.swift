@@ -126,21 +126,24 @@ struct MainView: View {
                 .foregroundStyle(.secondary)
                 .padding(.top, 12)
 
-            // MARK: - Video panel (bead gateopener-672.12)
+            // MARK: - Permanent video slot (bead gateopener-41m.11)
             //
-            // Shown only while `doorVideoCoordinator.isPanelVisible` (a
-            // session is connecting or streaming); animates in/out so the
-            // panel never just pops in/out of the layout. When hidden this
-            // renders as a zero-height `EmptyView`, so the button/status
-            // line below simply occupy the space instead of leaving a gap
-            // — there is no separate "reserved slot" once real video
-            // exists.
-            if doorVideoCoordinator.isPanelVisible, let session = doorVideoCoordinator.session {
-                videoPanel(session: session)
-                    .padding(.horizontal, 20)
-                    .padding(.top, 12)
-                    .transition(.opacity.combined(with: .scale(scale: 0.95)))
-            }
+            // Unlike the panel this replaces, the slot is ALWAYS present
+            // (never conditionally inserted/removed from the layout) so the
+            // screen always explains what's going on with the door camera,
+            // rather than a panel that silently appears and vanishes. Its
+            // CONTENT switches between the live web view, a connecting/
+            // busy-retry overlay, and one of two placeholders — see
+            // `videoSlot`. `layoutPriority(-1)` (lower than the status
+            // text/Open button's default 0) is what lets it shrink first on
+            // short screens per this bead's STEP 5 — the aspect-ratio frame
+            // below caps its growth, but on a screen too short to fit both
+            // at full size, SwiftUI takes space from the lowest-priority
+            // view first, which must be this one, never the button.
+            videoSlot
+                .padding(.horizontal, 20)
+                .padding(.top, 12)
+                .layoutPriority(-1)
 
             Spacer(minLength: 24)
 
@@ -149,7 +152,7 @@ struct MainView: View {
             // The Open button is anchored to the bottom safe area (16pt
             // spacing) rather than centered/floating, so it sits in the
             // screen's most thumb-reachable zone regardless of how much
-            // space the video panel above claims.
+            // space the video slot above claims.
             VStack(spacing: 16) {
                 Text(statusText)
                     .font(.subheadline)
@@ -158,10 +161,9 @@ struct MainView: View {
 
                 openButton
                     .padding(.horizontal, 20)
-
-                viewDoorButton
             }
             .padding(.bottom, 24)
+            .fixedSize(horizontal: false, vertical: true)
         }
         .animation(.easeInOut(duration: 0.25), value: doorVideoCoordinator.isPanelVisible)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -249,14 +251,122 @@ struct MainView: View {
         .accessibilityAddTraits(.isButton)
     }
 
-    /// The live door-camera panel: `DoorVideoView` plus a small circular X
-    /// (dismiss) button overlaid in the top-trailing corner, so the
-    /// operator can close it early without waiting for the door's own
-    /// ~28-30s session window to elapse. Calling `dismiss()` stops the
-    /// session (idempotent) and clears it immediately (no animation delay
-    /// — the button itself IS the explicit dismiss action).
-    private func videoPanel(session: DoorVideoSession) -> some View {
+    /// The permanent 4:3 video slot (bead gateopener-41m.11 STEP 2):
+    /// black background, rounded corners, always present directly under the
+    /// title. Its content switches on `DoorVideoSlotContent.content(...)`,
+    /// a pure mapping unit-tested independently in
+    /// `DoorVideoSlotContentTests` — this computed property only wires that
+    /// mapping's result to actual views/actions.
+    ///
+    /// `maxHeight` (rather than a bare `aspectRatio`) is what lets this slot
+    /// actually shrink on short screens: `aspectRatio(_:contentMode: .fit)`
+    /// alone still asks for its ideal (full-width-derived) height first,
+    /// and only `layoutPriority(-1)` on the caller plus this `maxHeight`
+    /// cap keep it from pushing `openButton`/`statusText` off-screen or
+    /// clipping them — see the `layoutPriority(-1)` comment where this is
+    /// placed in `body`.
+    ///
+    /// HARD RULE (memory `gateopener-ios-video-autoplay-hidden-webview`,
+    /// reaffirmed by bead gateopener-672.30 / commit 8797114): the
+    /// `sessionVideo` branch below is the ONLY place the web view is ever
+    /// placed in the hierarchy, it is placed there for the WHOLE window a
+    /// session is visible (connecting, busy-retry cooldown, AND streaming —
+    /// one stable structural branch, not a different one per sub-state), and
+    /// it is never hidden behind `.opacity(0)` or removed from the hierarchy
+    /// while some other branch is active. `DoorVideoView` itself keeps
+    /// drawing its own "Connecting…"/"Camera unavailable" overlay on top
+    /// (bead gateopener-672.30); `MainView` only ever layers ADDITIONAL
+    /// chrome (the busy-retry countdown, the close button) on top of that
+    /// same mounted view, never a competing standalone view. The
+    /// `.tapToView`/`.failed` branches render an entirely different view
+    /// tree (icon + text, or icon + text + button) instead.
+    ///
+    /// Only the busy-retry countdown text needs a per-second tick
+    /// (`doorVideoCoordinator.cooldownUntil` itself only changes at the
+    /// start/end of a cooldown), so the `TimelineView(.periodic(...))` wraps
+    /// ONLY that overlay, not the whole slot — re-evaluating the
+    /// WKWebView-hosting subtree every second would be an avoidable risk to
+    /// the live video (reviewer finding on this bead's FIX PASS).
+    @ViewBuilder
+    private var videoSlot: some View {
+        let content = DoorVideoSlotContent.content(
+            hasVisibleSession: doorVideoCoordinator.isPanelVisible,
+            sessionState: doorVideoCoordinator.sessionState,
+            lastTerminal: doorVideoCoordinator.lastTerminal,
+            cooldownUntil: doorVideoCoordinator.cooldownUntil,
+            now: Date()
+        )
+
+        Group {
+            switch content {
+            case .session(let overlay):
+                if let session = doorVideoCoordinator.session {
+                    sessionVideo(session: session, overlay: overlay)
+                } else {
+                    // Defensive only: `.session` is only produced when
+                    // `hasVisibleSession` is true, which the coordinator
+                    // only sets alongside a non-nil `session`. Falls back to
+                    // the neutral placeholder rather than crashing if that
+                    // invariant is ever violated.
+                    placeholder(icon: "video.fill", message: "Tap to view door", retry: false)
+                }
+            case .tapToView:
+                placeholder(icon: "video.fill", message: "Tap to view door", retry: false)
+            case .failed(let message):
+                placeholder(icon: "exclamationmark.triangle", message: message, retry: true)
+            }
+        }
+        .aspectRatio(4.0 / 3.0, contentMode: .fit)
+        .frame(maxWidth: .infinity)
+        .frame(maxHeight: 280)
+        .background(Color.black)
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .animation(.easeInOut(duration: 0.25), value: content)
+    }
+
+    /// The `.session` case: the real `DoorVideoView` — mounted at this SAME
+    /// structural position across connecting, busy-retry cooldown, and
+    /// streaming (see the HARD RULE above) — plus:
+    ///  - the existing close (xmark) button, available throughout the whole
+    ///    visible window (matches the pre-fix `videoPanel(session:)`, which
+    ///    included the close button for connecting too, not just streaming);
+    ///  - when `overlay == .busyRetry`, an opaque countdown overlay drawn ON
+    ///    TOP of `DoorVideoView`, fully covering its own "Connecting…" label
+    ///    so the two never show at once. Only this countdown text lives
+    ///    inside a `TimelineView(.periodic(from: .now, by: 1))`, since it is
+    ///    the only piece that needs a per-second tick
+    ///    (`doorVideoCoordinator.cooldownUntil` only changes at the start/
+    ///    end of a cooldown).
+    ///
+    /// Calling `dismiss()` (close button) stops the session (idempotent),
+    /// clears it immediately (no animation delay — the button itself IS the
+    /// explicit dismiss action), and resets `lastTerminal` to `.none` (a
+    /// USER close, per `DoorVideoCoordinator.dismiss()`'s doc comment).
+    private func sessionVideo(session: DoorVideoSession, overlay: DoorVideoSlotContent.SessionOverlay) -> some View {
         DoorVideoView(session: session, state: doorVideoCoordinator.sessionState)
+            .overlay {
+                if case .busyRetry(let secondsRemaining) = overlay {
+                    TimelineView(.periodic(from: .now, by: 1)) { timelineContext in
+                        let liveContent = DoorVideoSlotContent.content(
+                            hasVisibleSession: doorVideoCoordinator.isPanelVisible,
+                            sessionState: doorVideoCoordinator.sessionState,
+                            lastTerminal: doorVideoCoordinator.lastTerminal,
+                            cooldownUntil: doorVideoCoordinator.cooldownUntil,
+                            now: timelineContext.date
+                        )
+                        if case .session(.busyRetry(let liveSecondsRemaining)) = liveContent {
+                            busyRetryOverlay(secondsRemaining: liveSecondsRemaining)
+                        } else {
+                            // The cooldown elapsed since the outer `content`
+                            // was computed; the outer view will re-render
+                            // shortly with `overlay == .none` and drop this
+                            // branch entirely. Shown once, briefly, rather
+                            // than flashing a stale "0s"/negative countdown.
+                            busyRetryOverlay(secondsRemaining: secondsRemaining)
+                        }
+                    }
+                }
+            }
             .overlay(alignment: .topTrailing) {
                 Button {
                     doorVideoCoordinator.dismiss()
@@ -270,20 +380,85 @@ struct MainView: View {
             }
     }
 
-    /// Secondary, plain "View door" affordance below the status line: starts
-    /// a video session WITHOUT opening the gate. Per this bead's STEPS,
-    /// pressing it while a session is already live (connecting/streaming)
-    /// is a no-op — `DoorVideoCoordinator.viewDoor()` itself enforces the
-    /// retain-vs-replace policy, so this button never needs to check
-    /// `isPanelVisible` itself before calling it.
-    private var viewDoorButton: some View {
-        Button("View door") {
-            lightImpactGenerator.impactOccurred()
-            doorVideoCoordinator.viewDoor()
+    /// The busy-retry countdown overlay: an opaque dark background matching
+    /// `DoorVideoView`'s own connecting-overlay style
+    /// (`Color.black.opacity(0.92)`, bead gateopener-672.30), so it fully
+    /// covers `DoorVideoView`'s own "Connecting…" text underneath — the two
+    /// texts must never both be visible at once.
+    private func busyRetryOverlay(secondsRemaining: Int) -> some View {
+        ZStack {
+            Color.black.opacity(0.92)
+            VStack(spacing: 8) {
+                ProgressView()
+                    .progressViewStyle(.circular)
+                    .tint(.white)
+                Text("Door camera busy — retrying in \(secondsRemaining)s")
+                    .font(.footnote)
+                    .foregroundStyle(.white)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 12)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
-        .buttonStyle(.plain)
-        .font(.subheadline)
-        .foregroundStyle(Color.accentColor)
+        .accessibilityElement(children: .combine)
+    }
+
+    /// The `.tapToView`/`.failed` cases: an icon, a message, and (only for
+    /// `.failed`) a "Retry" button — both call `doorVideoCoordinator
+    /// .viewDoor()`, since retrying a failed session and starting a fresh
+    /// one from the neutral placeholder are the same action.
+    ///
+    /// `.tapToView`'s whole slot area is itself tappable (the `Button`
+    /// wraps the icon/text), matching this bead's STEP 2 ("whole slot is a
+    /// Button calling viewDoor()"); `.failed` shows a plain icon/text with a
+    /// separate, smaller "Retry" button instead, so a stray tap on the
+    /// failure message itself is not misread as "retry".
+    @ViewBuilder
+    private func placeholder(icon: String, message: String, retry: Bool) -> some View {
+        if retry {
+            VStack(spacing: 8) {
+                Image(systemName: icon)
+                    .font(.largeTitle)
+                    .foregroundStyle(.white.opacity(0.85))
+                Text(message)
+                    .font(.footnote)
+                    .foregroundStyle(.white)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 12)
+                    .fixedSize(horizontal: false, vertical: true)
+                Button("Retry") {
+                    lightImpactGenerator.impactOccurred()
+                    doorVideoCoordinator.viewDoor()
+                }
+                .buttonStyle(.plain)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(Color.white)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 6)
+                .background(Color.white.opacity(0.2), in: Capsule())
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .accessibilityElement(children: .combine)
+        } else {
+            Button {
+                lightImpactGenerator.impactOccurred()
+                doorVideoCoordinator.viewDoor()
+            } label: {
+                VStack(spacing: 8) {
+                    Image(systemName: icon)
+                        .font(.largeTitle)
+                        .foregroundStyle(.white.opacity(0.85))
+                    Text(message)
+                        .font(.footnote)
+                        .foregroundStyle(.white)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .buttonStyle(.plain)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .accessibilityLabel(message)
+            .accessibilityHint("Double tap to view the door camera")
+        }
     }
 
     /// The tap handler: fires a heavy haptic, keeps the screen awake, and
