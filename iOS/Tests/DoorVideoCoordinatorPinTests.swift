@@ -166,8 +166,102 @@ struct DoorVideoCoordinatorPinTests {
         await waitUntil(timeout: 3) { !coordinator.isPinned }
 
         #expect(coordinator.isPinned == false)
-        #expect(coordinator.pinStopMessage == "Camera unavailable - unpinned")
+        // The stop message now carries the last failure's reason (bead
+        // gateopener-41m.21) rather than the generic fallback, since
+        // `debugStub(failAfter:)`'s message is non-empty.
+        #expect(coordinator.pinStopMessage == "Unpinned - boom 2")
         #expect(coordinator.sessionStartCount == 3)
+    }
+
+    // MARK: - escalating failure backoff schedule (bead gateopener-41m.21)
+
+    /// With the default schedule `[2, 5, 10]` and `maxConsecutiveFailures ==
+    /// 4`, three consecutive failing stubs request backoffs `[2, 5, 10]` (in
+    /// that order) via the injected `renewSleep`, and the 4th failure stops
+    /// the pin with a message carrying the last failure's reason.
+    ///
+    /// MUTATION CHECK: hardcoding a single backoff value (rather than
+    /// indexing `failureBackoffs` by `consecutiveFailures - 1`) would make
+    /// the recorded durations something like `[2, 2, 2]` instead of
+    /// `[2, 5, 10]`, failing the first assertion below.
+    @Test func escalatingFailureBackoffScheduleRequestsRecordedDurations() async {
+        final class DurationRecorder: @unchecked Sendable {
+            private let lock = NSLock()
+            private var _durations: [Duration] = []
+            func record(_ duration: Duration) {
+                lock.lock(); defer { lock.unlock() }
+                _durations.append(duration)
+            }
+            var durations: [Duration] {
+                lock.lock(); defer { lock.unlock() }
+                return _durations
+            }
+        }
+
+        let recorder = DurationRecorder()
+        var callCount = 0
+        let coordinator = DoorVideoCoordinator(
+            makeSession: {
+                defer { callCount += 1 }
+                return DoorVideoSession.debugStub(connectingDelay: 0.02, failAfter: "boom \(callCount)")
+            },
+            isEnabled: { true },
+            pinPolicy: DoorVideoPinPolicy(),
+            renewSleep: { duration in recorder.record(duration) }
+        )
+
+        coordinator.setPinned(true)
+        await waitUntil(timeout: 3) { !coordinator.isPinned }
+
+        #expect(coordinator.sessionStartCount == 4)
+        #expect(recorder.durations == [.seconds(2), .seconds(5), .seconds(10)])
+        #expect(coordinator.pinStopMessage == "Unpinned - boom 3")
+    }
+
+    /// A failure whose message matches
+    /// `DoorVideoBusyPolicy.failureMessage(for: .doorBusy)` requests a
+    /// backoff of at least the 10s door-busy floor, even though the
+    /// schedule's 1st-failure value (2s) would otherwise be used.
+    ///
+    /// MUTATION CHECK: not deriving `failureWasDoorBusy` (or comparing
+    /// against a hardcoded string literal instead of
+    /// `DoorVideoBusyPolicy.failureMessage(for: .doorBusy)`) would request a
+    /// 2s backoff instead of >= 10s, failing the assertion below.
+    @Test func doorBusyFailureRequestsAtLeastTenSecondBackoff() async {
+        final class DurationRecorder: @unchecked Sendable {
+            private let lock = NSLock()
+            private var _durations: [Duration] = []
+            func record(_ duration: Duration) {
+                lock.lock(); defer { lock.unlock() }
+                _durations.append(duration)
+            }
+            var durations: [Duration] {
+                lock.lock(); defer { lock.unlock() }
+                return _durations
+            }
+        }
+
+        let recorder = DurationRecorder()
+        var callCount = 0
+        let busyMessage = DoorVideoBusyPolicy.failureMessage(for: .doorBusy)
+        let coordinator = DoorVideoCoordinator(
+            makeSession: {
+                defer { callCount += 1 }
+                if callCount == 0 {
+                    return DoorVideoSession.debugStub(connectingDelay: 0.02, failAfter: busyMessage)
+                }
+                return DoorVideoSession.debugStub(connectingDelay: 10, streamingDuration: 10)
+            },
+            isEnabled: { true },
+            pinPolicy: DoorVideoPinPolicy(),
+            renewSleep: { duration in recorder.record(duration) }
+        )
+
+        coordinator.setPinned(true)
+        await waitUntil { !recorder.durations.isEmpty }
+
+        #expect(recorder.durations.count == 1)
+        #expect(recorder.durations[0] >= .seconds(10))
     }
 
     // MARK: - injected now() past 300s -> "Stream ended - tap to resume", no new session
@@ -335,7 +429,9 @@ struct DoorVideoCoordinatorPinTests {
 
         coordinator.setPinned(true)
         await waitUntil { coordinator.pinStopMessage != nil }
-        #expect(coordinator.pinStopMessage == "Camera unavailable - unpinned")
+        // The stop message carries the last failure's reason (bead
+        // gateopener-41m.21) rather than the generic fallback.
+        #expect(coordinator.pinStopMessage == "Unpinned - boom 0")
 
         coordinator.viewDoor()
         await Task.yield()
@@ -362,7 +458,9 @@ struct DoorVideoCoordinatorPinTests {
 
         coordinator.setPinned(true)
         await waitUntil { coordinator.pinStopMessage != nil }
-        #expect(coordinator.pinStopMessage == "Camera unavailable - unpinned")
+        // The stop message carries the last failure's reason (bead
+        // gateopener-41m.21) rather than the generic fallback.
+        #expect(coordinator.pinStopMessage == "Unpinned - boom 0")
 
         coordinator.setPinned(true)
         #expect(coordinator.pinStopMessage == nil)

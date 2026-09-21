@@ -206,6 +206,19 @@ final class DoorVideoCoordinator {
     /// starts.
     private var reachedStreamingThisSession = false
 
+    /// The most recent `.failed(message:)` text seen on the CURRENT pin,
+    /// used for two things once the pin gives up
+    /// (`handlePinnableTermination`'s `.stop(.tooManyFailures)` case):
+    /// deriving `failureWasDoorBusy` (by comparing it against
+    /// `DoorVideoBusyPolicy.failureMessage(for: .doorBusy)`) and passing it
+    /// to `DoorVideoPinPolicy.stopMessage(_:lastFailure:)` so the shown
+    /// message carries the actual reason (bead gateopener-41m.21). `nil`
+    /// while unpinned or before any failure has occurred on the current pin;
+    /// reset to `nil` by `setPinned(_:)` (both directions) so a stale
+    /// message from a previous pin never leaks into a later one's stop
+    /// message.
+    private var lastFailureMessage: String?
+
     /// The single pending pinned-renewal task (bead gateopener-41m.14's
     /// failure-backoff path, `pinPolicy`'s `.renew(after:)` with
     /// `after > 0`). At most one is ever outstanding: cancelled and
@@ -297,6 +310,7 @@ final class DoorVideoCoordinator {
             consecutiveFailures = 0
             pinStopMessage = nil
             pinRenewalCount = 0
+            lastFailureMessage = nil
             eventSink("pin on")
 
             let phase = session?.state.phase
@@ -307,6 +321,7 @@ final class DoorVideoCoordinator {
             isPinned = false
             pinnedSince = nil
             pinRenewalCount = 0
+            lastFailureMessage = nil
             renewTask?.cancel()
             renewTask = nil
             eventSink("pin off (user)")
@@ -370,6 +385,7 @@ final class DoorVideoCoordinator {
         isPinned = false
         pinnedSince = nil
         pinRenewalCount = 0
+        lastFailureMessage = nil
         session?.stop()
         session = nil
         isPanelVisible = false
@@ -495,6 +511,7 @@ final class DoorVideoCoordinator {
                 consecutiveFailures = 0
             }
             consecutiveFailures += 1
+            lastFailureMessage = message
             handlePinnableTermination(.failed, message: message, for: changedSession) {
                 // `.failed` hides silently (no error alert) — `lastTerminal`
                 // carries the REAL message forward so `MainView`'s
@@ -538,11 +555,20 @@ final class DoorVideoCoordinator {
             return
         }
 
+        // Derived by comparing the failure message against the single
+        // source of truth in `DoorVideoBusyPolicy` (bead gateopener-41m.21
+        // STEP 2) -- no string literal duplicated here. Only meaningful
+        // when `outcome == .failed`; harmlessly `false` for `.ended`, whose
+        // `message` is always `nil`.
+        let failureWasDoorBusy = outcome == .failed
+            && message == DoorVideoBusyPolicy.failureMessage(for: .doorBusy)
+
         let decision = pinPolicy.decide(
             isPinned: true,
             outcome: outcome,
             pinnedElapsed: now().timeIntervalSince(pinStartedAt),
-            consecutiveFailures: consecutiveFailures
+            consecutiveFailures: consecutiveFailures,
+            failureWasDoorBusy: failureWasDoorBusy
         )
 
         // "ended"/"failed: <message>" fragment shared by both the immediate
@@ -604,7 +630,7 @@ final class DoorVideoCoordinator {
         case .stop(let reason):
             isPinned = false
             pinnedSince = nil
-            pinStopMessage = DoorVideoPinPolicy.stopMessage(reason)
+            pinStopMessage = DoorVideoPinPolicy.stopMessage(reason, lastFailure: lastFailureMessage)
             eventSink("pin stop: \(reason)")
             whenNotRenewing()
         }

@@ -192,7 +192,9 @@ struct DoorVideoCoordinatorEventSinkTests {
         await waitUntil(timeout: 3) { !coordinator.isPinned }
 
         #expect(coordinator.isPinned == false)
-        #expect(coordinator.pinStopMessage == "Camera unavailable - unpinned")
+        // The stop message carries the last failure's reason (bead
+        // gateopener-41m.21) rather than the generic fallback.
+        #expect(coordinator.pinStopMessage == "Unpinned - boom 3")
         #expect(coordinator.sessionStartCount == 4)
 
         let events = recorder.events

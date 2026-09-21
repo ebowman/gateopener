@@ -29,11 +29,36 @@ public struct DoorVideoPinPolicy: Sendable, Equatable {
     /// stateless and only ever sees the count it's handed.
     public var maxConsecutiveFailures: Int
 
-    /// Extra delay to wait before renewing after a FAILED session, on top
-    /// of whatever door-busy cooldown `DoorVideoSessionRegistry` already
-    /// enforces. Not applied after a normal `.ended` outcome, where renewal
-    /// is immediate (`after: 0`).
-    public var failureBackoff: TimeInterval
+    /// Escalating extra delay to wait before renewing after a FAILED
+    /// session, on top of whatever door-busy cooldown
+    /// `DoorVideoSessionRegistry` already enforces. Not applied after a
+    /// normal `.ended` outcome, where renewal is immediate (`after: 0`).
+    ///
+    /// Indexed by `consecutiveFailures - 1` (the 1st failure uses index 0,
+    /// the 2nd index 1, etc); once `consecutiveFailures - 1` reaches or
+    /// exceeds the array's last index, the LAST element is reused for every
+    /// further failure rather than going out of bounds. An EMPTY array is
+    /// treated as `[2]` (i.e. every failure backs off 2s) rather than
+    /// crashing or backing off `0` -- there is no sensible reading of "no
+    /// schedule at all" other than falling back to a single safe default.
+    public var failureBackoffs: [TimeInterval]
+
+    /// Convenience accessor for the schedule's first element, useful for
+    /// callers that only care about a single representative backoff value
+    /// (e.g. logging/diagnostics). Mirrors the empty-array fallback in
+    /// `failureBackoffs`'s doc comment: `[].first` would be `nil`, so this
+    /// returns `2` in that case instead.
+    public var failureBackoff: TimeInterval {
+        failureBackoffs.first ?? 2
+    }
+
+    /// Minimum extra delay enforced when a failed renewal's failure was
+    /// specifically a "door busy" outcome (see `decide(...)`'s
+    /// `failureWasDoorBusy` parameter). A door-busy failure means the door
+    /// itself is still within its own post-session cooldown (see
+    /// `DoorVideoBusyPolicy.cooldown`), so retrying sooner than this is
+    /// pointless -- the door will just refuse again.
+    public var doorBusyMinimumBackoff: TimeInterval = 10
 
     /// - Parameters:
     ///   - maxPinnedDuration: defaults to 300s (5 minutes). A non-positive
@@ -42,19 +67,45 @@ public struct DoorVideoPinPolicy: Sendable, Equatable {
     ///     unwanted, so a non-positive cap means the cap is immediately
     ///     considered reached (any `pinnedElapsed >= 0` stops with
     ///     `.maxDuration`).
-    ///   - maxConsecutiveFailures: defaults to 3. A value `<= 0` behaves as
+    ///   - maxConsecutiveFailures: defaults to 4. A value `<= 0` behaves as
     ///     `1`, i.e. the first failure already stops the pin -- there is no
     ///     sensible reading of "tolerate zero or fewer failures" other than
     ///     "stop on the first one".
-    ///   - failureBackoff: defaults to 2s.
+    ///   - failureBackoffs: defaults to `[2, 5, 10]`. See `failureBackoffs`'s
+    ///     doc comment for indexing/clamping/empty-array behavior.
     public init(
         maxPinnedDuration: TimeInterval = 300,
-        maxConsecutiveFailures: Int = 3,
-        failureBackoff: TimeInterval = 2
+        maxConsecutiveFailures: Int = 4,
+        failureBackoffs: [TimeInterval] = [2, 5, 10]
     ) {
         self.maxPinnedDuration = maxPinnedDuration
         self.maxConsecutiveFailures = maxConsecutiveFailures
-        self.failureBackoff = failureBackoff
+        self.failureBackoffs = failureBackoffs
+    }
+
+    /// Compat initializer for callers/tests still passing a single
+    /// `failureBackoff:` value -- equivalent to `failureBackoffs: [value]`,
+    /// i.e. every consecutive failure uses the SAME backoff (no escalation).
+    public init(
+        maxPinnedDuration: TimeInterval = 300,
+        maxConsecutiveFailures: Int = 4,
+        failureBackoff: TimeInterval
+    ) {
+        self.init(
+            maxPinnedDuration: maxPinnedDuration,
+            maxConsecutiveFailures: maxConsecutiveFailures,
+            failureBackoffs: [failureBackoff]
+        )
+    }
+
+    /// Looks up the backoff to use for the given (1-based) consecutive
+    /// failure count, per `failureBackoffs`'s indexing/clamping/empty-array
+    /// rules.
+    private func scheduledBackoff(forConsecutiveFailures consecutiveFailures: Int) -> TimeInterval {
+        guard !failureBackoffs.isEmpty else { return 2 }
+        let index = max(0, consecutiveFailures - 1)
+        let clampedIndex = min(index, failureBackoffs.count - 1)
+        return failureBackoffs[clampedIndex]
     }
 
     /// How a finished session ended, as classified by the caller.
@@ -104,7 +155,12 @@ public struct DoorVideoPinPolicy: Sendable, Equatable {
     ///    `consecutiveFailures` is the count INCLUDING the failure currently
     ///    being decided (i.e. the caller increments before calling this).
     /// 4. `outcome == .failed` (and none of the above fired) ->
-    ///    `.renew(after: failureBackoff)`.
+    ///    `.renew(after:)` using `failureBackoffs`' schedule for the current
+    ///    `consecutiveFailures` count; if `failureWasDoorBusy` is `true`,
+    ///    that scheduled value is raised to
+    ///    `max(scheduleValue, doorBusyMinimumBackoff)` -- a door-busy failure
+    ///    still counts as a failure and does not change rule order, it only
+    ///    ever raises (never lowers) the wait.
     /// 5. `outcome == .ended` (and none of the above fired) ->
     ///    `.renew(after: 0)`: the door's normal expiry needs no extra delay
     ///    beyond whatever door-busy cooldown the caller separately waits
@@ -122,11 +178,17 @@ public struct DoorVideoPinPolicy: Sendable, Equatable {
     ///     rather than producing a nonsensical decision.
     ///   - consecutiveFailures: the number of consecutive `.failed`
     ///     outcomes so far, INCLUDING the one being decided right now.
+    ///   - failureWasDoorBusy: whether the failure being decided (only
+    ///     meaningful when `outcome == .failed`) was specifically the door
+    ///     reporting itself busy (see `DoorVideoBusyPolicy.failureMessage(for:
+    ///     .doorBusy)`). Defaults to `false` so existing callers/tests that
+    ///     never pass it keep their current (schedule-only) behavior.
     public func decide(
         isPinned: Bool,
         outcome: SessionOutcome,
         pinnedElapsed: TimeInterval,
-        consecutiveFailures: Int
+        consecutiveFailures: Int,
+        failureWasDoorBusy: Bool = false
     ) -> Decision {
         guard isPinned else {
             return .stop(.notPinned)
@@ -144,7 +206,9 @@ public struct DoorVideoPinPolicy: Sendable, Equatable {
 
         switch outcome {
         case .failed:
-            return .renew(after: failureBackoff)
+            let scheduled = scheduledBackoff(forConsecutiveFailures: consecutiveFailures)
+            let delay = failureWasDoorBusy ? max(scheduled, doorBusyMinimumBackoff) : scheduled
+            return .renew(after: delay)
         case .ended:
             return .renew(after: 0)
         }
@@ -160,19 +224,49 @@ public struct DoorVideoPinPolicy: Sendable, Equatable {
         return max(0, maxPinnedDuration - clampedElapsed)
     }
 
+    /// The hard cap `stopMessage(_:lastFailure:)` guarantees for every
+    /// message it returns, matching this bead's DONE-CRITERIA.
+    private static let stopMessageMaxLength = 40
+
     /// A SHORT, human-readable message safe to show directly in a label for
     /// a given `StopReason`, or `nil` if that reason should show no message
-    /// at all.
+    /// at all. Guaranteed to be at most `stopMessageMaxLength` (40)
+    /// characters.
     ///
     /// - `.maxDuration` -> `"Stream ended - tap to resume"`.
-    /// - `.tooManyFailures` -> `"Camera unavailable - unpinned"`.
+    /// - `.tooManyFailures` with a non-empty `lastFailure` -> `"Unpinned -
+    ///   <lastFailure>"`, truncating `lastFailure` (appending "…") as needed
+    ///   to keep the whole message at or under the 40-character cap.
+    /// - `.tooManyFailures` with `lastFailure == nil` or empty -> the
+    ///   existing `"Camera unavailable - unpinned"`.
     /// - `.notPinned` -> `nil`: there is no pin to explain anything about.
-    public static func stopMessage(_ reason: StopReason) -> String? {
+    ///
+    /// - Parameter lastFailure: the most recent `.failed(message:)` text
+    ///   seen on this pin, if any. Defaults to `nil` so existing one-argument
+    ///   call sites keep compiling and behaving exactly as before (the
+    ///   existing "Camera unavailable - unpinned" wording).
+    public static func stopMessage(_ reason: StopReason, lastFailure: String? = nil) -> String? {
         switch reason {
         case .maxDuration:
             return "Stream ended - tap to resume"
         case .tooManyFailures:
-            return "Camera unavailable - unpinned"
+            guard let lastFailure, !lastFailure.isEmpty else {
+                return "Camera unavailable - unpinned"
+            }
+            let prefix = "Unpinned - "
+            let budget = stopMessageMaxLength - prefix.count
+            guard budget > 0 else {
+                return "Camera unavailable - unpinned"
+            }
+            if lastFailure.count <= budget {
+                return prefix + lastFailure
+            }
+            let truncationBudget = budget - 1 // room for the "…" suffix
+            guard truncationBudget > 0 else {
+                return "Camera unavailable - unpinned"
+            }
+            let truncated = String(lastFailure.prefix(truncationBudget)) + "…"
+            return prefix + truncated
         case .notPinned:
             return nil
         }

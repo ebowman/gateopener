@@ -50,33 +50,20 @@ struct DoorVideoPinPolicyTests {
 
     @Test func maxDurationTakesPriorityOverTooManyFailuresWhenBothApply() {
         let policy = DoorVideoPinPolicy()
-        // Pinned, elapsed >= 300, AND this is the 3rd consecutive failure:
-        // per rule order, maxDuration must win.
+        // Pinned, elapsed >= 300, AND this is the 4th consecutive failure
+        // (the default maxConsecutiveFailures): per rule order, maxDuration
+        // must win.
         #expect(
-            policy.decide(isPinned: true, outcome: .failed, pinnedElapsed: 300, consecutiveFailures: 3)
+            policy.decide(isPinned: true, outcome: .failed, pinnedElapsed: 300, consecutiveFailures: 4)
                 == .stop(.maxDuration)
         )
     }
 
     // MARK: - Rule 3: too many consecutive failures
 
-    @Test func thirdConsecutiveFailureStopsWithTooManyFailures() {
-        let policy = DoorVideoPinPolicy()
-        #expect(
-            policy.decide(isPinned: true, outcome: .failed, pinnedElapsed: 0, consecutiveFailures: 3)
-                == .stop(.tooManyFailures)
-        )
-    }
-
-    @Test func secondConsecutiveFailureRenewsInsteadOfStopping() {
-        let policy = DoorVideoPinPolicy()
-        #expect(
-            policy.decide(isPinned: true, outcome: .failed, pinnedElapsed: 0, consecutiveFailures: 2)
-                == .renew(after: 2)
-        )
-    }
-
-    @Test func failuresBeyondMaxAlsoStop() {
+    /// With the default `maxConsecutiveFailures == 4`, the 4th consecutive
+    /// failure stops the pin.
+    @Test func fourthConsecutiveFailureStopsWithTooManyFailures() {
         let policy = DoorVideoPinPolicy()
         #expect(
             policy.decide(isPinned: true, outcome: .failed, pinnedElapsed: 0, consecutiveFailures: 4)
@@ -84,21 +71,162 @@ struct DoorVideoPinPolicyTests {
         )
     }
 
-    // MARK: - Rule 4: failed but under the failure limit renews with backoff
+    @Test func thirdConsecutiveFailureRenewsInsteadOfStopping() {
+        let policy = DoorVideoPinPolicy()
+        #expect(
+            policy.decide(isPinned: true, outcome: .failed, pinnedElapsed: 0, consecutiveFailures: 3)
+                == .renew(after: 10)
+        )
+    }
 
-    @Test func firstFailureRenewsWithFailureBackoff() {
-        let policy = DoorVideoPinPolicy(failureBackoff: 2)
+    @Test func failuresBeyondMaxAlsoStop() {
+        let policy = DoorVideoPinPolicy()
+        #expect(
+            policy.decide(isPinned: true, outcome: .failed, pinnedElapsed: 0, consecutiveFailures: 5)
+                == .stop(.tooManyFailures)
+        )
+    }
+
+    // MARK: - Rule 4: failed but under the failure limit renews with the escalating schedule
+
+    /// Failures 1, 2, 3 map to the default schedule's 2, 5, 10 (last value
+    /// reused beyond the array's length, exercised separately below).
+    @Test func failureScheduleEscalatesAcrossConsecutiveFailures() {
+        let policy = DoorVideoPinPolicy()
         #expect(
             policy.decide(isPinned: true, outcome: .failed, pinnedElapsed: 0, consecutiveFailures: 1)
                 == .renew(after: 2)
         )
+        #expect(
+            policy.decide(isPinned: true, outcome: .failed, pinnedElapsed: 0, consecutiveFailures: 2)
+                == .renew(after: 5)
+        )
+        #expect(
+            policy.decide(isPinned: true, outcome: .failed, pinnedElapsed: 0, consecutiveFailures: 3)
+                == .renew(after: 10)
+        )
     }
 
-    @Test func failureBackoffUsesCustomValue() {
-        let policy = DoorVideoPinPolicy(failureBackoff: 7.5)
+    /// Beyond the schedule's length, the LAST element is reused rather than
+    /// going out of bounds.
+    @Test func failureScheduleClampsToLastElementBeyondArrayLength() {
+        let policy = DoorVideoPinPolicy(maxConsecutiveFailures: 100, failureBackoffs: [2, 5, 10])
+        #expect(
+            policy.decide(isPinned: true, outcome: .failed, pinnedElapsed: 0, consecutiveFailures: 4)
+                == .renew(after: 10)
+        )
+        #expect(
+            policy.decide(isPinned: true, outcome: .failed, pinnedElapsed: 0, consecutiveFailures: 50)
+                == .renew(after: 10)
+        )
+    }
+
+    /// An EMPTY schedule behaves as `[2]` -- every failure backs off 2s.
+    @Test func emptyFailureScheduleBehavesAsSingleTwoSecondBackoff() {
+        let policy = DoorVideoPinPolicy(maxConsecutiveFailures: 100, failureBackoffs: [])
+        #expect(
+            policy.decide(isPinned: true, outcome: .failed, pinnedElapsed: 0, consecutiveFailures: 1)
+                == .renew(after: 2)
+        )
+        #expect(
+            policy.decide(isPinned: true, outcome: .failed, pinnedElapsed: 0, consecutiveFailures: 5)
+                == .renew(after: 2)
+        )
+    }
+
+    @Test func customFailureScheduleUsesProvidedValues() {
+        let policy = DoorVideoPinPolicy(maxConsecutiveFailures: 100, failureBackoffs: [1, 3, 7.5])
+        #expect(
+            policy.decide(isPinned: true, outcome: .failed, pinnedElapsed: 0, consecutiveFailures: 1)
+                == .renew(after: 1)
+        )
+        #expect(
+            policy.decide(isPinned: true, outcome: .failed, pinnedElapsed: 0, consecutiveFailures: 2)
+                == .renew(after: 3)
+        )
+        #expect(
+            policy.decide(isPinned: true, outcome: .failed, pinnedElapsed: 0, consecutiveFailures: 3)
+                == .renew(after: 7.5)
+        )
+    }
+
+    // MARK: - Compat init (single failureBackoff:)
+
+    /// The compat initializer taking a single `failureBackoff:` behaves as
+    /// `failureBackoffs: [value]` -- no escalation, every failure uses the
+    /// same value.
+    @Test func compatInitWithSingleFailureBackoffAppliesToEveryFailure() {
+        let policy = DoorVideoPinPolicy(maxConsecutiveFailures: 100, failureBackoff: 7.5)
+        #expect(policy.failureBackoffs == [7.5])
+        #expect(policy.failureBackoff == 7.5)
         #expect(
             policy.decide(isPinned: true, outcome: .failed, pinnedElapsed: 0, consecutiveFailures: 1)
                 == .renew(after: 7.5)
+        )
+        #expect(
+            policy.decide(isPinned: true, outcome: .failed, pinnedElapsed: 0, consecutiveFailures: 4)
+                == .renew(after: 7.5)
+        )
+    }
+
+    // MARK: - Door-busy minimum backoff floor
+
+    /// `failureWasDoorBusy: true` raises the schedule's 2s and 5s values up
+    /// to the 10s floor, but leaves the schedule's own 10s unaffected (the
+    /// floor only ever raises, never lowers).
+    @Test func doorBusyFloorRaisesSmallScheduledValuesButLeavesTenUnaffected() {
+        let policy = DoorVideoPinPolicy()
+        #expect(
+            policy.decide(
+                isPinned: true, outcome: .failed, pinnedElapsed: 0,
+                consecutiveFailures: 1, failureWasDoorBusy: true
+            ) == .renew(after: 10)
+        )
+        #expect(
+            policy.decide(
+                isPinned: true, outcome: .failed, pinnedElapsed: 0,
+                consecutiveFailures: 2, failureWasDoorBusy: true
+            ) == .renew(after: 10)
+        )
+        #expect(
+            policy.decide(
+                isPinned: true, outcome: .failed, pinnedElapsed: 0,
+                consecutiveFailures: 3, failureWasDoorBusy: true
+            ) == .renew(after: 10)
+        )
+    }
+
+    /// A door-busy failure still counts as a failure and does not change
+    /// rule order: hitting the failure limit still stops the pin even when
+    /// `failureWasDoorBusy` is `true`.
+    @Test func doorBusyFailureStillStopsAtFailureLimit() {
+        let policy = DoorVideoPinPolicy()
+        #expect(
+            policy.decide(
+                isPinned: true, outcome: .failed, pinnedElapsed: 0,
+                consecutiveFailures: 4, failureWasDoorBusy: true
+            ) == .stop(.tooManyFailures)
+        )
+    }
+
+    /// A custom `doorBusyMinimumBackoff` is honoured.
+    @Test func customDoorBusyMinimumBackoffHonoured() {
+        var policy = DoorVideoPinPolicy(failureBackoffs: [2])
+        policy.doorBusyMinimumBackoff = 20
+        #expect(
+            policy.decide(
+                isPinned: true, outcome: .failed, pinnedElapsed: 0,
+                consecutiveFailures: 1, failureWasDoorBusy: true
+            ) == .renew(after: 20)
+        )
+    }
+
+    /// `failureWasDoorBusy: false` (the default) never applies the floor.
+    @Test func failureWasDoorBusyDefaultsToFalse() {
+        let policy = DoorVideoPinPolicy()
+        #expect(
+            policy.decide(isPinned: true, outcome: .failed, pinnedElapsed: 0, consecutiveFailures: 1)
+                == .renew(after: 2)
         )
     }
 
@@ -241,8 +369,51 @@ struct DoorVideoPinPolicyTests {
         #expect(DoorVideoPinPolicy.stopMessage(.maxDuration) == "Stream ended - tap to resume")
     }
 
-    @Test func stopMessageForTooManyFailures() {
+    @Test func stopMessageForTooManyFailuresWithNoLastFailureUsesGenericMessage() {
         #expect(DoorVideoPinPolicy.stopMessage(.tooManyFailures) == "Camera unavailable - unpinned")
+    }
+
+    @Test func stopMessageForTooManyFailuresWithNilLastFailureUsesGenericMessage() {
+        #expect(
+            DoorVideoPinPolicy.stopMessage(.tooManyFailures, lastFailure: nil)
+                == "Camera unavailable - unpinned"
+        )
+    }
+
+    @Test func stopMessageForTooManyFailuresWithEmptyLastFailureUsesGenericMessage() {
+        #expect(
+            DoorVideoPinPolicy.stopMessage(.tooManyFailures, lastFailure: "")
+                == "Camera unavailable - unpinned"
+        )
+    }
+
+    /// A short `lastFailure` is included verbatim, prefixed with "Unpinned - ".
+    @Test func stopMessageForTooManyFailuresWithLastFailureIncludesReason() {
+        #expect(
+            DoorVideoPinPolicy.stopMessage(.tooManyFailures, lastFailure: "Could not reach door camera")
+                == "Unpinned - Could not reach door camera"
+        )
+    }
+
+    /// The formatted message must never exceed 40 characters, even for a
+    /// `lastFailure` that would otherwise overflow it.
+    @Test func stopMessageForTooManyFailuresTruncatesLongLastFailure() {
+        let long = "This is a very long failure reason that will not fit"
+        let message = DoorVideoPinPolicy.stopMessage(.tooManyFailures, lastFailure: long)
+        #expect(message != nil)
+        #expect((message ?? "").count <= 40)
+        #expect((message ?? "").hasPrefix("Unpinned - "))
+        #expect((message ?? "").hasSuffix("…"))
+    }
+
+    /// Every possible `lastFailure` length exercises the exact <= 40
+    /// invariant, not merely the one long example above.
+    @Test func stopMessageForTooManyFailuresStaysWithinFortyCharactersAcrossLengths() {
+        for length in stride(from: 0, through: 60, by: 1) {
+            let reason = String(repeating: "x", count: length)
+            let message = DoorVideoPinPolicy.stopMessage(.tooManyFailures, lastFailure: reason)
+            #expect((message ?? "").count <= 40)
+        }
     }
 
     @Test func stopMessageForNotPinnedIsNil() {
@@ -254,7 +425,9 @@ struct DoorVideoPinPolicyTests {
     @Test func defaultInitValues() {
         let policy = DoorVideoPinPolicy()
         #expect(policy.maxPinnedDuration == 300)
-        #expect(policy.maxConsecutiveFailures == 3)
+        #expect(policy.maxConsecutiveFailures == 4)
+        #expect(policy.failureBackoffs == [2, 5, 10])
         #expect(policy.failureBackoff == 2)
+        #expect(policy.doorBusyMinimumBackoff == 10)
     }
 }
