@@ -122,6 +122,19 @@ public final class DoorVideoSession: NSObject {
     /// callback channel into a displayed `<video>` element).
     private static let plateauInterval: TimeInterval = 6
 
+    /// How long after `sessionStartedAt` with NO frame ever having arrived
+    /// before the session is declared failed (as opposed to a stall, which
+    /// only applies once at least one frame has been seen — see
+    /// `livenessVerdict(elapsedSinceStart:sinceLastFrame:hardTimeout:plateau:
+    /// firstFrameTimeout:)`). This is the "rtc/offer succeeded (HTTP 200 +
+    /// answer applied) but the door never actually sends media" case from
+    /// bead gateopener-12h.10 (2 of 5 rapid reopens got 200 but zero
+    /// frames). Matches `../comelit`'s `FIRST_FRAME_TIMEOUT_SECONDS`.
+    ///
+    /// Instance-level (not `static`) so it is injectable per-session for
+    /// tests, but every real call site relies on the default.
+    private let firstFrameTimeout: TimeInterval
+
     /// The `WKWebView` hosting `door-video.html`. Exposed directly (rather
     /// than wrapped in a custom view) because the `<video>` element inside
     /// the page is displayed DIRECTLY on iOS — see this type's doc comment
@@ -217,12 +230,14 @@ public final class DoorVideoSession: NSObject {
         tokenManager: TokenManager,
         gateClient: any GateOpening,
         appSettings: AppSettings,
-        urlSession: URLSession = .shared
+        urlSession: URLSession = .shared,
+        firstFrameTimeout: TimeInterval = 10
     ) {
         self.tokenManager = tokenManager
         self.gateClient = gateClient
         self.appSettings = appSettings
         self.urlSession = urlSession
+        self.firstFrameTimeout = firstFrameTimeout
 
         let config = WKWebViewConfiguration()
         // Without these two, iOS refuses to autoplay the <video> element
@@ -610,12 +625,78 @@ public final class DoorVideoSession: NSObject {
 
     // MARK: - Liveness watchdog
 
+    /// The three-way (four-way counting `.keepGoing`) liveness decision,
+    /// returned by the pure `livenessVerdict(elapsedSinceStart:
+    /// sinceLastFrame:hardTimeout:plateau:firstFrameTimeout:)` function
+    /// below so it can be unit-tested without a `WKWebView`.
+    enum LivenessVerdict: Equatable {
+        /// No terminal condition met yet; keep polling.
+        case keepGoing
+        /// `elapsedSinceStart >= hardTimeout`. Ends in `.ended` (the door's
+        /// own ~28-30s window, or the backstop, is a normal end).
+        case endedHardTimeout
+        /// A frame HAS arrived before, but none for >= `plateau`. Ends in
+        /// `.ended` (a genuine stall of an established stream is also a
+        /// normal end).
+        case endedStall
+        /// NO frame has EVER arrived and `elapsedSinceStart >=
+        /// firstFrameTimeout`. Ends in `.failed("No video from door
+        /// camera")` — the rtc/offer succeeded but the door never actually
+        /// sent media, which is an error, not a normal end.
+        case failedNoFirstFrame
+    }
+
+    /// Pure decision function backing `startLivenessWatchdog()`'s per-tick
+    /// logic — kept free of `self`/`WKWebView` so it can be exhaustively
+    /// unit-tested.
+    ///
+    /// Precedence when more than one condition is simultaneously true:
+    /// **hard timeout > no-first-frame > stall.** In practice hard timeout
+    /// (35s) and no-first-frame (10s) can only coincide if `firstFrameTimeout
+    /// >= hardTimeout` (not the production configuration), and stall
+    /// requires a frame to have already arrived (so it can never coincide
+    /// with no-first-frame); the explicit ordering below is what makes that
+    /// guarantee hold regardless of how the two timeouts are configured.
+    ///
+    /// - Parameters:
+    ///   - elapsedSinceStart: `now - sessionStartedAt`.
+    ///   - sinceLastFrame: `now - lastFrameAt`, or `nil` if no frame has ever
+    ///     arrived.
+    ///   - hardTimeout: The absolute session-length backstop.
+    ///   - plateau: How long with no new frame (after at least one frame
+    ///     arrived) before a stall is declared.
+    ///   - firstFrameTimeout: How long with no frame EVER arriving before the
+    ///     session is declared failed.
+    static func livenessVerdict(
+        elapsedSinceStart: TimeInterval,
+        sinceLastFrame: TimeInterval?,
+        hardTimeout: TimeInterval,
+        plateau: TimeInterval,
+        firstFrameTimeout: TimeInterval
+    ) -> LivenessVerdict {
+        if elapsedSinceStart >= hardTimeout {
+            return .endedHardTimeout
+        }
+        guard let sinceLastFrame else {
+            // No frame has ever arrived.
+            if elapsedSinceStart >= firstFrameTimeout {
+                return .failedNoFirstFrame
+            }
+            return .keepGoing
+        }
+        if sinceLastFrame >= plateau {
+            return .endedStall
+        }
+        return .keepGoing
+    }
+
     /// Watches for new "frame" messages (see `userContentController(_:
     /// didReceive:)` below) and ends the session on a stall
-    /// (`plateauInterval` with no new frame) or the hard timeout —
-    /// NEVER on ICE connection state, per this type's doc comment and bd
-    /// memory `gateopener-live-video-architecture` (ICE can stay
-    /// "connected" for ~10s after the door actually stops sending media).
+    /// (`plateauInterval` with no new frame), the hard timeout, or (bead
+    /// gateopener-41m.8) a first-frame timeout — NEVER on ICE connection
+    /// state, per this type's doc comment and bd memory
+    /// `gateopener-live-video-architecture` (ICE can stay "connected" for
+    /// ~10s after the door actually stops sending media).
     private func startLivenessWatchdog() {
         livenessTask = Task { [weak self] in
             while true {
@@ -623,43 +704,59 @@ public final class DoorVideoSession: NSObject {
                 if Task.isCancelled { return }
                 guard let self, !self.hasStopped else { return }
 
+                guard let startedAt = self.sessionStartedAt else { continue }
                 let now = Date()
-                if let startedAt = self.sessionStartedAt, now.timeIntervalSince(startedAt) >= Self.hardTimeout {
+                let elapsedSinceStart = now.timeIntervalSince(startedAt)
+                let sinceLastFrame = self.lastFrameAt.map { now.timeIntervalSince($0) }
+
+                let verdict = Self.livenessVerdict(
+                    elapsedSinceStart: elapsedSinceStart,
+                    sinceLastFrame: sinceLastFrame,
+                    hardTimeout: Self.hardTimeout,
+                    plateau: Self.plateauInterval,
+                    firstFrameTimeout: self.firstFrameTimeout
+                )
+
+                switch verdict {
+                case .keepGoing:
+                    continue
+                case .endedHardTimeout:
                     Self.logger.notice("hard timeout (\(Self.hardTimeout, privacy: .public)s) reached; ending session")
                     self.endDueToLiveness(reason: "hard timeout after \(Self.hardTimeout)s")
                     return
-                }
-
-                guard let lastFrameAt = self.lastFrameAt else {
-                    // No frame has arrived yet; only the hard timeout above
-                    // (not the plateau interval) applies until the first
-                    // frame is seen, matching `DoorVideoLiveness
-                    // .rtpCountersShowProgress`'s "a nil baseline must not
-                    // count as progress OR as an immediate stall" guard —
-                    // a session that never receives any frame at all still
-                    // needs to end via the hard timeout, not a premature
-                    // plateau firing before any frame was ever possible.
-                    continue
-                }
-                if now.timeIntervalSince(lastFrameAt) >= Self.plateauInterval {
+                case .endedStall:
                     Self.logger.notice("no new frame for \(Self.plateauInterval, privacy: .public)s; ending session (stall)")
                     self.endDueToLiveness(reason: "stall after \(Self.plateauInterval)s")
+                    return
+                case .failedNoFirstFrame:
+                    Self.logger.notice("no first frame after \(self.firstFrameTimeout, privacy: .public)s; failing session")
+                    self.endDueToNoFirstFrame()
                     return
                 }
             }
         }
     }
 
-    /// Common teardown for both stall and hard-timeout endings: runs the
-    /// same JS teardown/blank as `stop()` and transitions to `.ended`
-    /// (never `.failed` — the door closing its own ~28-30s window, or a
-    /// genuine stall, is a NORMAL end of session, not an error).
+    /// Shared teardown steps for every liveness-driven ending
+    /// (`endDueToLiveness(reason:)` and `endDueToNoFirstFrame()`): guards
+    /// `hasStopped` idempotency, appends + persists a diagnostics line,
+    /// resumes any in-flight page-load continuation, blanks the page
+    /// (`markClosing()` then `closeSession()`, best-effort, same order and
+    /// rationale as `stop()`), and removes both script-message handlers.
+    /// Does NOT set `state` — callers set the terminal state themselves
+    /// (`.ended` vs `.failed`) after this returns.
     ///
-    /// - Parameter reason: A short, human-readable terminal reason (e.g.
-    ///   "stall after 6.0s" or "hard timeout after 35.0s") appended to
-    ///   `diagnostics` and persisted before `state` transitions to `.ended`.
-    private func endDueToLiveness(reason: String) {
-        guard !hasStopped else { return }
+    /// - Parameter reason: Appended to `diagnostics` as `terminal reason:
+    ///   <reason>`.
+    /// - Returns: `true` if teardown ran (the caller should proceed to set
+    ///   `state`); `false` if the session had already stopped (the caller
+    ///   must NOT touch `state` — this is what prevents a first frame that
+    ///   arrives between the verdict and the teardown from resurrecting the
+    ///   session, since `recordFrameReceived()` itself also checks
+    ///   `hasStopped`, and either guard winning is sufficient).
+    @discardableResult
+    private func performLivenessTeardown(reason: String) -> Bool {
+        guard !hasStopped else { return false }
         hasStopped = true
 
         diagnostics.append("[\(Self.diagTimestamp())] terminal reason: \(reason)")
@@ -688,7 +785,32 @@ public final class DoorVideoSession: NSObject {
         webView.configuration.userContentController.removeScriptMessageHandler(forName: "frame")
         webView.configuration.userContentController.removeScriptMessageHandler(forName: "diag")
 
+        return true
+    }
+
+    /// Common teardown for both stall and hard-timeout endings: runs the
+    /// shared teardown steps (`performLivenessTeardown(reason:)`) and
+    /// transitions to `.ended` (never `.failed` — the door closing its own
+    /// ~28-30s window, or a genuine stall, is a NORMAL end of session, not
+    /// an error).
+    ///
+    /// - Parameter reason: A short, human-readable terminal reason (e.g.
+    ///   "stall after 6.0s" or "hard timeout after 35.0s") appended to
+    ///   `diagnostics` and persisted before `state` transitions to `.ended`.
+    private func endDueToLiveness(reason: String) {
+        guard performLivenessTeardown(reason: reason) else { return }
         state = .ended
+    }
+
+    /// Teardown for the "rtc/offer succeeded but no frame ever arrived"
+    /// failure (bead gateopener-41m.8): runs the SAME shared teardown steps
+    /// as `endDueToLiveness(reason:)` via `performLivenessTeardown(reason:)`,
+    /// but transitions to `.failed("No video from door camera")` instead of
+    /// `.ended` — unlike a stall or the hard timeout, a session that never
+    /// received a single frame is an error, not a normal end of stream.
+    private func endDueToNoFirstFrame() {
+        guard performLivenessTeardown(reason: "no first frame after \(firstFrameTimeout)s") else { return }
+        state = .failed("No video from door camera")
     }
 
     // MARK: - rtc/offer (Swift-side; the bearer token never reaches page JS)
