@@ -197,6 +197,28 @@ final class DoorVideoCoordinator {
     /// and by a fresh renewal superseding an earlier one.
     private var renewTask: Task<Void, Never>?
 
+    /// Number of PINNED renewals started on the CURRENT pin (bead
+    /// gateopener-41m.15 STEP 4) — incremented exactly where
+    /// `handlePinnableTermination(_:for:whenNotRenewing:)` decides
+    /// `.renew(after:)` and actually calls `startSession(resetPanelVisible:
+    /// false)` (both the immediate `after == 0` path and the failure-backoff
+    /// path once its sleep completes and it starts the replacement), NOT
+    /// merely when a renewal is scheduled — a `renewTask` that is later
+    /// cancelled (e.g. by `dismiss()`/`startOrRetain()` superseding it) must
+    /// not count as a renewal that happened. Reset to `0` by `setPinned(_:)`
+    /// (both directions) and by `dismiss()`, so a later pin starts counting
+    /// fresh. `internal` (not `private`) so `DoorVideoCoordinatorTests` can
+    /// assert it directly.
+    private(set) var pinRenewalCount = 0
+
+    /// `true` once the CURRENTLY mounted session is itself a pinned renewal
+    /// (`pinRenewalCount > 0`) — bead gateopener-41m.15 STEP 4's signal for
+    /// `MainView`/`DoorVideoSlotContent.content(...)` to show "Reconnecting…"
+    /// instead of `DoorVideoView`'s own "Connecting…"/"Camera unavailable"
+    /// text: the pin's very FIRST session has nothing to "reconnect" to yet,
+    /// so it still shows the ordinary text.
+    var isRenewing: Bool { pinRenewalCount > 0 }
+
     /// - Parameters:
     ///   - makeSession: Builds a fresh `DoorVideoSession` per replace. See
     ///     `makeSession`'s doc comment.
@@ -255,6 +277,7 @@ final class DoorVideoCoordinator {
             pinnedSince = now()
             consecutiveFailures = 0
             pinStopMessage = nil
+            pinRenewalCount = 0
 
             let phase = session?.state.phase
             if phase != .connecting, phase != .streaming {
@@ -263,6 +286,7 @@ final class DoorVideoCoordinator {
         } else {
             isPinned = false
             pinnedSince = nil
+            pinRenewalCount = 0
             renewTask?.cancel()
             renewTask = nil
         }
@@ -314,6 +338,7 @@ final class DoorVideoCoordinator {
         renewTask = nil
         isPinned = false
         pinnedSince = nil
+        pinRenewalCount = 0
         session?.stop()
         session = nil
         isPanelVisible = false
@@ -494,6 +519,7 @@ final class DoorVideoCoordinator {
                 // right before this), no `lastTerminal` change (stays
                 // `.none`), no `scheduleAutoClear`.
                 isPanelVisible = true
+                pinRenewalCount += 1
                 startSession(resetPanelVisible: false)
             } else {
                 // Failure backoff: leave the just-failed `changedSession`
@@ -516,6 +542,7 @@ final class DoorVideoCoordinator {
                     guard !Task.isCancelled else { return }
                     guard self.session === changedSession else { return }
                     self.isPanelVisible = true
+                    self.pinRenewalCount += 1
                     self.startSession(resetPanelVisible: false)
                 }
             }

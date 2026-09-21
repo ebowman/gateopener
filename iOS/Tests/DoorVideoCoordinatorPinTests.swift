@@ -433,4 +433,148 @@ struct DoorVideoCoordinatorPinTests {
         currentTime = currentTime.addingTimeInterval(100)
         #expect(coordinator.pinRemaining == 200)
     }
+
+    // MARK: - pinRenewalCount / isRenewing (bead gateopener-41m.15)
+
+    /// The pin's FIRST session is not a renewal: `pinRenewalCount == 0` and
+    /// `isRenewing == false` immediately after `setPinned(true)` starts it.
+    ///
+    /// MUTATION CHECK: incrementing `pinRenewalCount` anywhere in
+    /// `setPinned(true)`/`startSession()` itself (rather than only inside
+    /// `handlePinnableTermination`'s `.renew` handling) would make this fail.
+    @Test func firstPinnedSessionIsNotARenewal() async {
+        let coordinator = DoorVideoCoordinator(
+            makeSession: { DoorVideoSession.debugStub(connectingDelay: 10, streamingDuration: 10) },
+            isEnabled: { true }
+        )
+
+        coordinator.setPinned(true)
+        await Task.yield()
+
+        #expect(coordinator.pinRenewalCount == 0)
+        #expect(coordinator.isRenewing == false)
+    }
+
+    /// Once a pinned session ends and is renewed (`.renew(after: 0)`),
+    /// `pinRenewalCount` becomes `1` and `isRenewing` becomes `true` — the
+    /// signal `DoorVideoSlotContent.content(...)` uses to show
+    /// "Reconnecting…" instead of "Connecting…" for the second-and-later
+    /// mounted session.
+    ///
+    /// MUTATION CHECK: removing `pinRenewalCount += 1` from the `after <= 0`
+    /// branch of `handlePinnableTermination` would leave this at `0` forever,
+    /// failing both assertions below.
+    @Test func renewalAfterEndedIncrementsRenewalCountAndSetsIsRenewing() async {
+        var callCount = 0
+        let coordinator = DoorVideoCoordinator(
+            makeSession: {
+                defer { callCount += 1 }
+                return callCount == 0
+                    ? DoorVideoSession.debugStub(connectingDelay: 0.02, streamingDuration: 0.02)
+                    : DoorVideoSession.debugStub(connectingDelay: 10, streamingDuration: 10)
+            },
+            isEnabled: { true }
+        )
+
+        coordinator.setPinned(true)
+        await waitUntil { coordinator.sessionStartCount == 2 }
+
+        #expect(coordinator.pinRenewalCount == 1)
+        #expect(coordinator.isRenewing == true)
+    }
+
+    /// A renewal that goes through the failure-backoff path (`.renew(after:
+    /// > 0)`) also increments `pinRenewalCount`, once the backoff sleep
+    /// completes and the replacement session actually starts — not merely
+    /// when the renewal is scheduled.
+    ///
+    /// MUTATION CHECK: incrementing `pinRenewalCount` when `renewTask` is
+    /// first scheduled (rather than after `renewSleep` completes and
+    /// `startSession` is actually called) would make this pass too early —
+    /// this test's `waitUntil` on `sessionStartCount == 2` combined with the
+    /// instant `renewSleep` does not by itself distinguish the two, but the
+    /// `dismissedDuringBackoffDoesNotCountAsRenewal` test below does.
+    @Test func renewalAfterFailureBackoffIncrementsRenewalCount() async {
+        var callCount = 0
+        let coordinator = DoorVideoCoordinator(
+            makeSession: {
+                defer { callCount += 1 }
+                return callCount == 0
+                    ? DoorVideoSession.debugStub(connectingDelay: 0.02, failAfter: "boom")
+                    : DoorVideoSession.debugStub(connectingDelay: 10, streamingDuration: 10)
+            },
+            isEnabled: { true },
+            pinPolicy: DoorVideoPinPolicy(maxConsecutiveFailures: 5, failureBackoff: 0),
+            renewSleep: instantRenewSleep
+        )
+
+        coordinator.setPinned(true)
+        await waitUntil { coordinator.sessionStartCount == 2 }
+
+        #expect(coordinator.pinRenewalCount == 1)
+        #expect(coordinator.isRenewing == true)
+    }
+
+    /// A pending renewal that is CANCELLED by `dismiss()` before its backoff
+    /// completes must never have counted as a renewal — `pinRenewalCount`
+    /// only increments once `startSession` actually runs, not when a renewal
+    /// is merely scheduled.
+    ///
+    /// MUTATION CHECK: incrementing `pinRenewalCount` at the point
+    /// `renewTask` is created (rather than inside the task, after the sleep
+    /// and identity guard) would make `pinRenewalCount == 1` here even though
+    /// no second session ever actually started.
+    @Test func dismissedDuringBackoffDoesNotCountAsRenewal() async {
+        let coordinator = DoorVideoCoordinator(
+            makeSession: { DoorVideoSession.debugStub(connectingDelay: 0.02, failAfter: "boom") },
+            isEnabled: { true },
+            pinPolicy: DoorVideoPinPolicy(maxConsecutiveFailures: 5, failureBackoff: 5)
+            // Real renewSleep: the backoff must still be pending when
+            // dismiss() arrives below.
+        )
+
+        coordinator.setPinned(true)
+        await waitUntil(timeout: 1) { coordinator.session?.state.phase == .failed }
+
+        coordinator.dismiss()
+
+        #expect(coordinator.pinRenewalCount == 0)
+        #expect(coordinator.isRenewing == false)
+
+        // Wait comfortably longer than the backoff to prove no delayed
+        // increment sneaks through.
+        try? await Task.sleep(for: .milliseconds(300))
+        #expect(coordinator.pinRenewalCount == 0)
+    }
+
+    /// `setPinned(true)` on a FRESH pin resets `pinRenewalCount` back to `0`
+    /// even if a previous pin had renewed — a later pin's first session must
+    /// not be mistaken for a renewal of the earlier one.
+    ///
+    /// MUTATION CHECK: removing `pinRenewalCount = 0` from `setPinned(true)`
+    /// would leave the count from the FIRST pin's renewal carried over,
+    /// making `isRenewing` incorrectly `true` for the second pin's first
+    /// session.
+    @Test func rePinningResetsRenewalCount() async {
+        var callCount = 0
+        let coordinator = DoorVideoCoordinator(
+            makeSession: {
+                defer { callCount += 1 }
+                return callCount == 0
+                    ? DoorVideoSession.debugStub(connectingDelay: 0.02, streamingDuration: 0.02)
+                    : DoorVideoSession.debugStub(connectingDelay: 10, streamingDuration: 10)
+            },
+            isEnabled: { true }
+        )
+
+        coordinator.setPinned(true)
+        await waitUntil { coordinator.pinRenewalCount == 1 }
+
+        coordinator.dismiss()
+        coordinator.setPinned(true)
+        await Task.yield()
+
+        #expect(coordinator.pinRenewalCount == 0)
+        #expect(coordinator.isRenewing == false)
+    }
 }

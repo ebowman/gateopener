@@ -46,6 +46,13 @@ struct MainView: View {
     /// `.opening`/`.succeeded`/`.failed` without UI automation. See
     /// `DebugLaunchOptions`.
     @State private var didScheduleDebugAutoOpen = false
+
+    /// Debug-only, `--auto-pin-after <seconds>` verification hook (bead
+    /// gateopener-41m.15 STEP 9): the pin button needs a real tap, which
+    /// `simctl launch` cannot perform, so this schedules a single
+    /// `doorVideoCoordinator.setPinned(true)` call instead. See
+    /// `DebugLaunchOptions.autoPinAfterSeconds`.
+    @State private var didScheduleDebugAutoPin = false
     #endif
 
     private var gateDisplayName: String {
@@ -75,6 +82,27 @@ struct MainView: View {
         case .failed:
             return "Try Again"
         }
+    }
+
+    /// Pure combination of the two independent reasons the screen should
+    /// stay awake (bead gateopener-41m.15 STEP 5): the pre-existing open-flow
+    /// behavior (tap-to-open through queued/opening, restored once
+    /// succeeded/failed/idle — computed by the caller and passed in as
+    /// `openFlowNeedsAwake`) OR the video being pinned. A `static func`,
+    /// independent of `self`, so it can be unit-tested directly.
+    ///
+    /// Applied from THREE places, all of which must agree on this single
+    /// combined value rather than fighting each other by separately toggling
+    /// `UIApplication.shared.isIdleTimerDisabled`: `handleTap()`,
+    /// `handleStateChangeForHapticsAndIdleTimer(_:)`, and an
+    /// `.onChange(of: doorVideoCoordinator.isPinned)` in `body`.
+    ///
+    /// MUTATION CHECK: changing `||` to `&&` would require BOTH conditions
+    /// at once to keep the screen awake (e.g. a pinned session while idle
+    /// would incorrectly let the screen sleep) — `MainViewKeepScreenAwakeTests`
+    /// covers every combination with a distinct expectation.
+    static func shouldKeepScreenAwake(isPinned: Bool, openFlowNeedsAwake: Bool) -> Bool {
+        isPinned || openFlowNeedsAwake
     }
 
     private var statusText: String {
@@ -187,16 +215,49 @@ struct MainView: View {
             notificationGenerator.prepare()
             #if DEBUG
             scheduleDebugAutoOpenIfNeeded()
+            scheduleDebugAutoPinIfNeeded()
             if DebugLaunchOptions.openSettingsOnLaunch {
                 settingsPresented = true
             }
             #endif
         }
         .onDisappear {
+            // Unconditionally `false`, regardless of `doorVideoCoordinator
+            // .isPinned` — bead gateopener-41m.15 STEP 5's "must not be left
+            // stuck true" guarantee. The view disappearing means there is no
+            // screen left to keep awake for either reason.
             UIApplication.shared.isIdleTimerDisabled = false
         }
         .onChange(of: observable.state) { _, newState in
             handleStateChangeForHapticsAndIdleTimer(newState)
+        }
+        .onChange(of: doorVideoCoordinator.isPinned) { _, isPinned in
+            // Backgrounding calls `doorVideoCoordinator.dismiss()`
+            // (`GateOpenerIOSApp`'s `scenePhase` handler), which unpins —
+            // this fires from that same state change, applying
+            // `shouldKeepScreenAwake(isPinned: false, ...)` and clearing the
+            // flag rather than leaving it stuck `true` from the pin bead
+            // gateopener-41m.15 STEP 5 requires.
+            UIApplication.shared.isIdleTimerDisabled = Self.shouldKeepScreenAwake(
+                isPinned: isPinned,
+                openFlowNeedsAwake: Self.openFlowNeedsAwake(for: observable.state)
+            )
+        }
+    }
+
+    /// Whether the pre-existing open-flow behavior alone (independent of
+    /// pinning) wants the screen kept awake for the given `GateState` — the
+    /// `openFlowNeedsAwake` input to `shouldKeepScreenAwake(isPinned:
+    /// openFlowNeedsAwake:)`. `true` only while actively tapped-through
+    /// `.queued`/`.opening`; `false` for every terminal/idle state, matching
+    /// `handleStateChangeForHapticsAndIdleTimer(_:)`'s pre-existing
+    /// per-state resets.
+    private static func openFlowNeedsAwake(for state: GateState) -> Bool {
+        switch state {
+        case .queued, .opening:
+            return true
+        case .needsSetup, .idle, .succeeded, .failed:
+            return false
         }
     }
 
@@ -294,6 +355,9 @@ struct MainView: View {
             sessionState: doorVideoCoordinator.sessionState,
             lastTerminal: doorVideoCoordinator.lastTerminal,
             cooldownUntil: doorVideoCoordinator.cooldownUntil,
+            isPinned: doorVideoCoordinator.isPinned,
+            isRenewal: doorVideoCoordinator.isRenewing,
+            pinStopMessage: doorVideoCoordinator.pinStopMessage,
             now: Date()
         )
 
@@ -310,8 +374,13 @@ struct MainView: View {
                     // invariant is ever violated.
                     placeholder(icon: "video.fill", message: "Tap to view door", retry: false)
                 }
-            case .tapToView:
-                placeholder(icon: "video.fill", message: "Tap to view door", retry: false)
+            case .tapToView(let message):
+                // `message` is `pinStopMessage` when the pin most recently
+                // auto-stopped itself (bead gateopener-41m.15 STEP 5), else
+                // `nil` for the plain neutral placeholder — either way the
+                // tap-to-view affordance/action (`viewDoor()`, UNPINNED) is
+                // identical.
+                placeholder(icon: "video.fill", message: message ?? "Tap to view door", retry: false)
             case .failed(let message):
                 placeholder(icon: "exclamationmark.triangle", message: message, retry: true)
             }
@@ -327,35 +396,59 @@ struct MainView: View {
     /// The `.session` case: the real `DoorVideoView` — mounted at this SAME
     /// structural position across connecting, busy-retry cooldown, and
     /// streaming (see the HARD RULE above) — plus:
-    ///  - the existing close (xmark) button, available throughout the whole
-    ///    visible window (matches the pre-fix `videoPanel(session:)`, which
-    ///    included the close button for connecting too, not just streaming);
+    ///  - the existing close (xmark) button, top-trailing, available
+    ///    throughout the whole visible window (matches the pre-fix
+    ///    `videoPanel(session:)`, which included the close button for
+    ///    connecting too, not just streaming);
+    ///  - the pin button, top-leading (bead gateopener-41m.15 STEP 1),
+    ///    visible whenever a session exists (i.e. throughout this whole
+    ///    method, same as the close button);
     ///  - when `overlay == .busyRetry`, an opaque countdown overlay drawn ON
     ///    TOP of `DoorVideoView`, fully covering its own "Connecting…" label
     ///    so the two never show at once. Only this countdown text lives
     ///    inside a `TimelineView(.periodic(from: .now, by: 1))`, since it is
     ///    the only piece that needs a per-second tick
     ///    (`doorVideoCoordinator.cooldownUntil` only changes at the start/
-    ///    end of a cooldown).
+    ///    end of a cooldown);
+    ///  - when `overlay == .reconnecting` (bead gateopener-41m.15 STEP 4), an
+    ///    opaque "Reconnecting…" scrim, same style as the busy-retry overlay,
+    ///    covering `DoorVideoView`'s own "Connecting…"/"Camera unavailable"
+    ///    text so the operator is never told this is the pin's first session
+    ///    when it is actually a renewal;
+    ///  - while `doorVideoCoordinator.isPinned`, a bottom-trailing countdown
+    ///    capsule (bead gateopener-41m.15 STEP 2) showing `pinRemaining` as
+    ///    "m:ss", also inside a `TimelineView(.periodic(from: .now, by: 1))`
+    ///    — the only other piece needing a per-second tick.
     ///
     /// Calling `dismiss()` (close button) stops the session (idempotent),
     /// clears it immediately (no animation delay — the button itself IS the
     /// explicit dismiss action), and resets `lastTerminal` to `.none` (a
-    /// USER close, per `DoorVideoCoordinator.dismiss()`'s doc comment).
+    /// USER close, per `DoorVideoCoordinator.dismiss()`'s doc comment). This
+    /// also always unpins (`dismiss()`'s own behavior), same as backgrounding.
     private func sessionVideo(session: DoorVideoSession, overlay: DoorVideoSlotContent.SessionOverlay) -> some View {
         DoorVideoView(session: session, state: doorVideoCoordinator.sessionState)
             .overlay {
-                if case .busyRetry(let secondsRemaining) = overlay {
+                switch overlay {
+                case .busyRetry(let secondsRemaining):
                     TimelineView(.periodic(from: .now, by: 1)) { timelineContext in
                         let liveContent = DoorVideoSlotContent.content(
                             hasVisibleSession: doorVideoCoordinator.isPanelVisible,
                             sessionState: doorVideoCoordinator.sessionState,
                             lastTerminal: doorVideoCoordinator.lastTerminal,
                             cooldownUntil: doorVideoCoordinator.cooldownUntil,
+                            isPinned: doorVideoCoordinator.isPinned,
+                            isRenewal: doorVideoCoordinator.isRenewing,
+                            pinStopMessage: doorVideoCoordinator.pinStopMessage,
                             now: timelineContext.date
                         )
                         if case .session(.busyRetry(let liveSecondsRemaining)) = liveContent {
                             busyRetryOverlay(secondsRemaining: liveSecondsRemaining)
+                        } else if case .session(.reconnecting) = liveContent {
+                            // The cooldown elapsed since the outer `content`
+                            // was computed, and a pinned renewal is now
+                            // underway: hand off to the reconnecting scrim
+                            // rather than keep showing a stale countdown.
+                            reconnectingOverlay()
                         } else {
                             // The cooldown elapsed since the outer `content`
                             // was computed; the outer view will re-render
@@ -365,6 +458,10 @@ struct MainView: View {
                             busyRetryOverlay(secondsRemaining: secondsRemaining)
                         }
                     }
+                case .reconnecting:
+                    reconnectingOverlay()
+                case .none:
+                    EmptyView()
                 }
             }
             .overlay(alignment: .topTrailing) {
@@ -378,6 +475,77 @@ struct MainView: View {
                 .padding(8)
                 .accessibilityLabel("Close door camera")
             }
+            .overlay(alignment: .topLeading) {
+                pinButton
+            }
+            .overlay(alignment: .bottomTrailing) {
+                if doorVideoCoordinator.isPinned {
+                    pinCountdownCapsule
+                }
+            }
+    }
+
+    /// The pin toggle button (bead gateopener-41m.15 STEP 1): top-leading,
+    /// SF Symbol "pin"/"pin.fill" (filled + accent-tinted when pinned), on a
+    /// 44x44 material-circle hit target. Toggles
+    /// `doorVideoCoordinator.setPinned(_:)` and fires a light haptic.
+    private var pinButton: some View {
+        Button {
+            lightImpactGenerator.impactOccurred()
+            doorVideoCoordinator.setPinned(!doorVideoCoordinator.isPinned)
+        } label: {
+            Image(systemName: doorVideoCoordinator.isPinned ? "pin.fill" : "pin")
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(doorVideoCoordinator.isPinned ? Color.accentColor : Color.white)
+                .frame(width: 44, height: 44)
+                .background(.ultraThinMaterial, in: Circle())
+        }
+        .padding(8)
+        .accessibilityLabel(doorVideoCoordinator.isPinned ? "Unpin video" : "Pin video")
+        .accessibilityValue("Keeps the camera on for up to 5 minutes")
+    }
+
+    /// The pinned countdown capsule (bead gateopener-41m.15 STEP 2):
+    /// bottom-trailing, "m:ss" from `doorVideoCoordinator.pinRemaining`,
+    /// monospaced digits, turning red at <= 30s remaining — mirrors the web
+    /// app's countdown badge. Only this text needs a per-second tick
+    /// (`pinRemaining` is derived from `Date()` at read time), so the
+    /// `TimelineView` wraps ONLY this capsule, not `DoorVideoView`.
+    private var pinCountdownCapsule: some View {
+        TimelineView(.periodic(from: .now, by: 1)) { _ in
+            let remaining = max(0, Int(doorVideoCoordinator.pinRemaining ?? 0))
+            let minutes = remaining / 60
+            let seconds = remaining % 60
+            Text(String(format: "%d:%02d", minutes, seconds))
+                .font(.footnote.monospacedDigit().weight(.semibold))
+                .foregroundStyle(remaining <= 30 ? Color.red : Color.white)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 4)
+                .background(.ultraThinMaterial, in: Capsule())
+                .padding(8)
+                .accessibilityLabel("Pin time remaining")
+                .accessibilityValue("\(minutes) minutes \(seconds) seconds")
+        }
+    }
+
+    /// The pinned-renewal "Reconnecting…" scrim (bead gateopener-41m.15 STEP
+    /// 4): same opaque style as `busyRetryOverlay` (`Color.black.opacity
+    /// (0.92)`) so it fully covers `DoorVideoView`'s own "Connecting…"/
+    /// "Camera unavailable" text underneath — the two must never both be
+    /// visible at once.
+    private func reconnectingOverlay() -> some View {
+        ZStack {
+            Color.black.opacity(0.92)
+            VStack(spacing: 8) {
+                ProgressView()
+                    .progressViewStyle(.circular)
+                    .tint(.white)
+                Text("Reconnecting…")
+                    .font(.footnote)
+                    .foregroundStyle(.white)
+            }
+        }
+        .accessibilityElement(children: .combine)
     }
 
     /// The busy-retry countdown overlay: an opaque dark background matching
@@ -494,7 +662,10 @@ struct MainView: View {
         }
 
         impactGenerator.impactOccurred()
-        UIApplication.shared.isIdleTimerDisabled = true
+        UIApplication.shared.isIdleTimerDisabled = Self.shouldKeepScreenAwake(
+            isPinned: doorVideoCoordinator.isPinned,
+            openFlowNeedsAwake: true
+        )
         observable.requestOpen()
         doorVideoCoordinator.startForOpen()
     }
@@ -502,21 +673,24 @@ struct MainView: View {
     /// Drives haptics and the idle-timer reset from `state` transitions,
     /// never from the tap itself — `UINotificationFeedbackGenerator`
     /// success/error haptics fire only once the controller actually
-    /// reaches a terminal state, not optimistically on tap.
+    /// reaches a terminal state, not optimistically on tap. The idle-timer
+    /// flag itself is always the combined `shouldKeepScreenAwake(isPinned:
+    /// openFlowNeedsAwake:)` value (bead gateopener-41m.15 STEP 5) — a
+    /// terminal/idle open-flow state no longer unconditionally clears the
+    /// flag if the video happens to be pinned at the same moment.
     private func handleStateChangeForHapticsAndIdleTimer(_ newState: GateState) {
         switch newState {
         case .succeeded:
             notificationGenerator.notificationOccurred(.success)
-            UIApplication.shared.isIdleTimerDisabled = false
         case .failed:
             notificationGenerator.notificationOccurred(.error)
-            UIApplication.shared.isIdleTimerDisabled = false
-        case .needsSetup, .idle:
-            UIApplication.shared.isIdleTimerDisabled = false
-        case .queued, .opening:
-            // Already set true on tap; keep it true through queued/opening.
-            UIApplication.shared.isIdleTimerDisabled = true
+        case .needsSetup, .idle, .queued, .opening:
+            break
         }
+        UIApplication.shared.isIdleTimerDisabled = Self.shouldKeepScreenAwake(
+            isPinned: doorVideoCoordinator.isPinned,
+            openFlowNeedsAwake: Self.openFlowNeedsAwake(for: newState)
+        )
     }
 
     #if DEBUG
@@ -530,6 +704,23 @@ struct MainView: View {
         Task {
             try? await Task.sleep(for: .seconds(delaySeconds))
             handleTap()
+        }
+    }
+
+    /// `--auto-pin-after <seconds>`: calls `doorVideoCoordinator
+    /// .setPinned(true)` once, after the given delay, from `onAppear`. The
+    /// pin button itself needs a real tap, which `simctl launch` cannot
+    /// perform — this DEBUG-only hook lets a screenshot script capture the
+    /// pinned/reconnecting/countdown states instead (bead gateopener-41m.15
+    /// STEP 9). See `DebugLaunchOptions.autoPinAfterSeconds`.
+    private func scheduleDebugAutoPinIfNeeded() {
+        guard !didScheduleDebugAutoPin,
+              let delaySeconds = DebugLaunchOptions.autoPinAfterSeconds else { return }
+        didScheduleDebugAutoPin = true
+        Task {
+            try? await Task.sleep(for: .seconds(delaySeconds))
+            lightImpactGenerator.impactOccurred()
+            doorVideoCoordinator.setPinned(true)
         }
     }
     #endif

@@ -89,6 +89,12 @@ struct GateOpenerIOSApp: App {
             makeSession: {
                 #if DEBUG
                 if DebugLaunchOptions.mockVideoOnLaunch {
+                    if let timeline = DebugLaunchOptions.mockVideoTimeline {
+                        return DoorVideoSession.debugStub(
+                            connectingDelay: timeline.connectingSeconds,
+                            streamingDuration: timeline.streamingSeconds
+                        )
+                    }
                     return DoorVideoSession.debugStub()
                 }
                 #endif

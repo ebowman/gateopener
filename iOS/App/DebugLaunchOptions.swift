@@ -30,6 +30,9 @@ import os
 ///   - `--open-settings`: presents the Settings sheet immediately from
 ///     `MainView.onAppear`, so it can be screenshotted without a human or
 ///     UI-automation tap (bead gateopener-672.10 verification).
+///   - `--mock-video [<connectingSeconds> <streamingSeconds>]`: see
+///     `mockVideoOnLaunch`/`mockVideoTimeline`.
+///   - `--auto-pin-after <seconds>`: see `autoPinAfterSeconds`.
 enum DebugLaunchOptions {
     /// The fake `GateOpening` mode requested by `--mock-gate`, or `nil` if
     /// that argument was not passed (production `GateClient` is used).
@@ -54,8 +57,34 @@ enum DebugLaunchOptions {
     /// Parses `--auto-open-after <seconds>` from the process's launch
     /// arguments. Returns `nil` if the argument is absent or malformed.
     static var autoOpenAfterSeconds: Double? {
-        let arguments = ProcessInfo.processInfo.arguments
-        guard let flagIndex = arguments.firstIndex(of: "--auto-open-after"),
+        parseSecondsFlag("--auto-open-after", in: ProcessInfo.processInfo.arguments)
+    }
+
+    /// Parses `--auto-pin-after <seconds>` from the process's launch
+    /// arguments, mirroring `autoOpenAfterSeconds`'s parsing exactly. Returns
+    /// `nil` if the argument is absent or malformed.
+    ///
+    /// DEBUG-only verification hook for bead gateopener-41m.15's pin UI
+    /// (STEP 9): `MainView` schedules a single
+    /// `doorVideoCoordinator.setPinned(true)` call after this delay, since
+    /// the pin button itself needs a real tap, which `simctl launch` cannot
+    /// perform — combined with `--mock-gate ok --mock-video <connecting>
+    /// <streaming>`, this lets a screenshot script capture the pinned/
+    /// reconnecting/countdown states without UI automation.
+    static var autoPinAfterSeconds: Double? {
+        parseSecondsFlag("--auto-pin-after", in: ProcessInfo.processInfo.arguments)
+    }
+
+    /// Shared single-`Double`-argument flag parser for `--auto-open-after`/
+    /// `--auto-pin-after`, factored out (bead gateopener-41m.15) so
+    /// `DebugLaunchOptionsParsingTests` can exercise the parsing logic
+    /// directly against a literal `[String]` array — `ProcessInfo
+    /// .processInfo.arguments` itself is fixed for the life of the test
+    /// process and cannot be swapped per-test. Returns `nil` if `flag` is
+    /// absent, is the last argument (no following value), or the following
+    /// argument is not parseable as a `Double`.
+    static func parseSecondsFlag(_ flag: String, in arguments: [String]) -> Double? {
+        guard let flagIndex = arguments.firstIndex(of: flag),
               arguments.count > flagIndex + 1,
               let seconds = Double(arguments[flagIndex + 1]) else { return nil }
         return seconds
@@ -117,6 +146,41 @@ enum DebugLaunchOptions {
     /// so the door-video panel itself can be screenshotted.
     static var mockVideoOnLaunch: Bool {
         ProcessInfo.processInfo.arguments.contains("--mock-video")
+    }
+
+    /// Optional `<connectingSeconds> <streamingSeconds>` timeline overrides
+    /// for `--mock-video` (bead gateopener-41m.15 STEP 6/DONE-CRITERIA): lets
+    /// a simulator run demo PIN RENEWAL with short cycles, e.g.
+    /// `--mock-video 1 5` (1s connecting, 5s streaming, so the door's
+    /// `.ended` -> pinned-renewal seam repeats roughly every 6s instead of
+    /// `DoorVideoSession.debugStub()`'s real defaults of 2s/8s).
+    ///
+    /// Mirrors `autoOpenAfterSeconds`'s parsing style: reads the two
+    /// arguments immediately following the flag. `nil` (both components,
+    /// together — this always returns either a fully-populated tuple or
+    /// `nil`, never a partial one) whenever:
+    ///   - `--mock-video` was not passed at all;
+    ///   - it was passed with no following arguments (bare `--mock-video`,
+    ///     the pre-existing form) — `debugStub()`'s own defaults apply;
+    ///   - either following argument is missing or not parseable as a
+    ///     `Double` (malformed) — e.g. `--mock-video 1` (only one number) or
+    ///     `--mock-video abc 5` both fall back to `debugStub()`'s defaults
+    ///     rather than starting one leg of the timeline from a
+    ///     half-parsed value.
+    static var mockVideoTimeline: (connectingSeconds: Double, streamingSeconds: Double)? {
+        parseMockVideoTimeline(in: ProcessInfo.processInfo.arguments)
+    }
+
+    /// Pure parsing logic behind `mockVideoTimeline`, factored out (bead
+    /// gateopener-41m.15) so `DebugLaunchOptionsParsingTests` can exercise it
+    /// directly against a literal `[String]` array. See `mockVideoTimeline`'s
+    /// doc comment for the exact semantics.
+    static func parseMockVideoTimeline(in arguments: [String]) -> (connectingSeconds: Double, streamingSeconds: Double)? {
+        guard let flagIndex = arguments.firstIndex(of: "--mock-video"),
+              arguments.count > flagIndex + 2,
+              let connectingSeconds = Double(arguments[flagIndex + 1]),
+              let streamingSeconds = Double(arguments[flagIndex + 2]) else { return nil }
+        return (connectingSeconds: connectingSeconds, streamingSeconds: streamingSeconds)
     }
 
     /// Pre-seeds `appSettings` and the credential store so a `--mock-gate`

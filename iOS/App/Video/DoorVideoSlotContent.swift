@@ -32,8 +32,11 @@ enum DoorVideoSlotContent: Equatable {
     case session(overlay: SessionOverlay)
     /// No visible session, and the last one either never existed or ended
     /// normally (`lastTerminal == .none` or `.ended`): the neutral
-    /// "Tap to view door" placeholder.
-    case tapToView
+    /// "Tap to view door" placeholder — UNLESS `pinStopMessage` is set (bead
+    /// gateopener-41m.15 STEP 5), in which case that message is shown
+    /// instead, still with the tap-to-view affordance (tapping resumes
+    /// UNPINNED via `viewDoor()`, which clears the message).
+    case tapToView(message: String?)
     /// No visible session, and the last one failed: the "Retry" placeholder
     /// carrying the REAL failure message (never a generic string) for
     /// display.
@@ -50,8 +53,20 @@ enum DoorVideoSlotContent: Equatable {
         /// A door-busy cooldown is counting down: show "Door camera busy —
         /// retrying in Ns", re-evaluated every second by a `TimelineView`,
         /// drawn opaquely on top so `DoorVideoView`'s own "Connecting…" text
-        /// is fully covered (never both visible at once).
+        /// is fully covered (never both visible at once). Takes priority
+        /// over `.reconnecting` whenever both would otherwise apply (bead
+        /// gateopener-41m.15 STEP 3: "Door camera busy" is more specific/
+        /// actionable than the generic "Reconnecting…").
         case busyRetry(secondsRemaining: Int)
+        /// A PINNED renewal is between sessions (bead gateopener-41m.15 STEP
+        /// 4): the mounted session is not yet `.streaming` (still
+        /// `.idle`/`.connecting`, or `.failed` during the failure backoff)
+        /// AND this is not the pin's first session — i.e. `DoorVideoView`'s
+        /// own "Connecting…"/"Camera unavailable" text underneath must be
+        /// fully covered by an opaque scrim reading "Reconnecting…" instead,
+        /// so the operator is never told video is continuous when the door
+        /// actually enforces a ~15s gap between sessions.
+        case reconnecting
     }
 
     /// Pure derivation of what the slot should show.
@@ -74,6 +89,22 @@ enum DoorVideoSlotContent: Equatable {
     ///   - cooldownUntil: `DoorVideoCoordinator.cooldownUntil` — non-nil
     ///     while the current (connecting) session is waiting out a
     ///     door-busy cooldown.
+    ///   - isPinned: `DoorVideoCoordinator.isPinned` (bead gateopener-41m.15
+    ///     STEP 3/4) — whether the video is currently pinned. Combined with
+    ///     `isRenewal` to decide whether a not-yet-streaming/failed-backoff
+    ///     session should show "Reconnecting…" instead of `DoorVideoView`'s
+    ///     own "Connecting…"/"Camera unavailable" text.
+    ///   - isRenewal: `DoorVideoCoordinator.isRenewing` (bead
+    ///     gateopener-41m.15 STEP 4) — `true` when the CURRENTLY mounted
+    ///     session is a pinned RENEWAL (not the pin's first session).
+    ///     `.reconnecting` only ever applies when this is `true`: the pin's
+    ///     first session still shows the ordinary "Connecting…" text, since
+    ///     there is nothing to "reconnect" to yet.
+    ///   - pinStopMessage: `DoorVideoCoordinator.pinStopMessage` (bead
+    ///     gateopener-41m.15 STEP 5) — non-nil when the pin most recently
+    ///     auto-stopped itself; consulted only when there is no visible
+    ///     session, taking priority over the plain "Tap to view door" text
+    ///     but leaving the tap-to-view affordance/behavior unchanged.
     ///   - now: Injected (rather than read via `Date()` internally) so this
     ///     stays a pure function callers can unit-test deterministically,
     ///     and so a `TimelineView`'s per-second tick can re-invoke it with a
@@ -96,21 +127,38 @@ enum DoorVideoSlotContent: Equatable {
     /// rule from commit 8797114 (gateopener-672.30) without any test here
     /// catching it structurally — `DoorVideoSlotContentTests` guards this by
     /// asserting the visible-session branches all decode to `.session`.
+    ///
+    /// MUTATION CHECK (gateopener-41m.15): `.failed` while `hasVisibleSession`
+    /// is `true` is now a REAL, reachable path (a pinned session's failure
+    /// backoff keeps the failed session mounted — see
+    /// `DoorVideoCoordinator.handlePinnableTermination`), not merely
+    /// defensive — dropping the `isPinned && isRenewal` check on that branch
+    /// would either wrongly show `.reconnecting` for an unpinned failure or
+    /// wrongly fall back to `DoorVideoView`'s own "Camera unavailable" text
+    /// during a pinned renewal's backoff.
     static func content(
         hasVisibleSession: Bool,
         sessionState: DoorVideoSession.State,
         lastTerminal: DoorVideoCoordinator.LastTerminal,
         cooldownUntil: Date?,
+        isPinned: Bool = false,
+        isRenewal: Bool = false,
+        pinStopMessage: String? = nil,
         now: Date
     ) -> DoorVideoSlotContent {
         guard hasVisibleSession else {
+            if let pinStopMessage {
+                return .tapToView(message: pinStopMessage)
+            }
             switch lastTerminal {
             case .none, .ended:
-                return .tapToView
+                return .tapToView(message: nil)
             case .failed(let message):
                 return .failed(message)
             }
         }
+
+        let showsReconnecting = isPinned && isRenewal
 
         switch sessionState {
         case .streaming:
@@ -124,18 +172,33 @@ enum DoorVideoSlotContent: Equatable {
                 // `cooldownUntil` is a hair in the future due to floating-
                 // point/clock granularity but the ceiling of the difference
                 // would otherwise round to 0.
+                //
+                // Busy-retry takes priority over `.reconnecting` (see
+                // `SessionOverlay.busyRetry`'s doc comment) — checked first
+                // regardless of `showsReconnecting`.
                 let remaining = max(1, Int(ceil(cooldownUntil.timeIntervalSince(now))))
                 return .session(overlay: .busyRetry(secondsRemaining: remaining))
             }
-            return .session(overlay: .none)
-        case .ended, .failed:
+            return .session(overlay: showsReconnecting ? .reconnecting : .none)
+        case .failed:
+            // A pinned session's failure backoff (bead gateopener-41m.14)
+            // keeps the failed session mounted with `hasVisibleSession ==
+            // true` for up to `pinPolicy.failureBackoff` seconds — a REAL,
+            // reachable path, not merely defensive. During that window the
+            // scrim must read "Reconnecting…", covering `DoorVideoView`'s
+            // own "Camera unavailable" text, so the operator is not told the
+            // pin has failed when it is about to retry.
+            return .session(overlay: showsReconnecting ? .reconnecting : .none)
+        case .ended:
             // Defensive only — `DoorVideoCoordinator.handleStateChange` sets
-            // `isPanelVisible = false` for both of these, so `hasVisibleSession`
-            // should never be `true` here in practice. Falls back to a plain
-            // mounted session with no extra overlay (matching `DoorVideoView`
-            // .overlay(for:)`'s own handling of these states) rather than
-            // dropping the web view or crashing if that invariant is ever
-            // violated.
+            // `isPanelVisible = false` for `.ended` (a pinned `.ended` is
+            // renewed synchronously without ever setting `isPanelVisible =
+            // false` in between — see `handlePinnableTermination`), so
+            // `hasVisibleSession` should never be `true` here in practice.
+            // Falls back to a plain mounted session with no extra overlay
+            // (matching `DoorVideoView.overlay(for:)`'s own handling of this
+            // state) rather than dropping the web view or crashing if that
+            // invariant is ever violated.
             return .session(overlay: .none)
         }
     }

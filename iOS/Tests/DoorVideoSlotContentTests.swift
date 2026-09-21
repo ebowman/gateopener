@@ -14,11 +14,11 @@ struct DoorVideoSlotContentTests {
     // MARK: - No visible session
 
     /// No session has ever run (`lastTerminal == .none`): the neutral
-    /// "Tap to view door" placeholder.
+    /// "Tap to view door" placeholder (`message == nil`).
     ///
     /// MUTATION CHECK: changing the `.none` branch inside the
-    /// `!hasVisibleSession` guard to return anything but `.tapToView` fails
-    /// this assertion.
+    /// `!hasVisibleSession` guard to return anything but `.tapToView(message:
+    /// nil)` fails this assertion.
     @Test func noSessionEverAndNoneTerminalMapsToTapToView() {
         let result = DoorVideoSlotContent.content(
             hasVisibleSession: false,
@@ -27,7 +27,7 @@ struct DoorVideoSlotContentTests {
             cooldownUntil: nil,
             now: now
         )
-        #expect(result == .tapToView)
+        #expect(result == .tapToView(message: nil))
     }
 
     /// The last session ended normally (`lastTerminal == .ended`): still the
@@ -43,7 +43,64 @@ struct DoorVideoSlotContentTests {
             cooldownUntil: nil,
             now: now
         )
-        #expect(result == .tapToView)
+        #expect(result == .tapToView(message: nil))
+    }
+
+    /// A non-nil `pinStopMessage` (bead gateopener-41m.15 STEP 5) takes
+    /// priority over the plain neutral "Tap to view door" text — even when
+    /// `lastTerminal == .none`/`.ended` — but still maps to the SAME
+    /// `.tapToView` case (tap-to-view/resume-unpinned behavior unchanged),
+    /// just carrying the message through.
+    ///
+    /// MUTATION CHECK: dropping the `pinStopMessage` check (or checking it
+    /// AFTER the `lastTerminal` switch instead of before) would make this
+    /// return `.tapToView(message: nil)` instead, losing the auto-unpin
+    /// explanation.
+    @Test func pinStopMessageTakesPriorityOverNeutralTapToView() {
+        let result = DoorVideoSlotContent.content(
+            hasVisibleSession: false,
+            sessionState: .idle,
+            lastTerminal: .none,
+            cooldownUntil: nil,
+            pinStopMessage: "Stream ended - tap to resume",
+            now: now
+        )
+        #expect(result == .tapToView(message: "Stream ended - tap to resume"))
+    }
+
+    /// `pinStopMessage` also takes priority even when `lastTerminal ==
+    /// .failed(...)` — the auto-unpin ruling (STEP 5) always wins once set,
+    /// regardless of how the underlying session finished.
+    ///
+    /// MUTATION CHECK: checking `pinStopMessage` only inside the `.none`/
+    /// `.ended` arms of the `lastTerminal` switch (rather than before the
+    /// switch entirely) would make this incorrectly return `.failed(...)`
+    /// instead.
+    @Test func pinStopMessageTakesPriorityOverFailedTerminal() {
+        let result = DoorVideoSlotContent.content(
+            hasVisibleSession: false,
+            sessionState: .idle,
+            lastTerminal: .failed("boom"),
+            cooldownUntil: nil,
+            pinStopMessage: "Camera unavailable - unpinned",
+            now: now
+        )
+        #expect(result == .tapToView(message: "Camera unavailable - unpinned"))
+    }
+
+    /// A `nil` `pinStopMessage` (the default) falls through to the ordinary
+    /// `lastTerminal`-driven behavior unchanged — this is a regression guard
+    /// for the new parameter's default value.
+    @Test func nilPinStopMessageFallsThroughToLastTerminal() {
+        let result = DoorVideoSlotContent.content(
+            hasVisibleSession: false,
+            sessionState: .idle,
+            lastTerminal: .failed("boom"),
+            cooldownUntil: nil,
+            pinStopMessage: nil,
+            now: now
+        )
+        #expect(result == .failed("boom"))
     }
 
     /// The last session failed: `.failed(message)`, carrying the REAL
@@ -223,5 +280,140 @@ struct DoorVideoSlotContentTests {
             return
         }
         #expect(secondsRemaining >= 1)
+    }
+
+    // MARK: - Visible session: pinned reconnecting (bead gateopener-41m.15)
+
+    /// The pin's FIRST session (`isPinned == true`, `isRenewal == false`)
+    /// while connecting must NOT show "Reconnecting…" — there is nothing to
+    /// reconnect to yet, so `DoorVideoView`'s own "Connecting…" text is
+    /// sufficient.
+    ///
+    /// MUTATION CHECK: dropping the `isRenewal` half of the `showsReconnecting`
+    /// condition (i.e. keying only off `isPinned`) would make this
+    /// incorrectly return `.session(overlay: .reconnecting)`.
+    @Test func pinnedFirstSessionConnectingDoesNotShowReconnecting() {
+        let result = DoorVideoSlotContent.content(
+            hasVisibleSession: true,
+            sessionState: .connecting,
+            lastTerminal: .none,
+            cooldownUntil: nil,
+            isPinned: true,
+            isRenewal: false,
+            now: now
+        )
+        #expect(result == .session(overlay: .none))
+    }
+
+    /// A pinned RENEWAL (`isPinned == true`, `isRenewal == true`) while
+    /// connecting (not yet streaming) maps to `.session(overlay:
+    /// .reconnecting)`.
+    ///
+    /// MUTATION CHECK: dropping the `isPinned` half of the condition (i.e.
+    /// keying only off `isRenewal`) would make an UNPINNED renewal (were one
+    /// ever possible) show "Reconnecting…" too, which this bead's design
+    /// explicitly restricts to pinned sessions.
+    @Test func pinnedRenewalConnectingShowsReconnecting() {
+        let result = DoorVideoSlotContent.content(
+            hasVisibleSession: true,
+            sessionState: .connecting,
+            lastTerminal: .none,
+            cooldownUntil: nil,
+            isPinned: true,
+            isRenewal: true,
+            now: now
+        )
+        #expect(result == .session(overlay: .reconnecting))
+    }
+
+    /// A pinned RENEWAL that is `.idle` (not even `.connecting` yet) also
+    /// shows "Reconnecting…" — `.idle`/`.connecting` are treated identically
+    /// throughout this mapping.
+    @Test func pinnedRenewalIdleShowsReconnecting() {
+        let result = DoorVideoSlotContent.content(
+            hasVisibleSession: true,
+            sessionState: .idle,
+            lastTerminal: .none,
+            cooldownUntil: nil,
+            isPinned: true,
+            isRenewal: true,
+            now: now
+        )
+        #expect(result == .session(overlay: .reconnecting))
+    }
+
+    /// A pinned session's FAILURE BACKOFF (bead gateopener-41m.14) keeps the
+    /// `.failed` session mounted with `hasVisibleSession == true` — a REAL,
+    /// reachable path (not merely defensive). During a pinned renewal's
+    /// backoff, this must show "Reconnecting…", covering `DoorVideoView`'s
+    /// own "Camera unavailable" text.
+    ///
+    /// MUTATION CHECK: treating `.failed` identically to the old
+    /// defensive-only `.ended` fallback (i.e. never consulting
+    /// `showsReconnecting` for `.failed`) would make this incorrectly return
+    /// `.session(overlay: .none)`.
+    @Test func pinnedRenewalFailedDuringBackoffShowsReconnecting() {
+        let result = DoorVideoSlotContent.content(
+            hasVisibleSession: true,
+            sessionState: .failed("boom"),
+            lastTerminal: .none,
+            cooldownUntil: nil,
+            isPinned: true,
+            isRenewal: true,
+            now: now
+        )
+        #expect(result == .session(overlay: .reconnecting))
+    }
+
+    /// An UNPINNED session's `.failed` state while `hasVisibleSession` is
+    /// (defensively) `true` must NOT show "Reconnecting…" — that scrim is
+    /// exclusively a pinned-renewal concept.
+    @Test func unpinnedFailedDuringVisibleSessionDoesNotShowReconnecting() {
+        let result = DoorVideoSlotContent.content(
+            hasVisibleSession: true,
+            sessionState: .failed("boom"),
+            lastTerminal: .none,
+            cooldownUntil: nil,
+            isPinned: false,
+            isRenewal: false,
+            now: now
+        )
+        #expect(result == .session(overlay: .none))
+    }
+
+    /// Busy-retry takes priority over `.reconnecting` whenever both would
+    /// otherwise apply (a pinned renewal ALSO waiting out a door-busy
+    /// cooldown): the more specific/actionable "Door camera busy" text wins.
+    ///
+    /// MUTATION CHECK: checking `showsReconnecting` before the
+    /// `cooldownUntil` comparison (rather than after) would make this
+    /// incorrectly return `.reconnecting` instead of `.busyRetry`.
+    @Test func busyRetryTakesPriorityOverReconnectingWhenBothApply() {
+        let deadline = now.addingTimeInterval(5)
+        let result = DoorVideoSlotContent.content(
+            hasVisibleSession: true,
+            sessionState: .connecting,
+            lastTerminal: .none,
+            cooldownUntil: deadline,
+            isPinned: true,
+            isRenewal: true,
+            now: now
+        )
+        #expect(result == .session(overlay: .busyRetry(secondsRemaining: 5)))
+    }
+
+    /// Streaming always wins regardless of pin/renewal state — once frames
+    /// are flowing there is nothing to "reconnect" to.
+    @Test func pinnedRenewalStreamingShowsNoOverlay() {
+        let result = DoorVideoSlotContent.content(
+            hasVisibleSession: true,
+            sessionState: .streaming,
+            lastTerminal: .none,
+            cooldownUntil: nil,
+            isPinned: true,
+            isRenewal: true,
+            now: now
+        )
+        #expect(result == .session(overlay: .none))
     }
 }
