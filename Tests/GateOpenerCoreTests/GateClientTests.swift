@@ -87,6 +87,11 @@ final class RequestScript: @unchecked Sendable {
     /// Lets tests prove a 401 retry used a DIFFERENT (freshly-resolved)
     /// bearer token than the first attempt, not just that a retry happened.
     private(set) var authorizationHeaders: [String] = []
+    /// `URLRequest.timeoutInterval` seen on every request, in order. Lets
+    /// tests prove the escalating per-attempt `RetryPolicy.requestTimeouts`
+    /// schedule (e.g. 3s/5s/8s) was actually applied to each attempt's
+    /// `URLRequest`, not just configured on `RetryPolicy`.
+    private(set) var timeoutIntervals: [TimeInterval] = []
 
     init(responses: [ScriptedResponse]) {
         self.responses = responses
@@ -97,12 +102,13 @@ final class RequestScript: @unchecked Sendable {
         self.init(responses: statuses.map { ScriptedResponse(status: $0) })
     }
 
-    func nextResponse(forPath path: String, authorizationHeader: String?) -> ScriptedResponse {
+    func nextResponse(forPath path: String, authorizationHeader: String?, timeoutInterval: TimeInterval) -> ScriptedResponse {
         lock.lock()
         defer { lock.unlock() }
         requestCount += 1
         lastPath = path
         authorizationHeaders.append(authorizationHeader ?? "")
+        timeoutIntervals.append(timeoutInterval)
         let response = responses[min(index, responses.count - 1)]
         index += 1
         return response
@@ -148,7 +154,7 @@ final class SequencedStubURLProtocol: URLProtocol, @unchecked Sendable {
         }
 
         let authHeader = request.value(forHTTPHeaderField: "authorization")
-        let scripted = script.nextResponse(forPath: path, authorizationHeader: authHeader)
+        let scripted = script.nextResponse(forPath: path, authorizationHeader: authHeader, timeoutInterval: request.timeoutInterval)
 
         if let transportErrorCode = scripted.transportError {
             client?.urlProtocol(self, didFailWithError: URLError(transportErrorCode))
@@ -641,10 +647,14 @@ final class SleepRecorder: @unchecked Sendable {
 
     let (tokenManager, _) = makeTokenManager()
     let recorder = SleepRecorder()
-    // Same attempt/backoff shape as `.noDelay(maxAttempts:)` (base 400ms,
-    // 6s total cap, 3s per-request timeout), but `sleep` records the
-    // requested `Duration` instead of no-op'ing, so this test can assert
-    // real backoff WOULD have slept without ever actually sleeping.
+    // Custom, intentionally larger-than-default `maxTotalDelay` (6s, versus
+    // the 2s default) so this test's own sleep-count/positivity assertions
+    // are independent of the default policy's tighter cap -- that cap is
+    // covered separately by `defaultPolicySleepsNeverExceedMaxTotalDelay`
+    // below. `sleep` records the requested `Duration` instead of no-op'ing,
+    // so this test can assert real backoff WOULD have slept without ever
+    // actually sleeping. Uses the source-compatibility single-value
+    // `requestTimeout:` initializer (uniform 3s across all attempts).
     let retryPolicy = RetryPolicy(
         maxAttempts: 3,
         baseDelay: .milliseconds(400),
@@ -665,6 +675,134 @@ final class SleepRecorder: @unchecked Sendable {
     // have actually slept -- the deterministic replacement for the old
     // wall-clock ">1s with real backoff" claim.
     #expect(recorder.durations.allSatisfy { $0 > .zero })
+}
+
+// MARK: - gateopener-41m.6: escalating per-attempt timeout, shrunk sleep budget
+
+/// Acceptance test for step 1: attempt `k`'s `URLRequest.timeoutInterval`
+/// follows the configured `requestTimeouts` schedule exactly -- 3s, 5s, 8s
+/// for the default policy -- across a 500/500/500 script that forces all 3
+/// attempts to actually happen.
+@Test func openEscalatesPerAttemptTimeoutAcrossThreeFiveEightSeconds() async throws {
+    let script = RequestScript(statuses: [500, 500, 500])
+    let session = makeSequencedSession(script: script)
+
+    let (tokenManager, _) = makeTokenManager()
+    let client = GateClient(session: session, tokenManager: tokenManager, retryPolicy: .noDelay(maxAttempts: 3))
+
+    await #expect(throws: Error.self) {
+        try await client.open(endpointId: "VIP#OD#SB100001.1")
+    }
+
+    #expect(script.timeoutIntervals == [3, 5, 8])
+}
+
+/// Edge case: `maxAttempts > requestTimeouts.count` reuses the LAST
+/// timeout value for every attempt beyond the schedule's length, rather than
+/// indexing out of bounds or wrapping.
+@Test func openReusesLastTimeoutWhenMaxAttemptsExceedsScheduleLength() async throws {
+    let script = RequestScript(statuses: [500, 500, 500, 500])
+    let session = makeSequencedSession(script: script)
+
+    let (tokenManager, _) = makeTokenManager()
+    let retryPolicy = RetryPolicy(
+        maxAttempts: 4,
+        baseDelay: .milliseconds(1),
+        maxTotalDelay: .milliseconds(1),
+        requestTimeouts: [.seconds(3), .seconds(5), .seconds(8)],
+        sleep: { _ in }
+    )
+    let client = GateClient(session: session, tokenManager: tokenManager, retryPolicy: retryPolicy)
+
+    await #expect(throws: Error.self) {
+        try await client.open(endpointId: "VIP#OD#SB100001.1")
+    }
+
+    // 4th attempt reuses the last (8s) schedule entry rather than crashing
+    // or reusing the first.
+    #expect(script.timeoutIntervals == [3, 5, 8, 8])
+}
+
+/// Edge case: `maxAttempts == 1` uses only the FIRST entry of the schedule,
+/// never a later one, and never below the 3s floor.
+@Test func openWithSingleAttemptUsesFirstTimeoutOnly() async throws {
+    let script = RequestScript(statuses: [500])
+    let session = makeSequencedSession(script: script)
+
+    let (tokenManager, _) = makeTokenManager()
+    let client = GateClient(session: session, tokenManager: tokenManager, retryPolicy: .noDelay(maxAttempts: 1))
+
+    await #expect(throws: Error.self) {
+        try await client.open(endpointId: "VIP#OD#SB100001.1")
+    }
+
+    #expect(script.timeoutIntervals == [3])
+}
+
+/// Acceptance test for step 2: the sum of every sleep the DEFAULT policy
+/// (`.noDelay()`, same backoff/cap shape as `.default`) actually requests
+/// via the injected `sleep` closure never exceeds the 2s `maxTotalDelay`
+/// budget, across a full 3-attempt failure run.
+@Test func defaultPolicySleepsNeverExceedMaxTotalDelay() async throws {
+    let script = RequestScript(statuses: [500, 500, 500])
+    let session = makeSequencedSession(script: script)
+
+    let (tokenManager, _) = makeTokenManager()
+    let recorder = SleepRecorder()
+    let retryPolicy = RetryPolicy(
+        maxAttempts: 3,
+        baseDelay: .milliseconds(400),
+        maxTotalDelay: .seconds(2),
+        requestTimeouts: [.seconds(3), .seconds(5), .seconds(8)],
+        sleep: { duration in recorder.record(duration) }
+    )
+    let client = GateClient(session: session, tokenManager: tokenManager, retryPolicy: retryPolicy)
+
+    await #expect(throws: Error.self) {
+        try await client.open(endpointId: "VIP#OD#SB100001.1")
+    }
+
+    let totalSleep = recorder.durations.reduce(Duration.zero, +)
+    #expect(totalSleep <= .seconds(2))
+}
+
+/// Confirms `RetryPolicy.default` itself (not a hand-built equivalent) uses
+/// the documented 2s `maxTotalDelay` cap and 3/5/8s escalating schedule, so
+/// a future change to one without the other is caught here.
+@Test func defaultRetryPolicyHasDocumentedShapeAndArithmetic() {
+    let policy = RetryPolicy.default
+    #expect(policy.maxAttempts == 3)
+    #expect(policy.maxTotalDelay == .seconds(2))
+    #expect(policy.requestTimeouts == [.seconds(3), .seconds(5), .seconds(8)])
+    // Worst case: 3 + 5 + 8 = 16s of requests, plus <= 2s of bounded sleep
+    // = <= 18s, comfortably under OpenGateFlow's 25s deadline.
+    let totalRequestBudget = policy.requestTimeouts.reduce(Duration.zero, +)
+    #expect(totalRequestBudget == .seconds(16))
+    #expect(totalRequestBudget + policy.maxTotalDelay == .seconds(18))
+}
+
+/// Source-compatibility: the single-value `requestTimeout:` initializer
+/// (pre-dating this bead) still compiles and behaves as a UNIFORM timeout
+/// across every attempt -- i.e. equivalent to `requestTimeouts: [value]`.
+@Test func singleValueRequestTimeoutInitializerAppliesUniformlyToEveryAttempt() async throws {
+    let script = RequestScript(statuses: [500, 500, 500])
+    let session = makeSequencedSession(script: script)
+
+    let (tokenManager, _) = makeTokenManager()
+    let retryPolicy = RetryPolicy(
+        maxAttempts: 3,
+        requestTimeout: .seconds(5),
+        sleep: { _ in }
+    )
+    #expect(retryPolicy.requestTimeouts == [.seconds(5)])
+
+    let client = GateClient(session: session, tokenManager: tokenManager, retryPolicy: retryPolicy)
+
+    await #expect(throws: Error.self) {
+        try await client.open(endpointId: "VIP#OD#SB100001.1")
+    }
+
+    #expect(script.timeoutIntervals == [5, 5, 5])
 }
 
 // MARK: - open: .invalidCredentials is never retried (safety: retrying a

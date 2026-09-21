@@ -147,8 +147,16 @@ defensively, observed occasionally in practice).
 ### Retry behavior
 
 The live API is not perfectly reliable, so `open` retries with bounded
-exponential backoff (base ~400ms, jittered, capped at ~6s of total sleep
-across attempts, 3 attempts by default, 3s per-request timeout):
+exponential backoff (base ~400ms, jittered, capped at ~2s of total sleep
+across attempts, 3 attempts by default, escalating 3s/5s/8s per-attempt
+timeouts — attempt 1 gets 3s, attempt 2 gets 5s, attempt 3 gets 8s, and any
+further attempt reuses the last value). Escalating rather than a flat 3s
+because measured live latency has a ~1.7s healthy median, leaving too little
+margin on weak Wi-Fi/cellular for a flat timeout; retrying is safe here since
+the actuator is momentary and the official app itself sends the open command
+twice. The first attempt's timeout must never be shrunk below 3s. Worst case:
+`3 + 5 + 8 = 16s` of requests plus `<= 2s` of bounded backoff sleep = `<= 18s`
+total, comfortably under `OpenGateFlow`'s 25s deadline:
 
 - **Retried**: any HTTP 5xx, HTTP 429, and transport-level (network) errors.
 - **Not retried**: other 4xx statuses (e.g. 400, 403) — these indicate a

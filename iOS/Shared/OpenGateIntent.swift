@@ -75,7 +75,7 @@ public struct OpenGateIntent: AppIntent {
         // races and reads stale-optimistic `true` on a genuinely offline
         // device, the flow does not hang — `GateController.performOpen()`'s
         // own network call will simply fail (via `GateClient`'s existing
-        // retry/timeout budget, ~15s worst case) and `OpenGateFlow` maps
+        // retry/timeout budget, ~18s worst case) and `OpenGateFlow` maps
         // that to `.failed(message:)`, which still produces a correct,
         // bounded, user-visible dialog. The `isReachable == false` fast
         // path exists to avoid the ~45s `requestOpen()` QUEUE TTL (which

@@ -126,55 +126,100 @@ public struct RetryPolicy: Sendable {
     /// Once the cumulative planned delay would exceed this, no further
     /// retries are attempted (this bounds worst-case latency for a human
     /// standing at the gate).
-    public let maxTotalDelay: Duration
-    /// Per-request timeout (`URLRequest.timeoutInterval`), applied to EVERY
-    /// individual HTTP attempt.
     ///
-    /// Without this, a hanging server relies entirely on
+    /// Shrunk from 6s to 2s when per-attempt timeouts became escalating
+    /// (`requestTimeouts`, see below) rather than a flat 3s: the retry
+    /// budget is now dominated by the *requests themselves* (up to 16s for
+    /// the default 3/5/8s schedule), so the sleep budget only needs to be
+    /// large enough to avoid hammering a struggling server back-to-back, not
+    /// to bound overall wait time on its own.
+    public let maxTotalDelay: Duration
+    /// Per-attempt timeout (`URLRequest.timeoutInterval`) schedule, applied
+    /// to EACH individual HTTP attempt: attempt `k` (1-based) uses
+    /// `requestTimeouts[min(k - 1, requestTimeouts.count - 1)]`, so once the
+    /// array is exhausted the LAST value is reused for any further attempts
+    /// (`maxAttempts > requestTimeouts.count`), and with `maxAttempts == 1`
+    /// only the first value is ever used. Must be non-empty (enforced by a
+    /// precondition in `init`).
+    ///
+    /// Without a per-attempt timeout, a hanging server relies entirely on
     /// `URLSessionConfiguration`'s default request timeout (60s), so 3
     /// attempts could block for up to ~180s even though `maxTotalDelay`
     /// bounds only time spent SLEEPING between attempts, not time spent
-    /// waiting on an individual request. That defeats the "~6s bounded, a
-    /// human is waiting" intent behind `maxTotalDelay`.
+    /// waiting on an individual request.
     ///
-    /// Chosen as 3s: the overall budget is ~6s of retry sleep plus however
-    /// long the requests themselves take; capping each individual request at
-    /// 3s means the worst case across `maxAttempts == 3` attempts is roughly
-    /// `3 * 3s (requests) + 6s (bounded sleep) = 15s` -- not as tight as the
-    /// "~6s" framing taken literally, but genuinely bounded (versus
-    /// effectively unbounded/~180s before this change), and 3s is still
-    /// short enough that a single hang does not dominate the human-facing
-    /// wait. Callers needing a different bound can inject their own value.
-    public let requestTimeout: Duration
+    /// Escalating rather than flat: measured live Comelit-cloud latency puts
+    /// the healthy median around 1.7s, so a flat 3s timeout leaves only
+    /// ~1.1s of margin -- on weak Wi-Fi/cellular, all 3 attempts can time
+    /// out even though a slightly longer wait would have succeeded (see
+    /// memory `comelit-cloud-latency-and-timeout-budget`). Retrying is SAFE
+    /// here (the actuator is momentary and the official app itself sends
+    /// the open command twice), so this escalates the PER-ATTEMPT budget
+    /// instead of adding more attempts: default `[3s, 5s, 8s]`. The first
+    /// attempt's timeout must NEVER be shrunk below 3s (per that same
+    /// memory) -- callers needing a different bound can inject their own
+    /// array, but should preserve that floor.
+    ///
+    /// Worst case for the default policy (`maxAttempts == 3`,
+    /// `requestTimeouts == [3s, 5s, 8s]`, `maxTotalDelay == 2s`): `3 + 5 + 8
+    /// = 16s` of requests, plus at most `2s` of bounded backoff sleep between
+    /// attempts, for a `<= 18s` total -- comfortably under
+    /// `OpenGateFlow`'s 25s extension-lifetime deadline.
+    public let requestTimeouts: [Duration]
     /// Injectable sleep function so tests never actually sleep.
     public let sleep: @Sendable (Duration) async throws -> Void
 
+    /// Primary initializer: escalating per-attempt timeout schedule.
+    ///
+    /// - Precondition: `requestTimeouts` must be non-empty.
     public init(
         maxAttempts: Int = 3,
         baseDelay: Duration = .milliseconds(400),
-        maxTotalDelay: Duration = .seconds(6),
-        requestTimeout: Duration = .seconds(3),
+        maxTotalDelay: Duration = .seconds(2),
+        requestTimeouts: [Duration] = [.seconds(3), .seconds(5), .seconds(8)],
         sleep: @escaping @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) }
     ) {
+        precondition(!requestTimeouts.isEmpty, "RetryPolicy.requestTimeouts must be non-empty")
         self.maxAttempts = maxAttempts
         self.baseDelay = baseDelay
         self.maxTotalDelay = maxTotalDelay
-        self.requestTimeout = requestTimeout
+        self.requestTimeouts = requestTimeouts
         self.sleep = sleep
     }
 
+    /// Source-compatibility initializer for existing call sites that pass a
+    /// single, uniform `requestTimeout: Duration` (pre-dating the escalating
+    /// `requestTimeouts` schedule). Equivalent to passing `[requestTimeout]`
+    /// -- i.e. every attempt uses the same timeout.
+    public init(
+        maxAttempts: Int = 3,
+        baseDelay: Duration = .milliseconds(400),
+        maxTotalDelay: Duration = .seconds(2),
+        requestTimeout: Duration,
+        sleep: @escaping @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) }
+    ) {
+        self.init(
+            maxAttempts: maxAttempts,
+            baseDelay: baseDelay,
+            maxTotalDelay: maxTotalDelay,
+            requestTimeouts: [requestTimeout],
+            sleep: sleep
+        )
+    }
+
     /// The default, real-world policy: 3 attempts, ~400ms exponential
-    /// backoff with jitter, real `Task.sleep`.
+    /// backoff with jitter, escalating 3s/5s/8s per-attempt timeouts, real
+    /// `Task.sleep`.
     public static let `default` = RetryPolicy()
 
-    /// A policy for tests: same attempt/backoff shape, but `sleep` is a
-    /// no-op so tests complete instantly.
+    /// A policy for tests: same attempt/backoff/timeout shape as `.default`,
+    /// but `sleep` is a no-op so tests complete instantly.
     public static func noDelay(maxAttempts: Int = 3) -> RetryPolicy {
         RetryPolicy(
             maxAttempts: maxAttempts,
             baseDelay: .milliseconds(400),
-            maxTotalDelay: .seconds(6),
-            requestTimeout: .seconds(3),
+            maxTotalDelay: .seconds(2),
+            requestTimeouts: [.seconds(3), .seconds(5), .seconds(8)],
             sleep: { _ in }
         )
     }
@@ -451,10 +496,14 @@ public struct GateClient: Sendable {
             request.setValue("application/json", forHTTPHeaderField: "accept")
             request.httpBody = bodyData
             // Bound each individual attempt's wait -- see
-            // `RetryPolicy.requestTimeout` doc comment for why this is
-            // necessary on top of `maxTotalDelay`.
-            request.timeoutInterval = TimeInterval(retryPolicy.requestTimeout.components.seconds)
-                + Double(retryPolicy.requestTimeout.components.attoseconds) / 1e18
+            // `RetryPolicy.requestTimeouts` doc comment for why this is
+            // necessary on top of `maxTotalDelay`. Attempt `k` (1-based)
+            // uses `requestTimeouts[min(k - 1, count - 1)]`, so once the
+            // schedule is exhausted the last value is reused for any
+            // further attempts.
+            let timeoutForAttempt = retryPolicy.requestTimeouts[min(attempt - 1, retryPolicy.requestTimeouts.count - 1)]
+            request.timeoutInterval = TimeInterval(timeoutForAttempt.components.seconds)
+                + Double(timeoutForAttempt.components.attoseconds) / 1e18
 
             do {
                 let token = try await tokenManager.accessToken()

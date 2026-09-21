@@ -95,12 +95,15 @@ public struct OpenGateFlow: Sendable {
     ///   - reloadTimelines: Invoked after every snapshot write.
     ///   - timeout: How long to wait for `open()` before giving up and
     ///     returning `.timedOut`. Defaults to 25s — comfortably above the
-    ///     ~15s worst-case `GateClient` retry budget (see the
-    ///     `comelit-cloud-latency-and-timeout-budget` memory: do NOT shrink
-    ///     the underlying per-request timeout to "fix" this; 25s here is
-    ///     purely an extension-lifetime safety net) and comfortably below
-    ///     the ~30s a widget/App-Intent extension process is typically
-    ///     killed at.
+    ///     `<= 18s` worst-case `GateClient` retry budget (default
+    ///     `RetryPolicy`: escalating 3s/5s/8s per-attempt timeouts across 3
+    ///     attempts = 16s of requests, plus <= 2s of bounded backoff sleep;
+    ///     see the `comelit-cloud-latency-and-timeout-budget` memory: do NOT
+    ///     shrink the underlying per-request timeouts below that schedule
+    ///     -- and never below 3s on the first attempt -- to "fix" this; 25s
+    ///     here is purely an extension-lifetime safety net) and comfortably
+    ///     below the ~30s a widget/App-Intent extension process is
+    ///     typically killed at.
     ///   - now: Injectable clock for the snapshot's `updatedAt`, defaulting
     ///     to `Date.init`.
     public func run(
