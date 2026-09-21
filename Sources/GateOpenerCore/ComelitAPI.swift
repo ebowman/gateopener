@@ -53,9 +53,25 @@ public struct ComelitAPI: Sendable {
     public static let userAgent = "ktor-client"
 
     private let session: URLSession
+    /// `URLRequest.timeoutInterval` applied to EVERY request this type
+    /// builds (auth, token exchange, refresh). 8s rationale: normal cloud
+    /// latency is 1.6-1.9s (memory `comelit-cloud-latency-and-timeout-budget`)
+    /// and token calls are rare, so one generous bounded attempt beats
+    /// several tight ones. See `docs/PROTOCOL.md`'s "Token endpoints"
+    /// section.
+    private let requestTimeout: Duration
+    /// Injectable sleep function so tests never actually sleep. Mirrors
+    /// `RetryPolicy.sleep` in `GateClient.swift`.
+    private let sleep: @Sendable (Duration) async throws -> Void
 
-    public init(session: URLSession = .shared) {
+    public init(
+        session: URLSession = .shared,
+        requestTimeout: Duration = .seconds(8),
+        sleep: @escaping @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) }
+    ) {
         self.session = session
+        self.requestTimeout = requestTimeout
+        self.sleep = sleep
     }
 
     // MARK: - Login
@@ -108,6 +124,7 @@ public struct ComelitAPI: Sendable {
         request.setValue("application/json", forHTTPHeaderField: "content-type")
         request.setValue(Self.userAgent, forHTTPHeaderField: "user-agent")
         request.setValue("application/json,application/xml,text/xml", forHTTPHeaderField: "accept")
+        request.timeoutInterval = TimeInterval(requestTimeout.components.seconds)
         do {
             request.httpBody = try JSONSerialization.data(withJSONObject: body)
         } catch {
@@ -181,6 +198,11 @@ public struct ComelitAPI: Sendable {
     }
 
     /// Step 2 of login: exchange an authorization code + PKCE verifier for tokens.
+    ///
+    /// Retried once on transport failure or HTTP >= 500 / 429 (see
+    /// `performTokenRequest(form:allowRetry:)`): this is the token EXCHANGE,
+    /// distinct from the credential-submitting `/o-auth-2/auth` POST (step 1
+    /// of `login`), which is never retried.
     private func exchangeCodeForTokens(code: String, verifier: String) async throws -> TokenSet {
         let form: [String: String] = [
             "grant_type": "authorization_code",
@@ -190,7 +212,7 @@ public struct ComelitAPI: Sendable {
             "code": code,
             "code_verifier": verifier,
         ]
-        return try await performTokenRequest(form: form)
+        return try await performTokenRequest(form: form, allowRetry: true)
     }
 
     // MARK: - Refresh
@@ -208,14 +230,94 @@ public struct ComelitAPI: Sendable {
             "refresh_token": refreshToken,
             "scope": Self.scope,
         ]
-        return try await performTokenRequest(form: form)
+        return try await performTokenRequest(form: form, allowRetry: true)
     }
 
     // MARK: - Shared token-endpoint plumbing
 
-    private func performTokenRequest(form: [String: String]) async throws -> TokenSet {
+    /// Delay before the single retry attempt on `/o-auth-2/token` (see
+    /// `performTokenRequest(form:allowRetry:)`). Routed through the
+    /// injectable `sleep` closure so tests never really sleep.
+    private static let retryDelay: Duration = .milliseconds(500)
+
+    /// A single `/o-auth-2/token` HTTP attempt's outcome, ahead of any
+    /// error-mapping: either an HTTP response (of any status), or a
+    /// transport failure. Modeled as a value rather than thrown errors so
+    /// the retry decision in `performTokenRequest` can inspect a
+    /// transport-failure vs. HTTP-status distinction directly, without
+    /// having to pattern-match back out of a thrown `ComelitError`.
+    private enum TokenAttemptOutcome {
+        case response(data: Data, httpResponse: HTTPURLResponse)
+        case transportFailure(String)
+    }
+
+    /// POST to `/o-auth-2/token`, optionally retrying EXACTLY ONCE after a
+    /// fixed 500ms delay (via the injectable `sleep` closure) if the first
+    /// attempt fails with a transport error or an HTTP status of 500+ or
+    /// 429.
+    ///
+    /// `allowRetry` is `false` for nothing today (both token-endpoint
+    /// callers -- `exchangeCodeForTokens` and `refresh` -- pass `true`); it
+    /// exists so a future caller of this shared plumbing can opt out
+    /// without duplicating the request-building logic. The credential-
+    /// submitting `/o-auth-2/auth` POST is a SEPARATE method
+    /// (`requestAuthorizationCode`) that never calls this at all, and so is
+    /// never retried, regardless of this flag.
+    ///
+    /// Never retries a 4xx status (other than 429), and never retries a
+    /// `wrong_username_or_password` body regardless of its HTTP status:
+    /// both indicate a request the server will never accept no matter how
+    /// many times it is resent.
+    private func performTokenRequest(form: [String: String], allowRetry: Bool) async throws -> TokenSet {
+        var outcome = await attemptTokenRequest(form: form)
+
+        if allowRetry, Self.isRetryable(outcome) {
+            try await sleep(Self.retryDelay)
+            outcome = await attemptTokenRequest(form: form)
+        }
+
+        switch outcome {
+        case .transportFailure(let description):
+            throw ComelitError.network(description)
+        case .response(let data, let httpResponse):
+            let bodyString = String(data: data, encoding: .utf8) ?? ""
+
+            if bodyString.contains("wrong_username_or_password") {
+                throw ComelitError.invalidCredentials
+            }
+
+            guard httpResponse.statusCode == 200 else {
+                throw ComelitError.server(status: httpResponse.statusCode, body: String(bodyString.prefix(300)))
+            }
+
+            return try Self.decodeTokenResponse(data: data)
+        }
+    }
+
+    /// Whether a `/o-auth-2/token` attempt's outcome is safe to retry: a
+    /// transport failure, or an HTTP 500+ / 429 response whose body is NOT
+    /// a `wrong_username_or_password` credential rejection (that always
+    /// wins regardless of status, and is never retried).
+    private static func isRetryable(_ outcome: TokenAttemptOutcome) -> Bool {
+        switch outcome {
+        case .transportFailure:
+            return true
+        case .response(let data, let httpResponse):
+            let bodyString = String(data: data, encoding: .utf8) ?? ""
+            if bodyString.contains("wrong_username_or_password") {
+                return false
+            }
+            return httpResponse.statusCode >= 500 || httpResponse.statusCode == 429
+        }
+    }
+
+    /// A single HTTP attempt against `/o-auth-2/token`. Never throws --
+    /// transport failures and HTTP responses of any status are both
+    /// reported via `TokenAttemptOutcome` so the caller can make the retry
+    /// decision before any error-mapping happens.
+    private func attemptTokenRequest(form: [String: String]) async -> TokenAttemptOutcome {
         guard let url = URL(string: "\(Self.baseURL)/o-auth-2/token") else {
-            throw ComelitError.network("invalid URL for /o-auth-2/token")
+            return .transportFailure("invalid URL for /o-auth-2/token")
         }
 
         var request = URLRequest(url: url)
@@ -226,25 +328,18 @@ public struct ComelitAPI: Sendable {
         )
         request.setValue(Self.userAgent, forHTTPHeaderField: "user-agent")
         request.setValue("application/json", forHTTPHeaderField: "accept")
+        request.timeoutInterval = TimeInterval(requestTimeout.components.seconds)
         request.httpBody = Self.formURLEncode(form).data(using: .utf8)
 
-        let (data, response) = try await performRequest(request)
-
-        guard let httpResponse = response as? HTTPURLResponse else {
-            throw ComelitError.network("non-HTTP response from /o-auth-2/token")
+        do {
+            let (data, response) = try await session.data(for: request)
+            guard let httpResponse = response as? HTTPURLResponse else {
+                return .transportFailure("non-HTTP response from /o-auth-2/token")
+            }
+            return .response(data: data, httpResponse: httpResponse)
+        } catch {
+            return .transportFailure(error.localizedDescription)
         }
-
-        let bodyString = String(data: data, encoding: .utf8) ?? ""
-
-        if bodyString.contains("wrong_username_or_password") {
-            throw ComelitError.invalidCredentials
-        }
-
-        guard httpResponse.statusCode == 200 else {
-            throw ComelitError.server(status: httpResponse.statusCode, body: String(bodyString.prefix(300)))
-        }
-
-        return try Self.decodeTokenResponse(data: data)
     }
 
     private func performRequest(_ request: URLRequest) async throws -> (Data, URLResponse) {

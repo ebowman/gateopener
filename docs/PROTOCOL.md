@@ -170,6 +170,21 @@ total, comfortably under `OpenGateFlow`'s 25s deadline:
   a wrong password against a live account-security-sensitive service is
   actively harmful and could contribute to a lockout.
 
+### Token endpoints
+
+`ComelitAPI` applies its own, separate timeout/retry policy to
+`POST /o-auth-2/auth` (credential submission) and `POST /o-auth-2/token`
+(authorization-code exchange and refresh): every request gets an 8s
+`URLRequest.timeoutInterval` (normal cloud latency is ~1.6–1.9s, and token
+calls are rare, so one generous bounded attempt beats several tight ones).
+The `authorization_code` exchange and the `refresh_token` grant each get
+exactly one retry, after a fixed 500ms delay, on transport failure or HTTP
+500+/429 — never on any other 4xx, and never on a
+`wrong_username_or_password` body regardless of status. The credential-
+submitting `/o-auth-2/auth` POST is never retried under any circumstance.
+Worst case for a token call needing its one retry: `8s + 0.5s + 8s = 16.5s`,
+still comfortably under `OpenGateFlow`'s 25s deadline.
+
 ## Live door-camera video (WebRTC)
 
 GateOpener's door-camera feature exists in a separate, harder-won layer.
