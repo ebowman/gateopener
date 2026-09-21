@@ -52,12 +52,28 @@ struct MainView: View {
         appSettings.selectedEndpointName ?? "your gate"
     }
 
-    private var buttonLabel: String {
-        switch observable.state {
+    /// The primary (verb) line of the Open button's label, one per
+    /// `GateState` case (bead gateopener-41m.10 STEP 2). A pure `static
+    /// func`, independent of `self`, so it can be unit-tested directly
+    /// without constructing a `MainView`.
+    ///
+    /// MUTATION CHECK: swapping any two branches' return values, or
+    /// collapsing two cases onto the same string, would silently pass any
+    /// test that doesn't cover both cases with distinct expectations — the
+    /// tests in `OpenGateButtonLabelTests` cover every case with a distinct
+    /// literal precisely to catch that.
+    static func primaryLabel(for state: GateState) -> String {
+        switch state {
+        case .needsSetup, .idle:
+            return "Open Gate"
+        case .queued:
+            return "Waiting for network…"
+        case .opening:
+            return "Opening…"
+        case .succeeded:
+            return "Opened"
         case .failed:
-            return "Try again"
-        case .needsSetup, .idle, .queued, .opening, .succeeded:
-            return appSettings.selectedEndpointName ?? "Open Gate"
+            return "Try Again"
         }
     }
 
@@ -128,18 +144,24 @@ struct MainView: View {
 
             Spacer(minLength: 24)
 
-            openButton
-                .padding(.horizontal, 20)
+            // MARK: - Bottom control cluster (bead gateopener-41m.10 STEP 3)
+            //
+            // The Open button is anchored to the bottom safe area (16pt
+            // spacing) rather than centered/floating, so it sits in the
+            // screen's most thumb-reachable zone regardless of how much
+            // space the video panel above claims.
+            VStack(spacing: 16) {
+                Text(statusText)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .accessibilityHidden(true) // surfaced via the button's accessibilityValue instead
 
-            Text(statusText)
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-                .padding(.top, 12)
-                .accessibilityHidden(true) // surfaced via the button's accessibilityValue instead
+                openButton
+                    .padding(.horizontal, 20)
 
-            viewDoorButton
-                .padding(.top, 4)
-                .padding(.bottom, 24)
+                viewDoorButton
+            }
+            .padding(.bottom, 24)
         }
         .animation(.easeInOut(duration: 0.25), value: doorVideoCoordinator.isPanelVisible)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -176,44 +198,55 @@ struct MainView: View {
         }
     }
 
+    /// The leading glyph shown in the button for the current state: a
+    /// checkmark once succeeded, otherwise the shared gate glyph
+    /// (`GateSymbol`, reused from the widget/App-Shortcuts icon per this
+    /// bead's INPUT — it reads clearly at this ~34pt size in white on the
+    /// filled accent background, so no separate SF Symbol is needed).
+    private var openButtonIconName: String {
+        if case .succeeded = observable.state {
+            return "checkmark.circle.fill"
+        }
+        return GateSymbol.name
+    }
+
     private var openButton: some View {
         Button(action: handleTap) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 24, style: .continuous)
-                    .fill(accentColor)
-
+            HStack(spacing: 14) {
                 if case .opening = observable.state {
                     ProgressView()
                         .progressViewStyle(.circular)
                         .tint(.white)
-                        .controlSize(.extraLarge)
-                        .scaleEffect(1.6)
+                } else {
+                    Image(systemName: openButtonIconName)
+                        .font(.system(size: 34, weight: .semibold))
+                        .frame(width: 40)
                 }
 
-                HStack(spacing: 10) {
-                    if case .succeeded = observable.state {
-                        Image(systemName: "checkmark.circle.fill")
-                    }
-                    Text(buttonLabel)
-                        .font(.title2.weight(.semibold))
-                        .lineLimit(2)
-                        .minimumScaleFactor(0.7)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(Self.primaryLabel(for: observable.state))
+                        .font(.title2.weight(.bold))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
+                    Text(gateDisplayName)
+                        .font(.subheadline)
+                        .foregroundStyle(.white.opacity(0.85))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
                 }
-                .foregroundStyle(.white)
-                .opacity(isOpening ? 0.0 : 1.0)
+
+                Spacer(minLength: 0)
             }
+            .padding(.horizontal, 20)
+            .foregroundStyle(.white)
         }
-        .buttonStyle(.plain)
-        .frame(minHeight: 140)
+        .buttonStyle(OpenGateButtonStyle(fillColor: accentColor))
+        .dynamicTypeSize(...DynamicTypeSize.accessibility1)
         .animation(.easeInOut(duration: 0.2), value: observable.state)
         .accessibilityLabel("Open \(gateDisplayName)")
         .accessibilityValue(statusText)
+        .accessibilityHint("Double tap to open the gate")
         .accessibilityAddTraits(.isButton)
-    }
-
-    private var isOpening: Bool {
-        if case .opening = observable.state { return true }
-        return false
     }
 
     /// The live door-camera panel: `DoorVideoView` plus a small circular X
