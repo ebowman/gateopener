@@ -194,6 +194,270 @@ struct OpenGateFlowTests {
         #expect(store.read()?.phase == .failed)
         #expect(store.read()?.message == "Timed out")
     }
+
+    // MARK: - Press-level journal phases (gateopener-41m.22)
+
+    /// Thread-safe recorder for `OpenPressRecord`s emitted via the `journal`
+    /// closure, same `NSLock` + `@unchecked Sendable` idiom used elsewhere in
+    /// this file.
+    private final class PressRecorder: @unchecked Sendable {
+        private let lock = NSLock()
+        private var _records: [OpenPressRecord] = []
+
+        func record(_ record: OpenPressRecord) {
+            lock.lock()
+            _records.append(record)
+            lock.unlock()
+        }
+
+        var records: [OpenPressRecord] {
+            lock.lock()
+            defer { lock.unlock() }
+            return _records
+        }
+    }
+
+    @Test func needsSetupEmitsReachabilityThenFinished() async {
+        let (defaults, cleanup) = makeSuite()
+        defer { cleanup() }
+        let store = WidgetSnapshotStore(defaults: defaults)
+        let recorder = PressRecorder()
+
+        let outcome = await OpenGateFlow().run(
+            currentState: .needsSetup,
+            gateName: "Front Gate",
+            isReachable: true,
+            open: { .succeeded(at: Date()) },
+            snapshot: store,
+            reloadTimelines: {},
+            journal: { recorder.record($0) }
+        )
+
+        #expect(outcome == .needsSetup)
+        let phases = recorder.records.map(\.phase)
+        #expect(phases == [
+            .reachability(isReachable: true, detail: ""),
+            .finished(outcome: "Sign in to GateOpener first"),
+        ])
+    }
+
+    @Test func unreachableEmitsReachabilityThenFinishedWithNoNetwork() async {
+        let (defaults, cleanup) = makeSuite()
+        defer { cleanup() }
+        let store = WidgetSnapshotStore(defaults: defaults)
+        let recorder = PressRecorder()
+
+        let outcome = await OpenGateFlow().run(
+            currentState: .idle,
+            gateName: "Front Gate",
+            isReachable: false,
+            open: { .succeeded(at: Date()) },
+            snapshot: store,
+            reloadTimelines: {},
+            journal: { recorder.record($0) }
+        )
+
+        #expect(outcome == .failed(message: "No network"))
+        let phases = recorder.records.map(\.phase)
+        #expect(phases == [
+            .reachability(isReachable: false, detail: ""),
+            .finished(outcome: "No network"),
+        ])
+    }
+
+    @Test func openedEmitsReachabilityOpenStartedThenFinished() async {
+        let (defaults, cleanup) = makeSuite()
+        defer { cleanup() }
+        let store = WidgetSnapshotStore(defaults: defaults)
+        let recorder = PressRecorder()
+
+        let outcome = await OpenGateFlow().run(
+            currentState: .idle,
+            gateName: "Front Gate",
+            isReachable: true,
+            open: { .succeeded(at: Date()) },
+            snapshot: store,
+            reloadTimelines: {},
+            journal: { recorder.record($0) }
+        )
+
+        #expect(outcome == .opened)
+        let phases = recorder.records.map(\.phase)
+        #expect(phases == [
+            .reachability(isReachable: true, detail: ""),
+            .openStarted,
+            .finished(outcome: "Gate opened"),
+        ])
+    }
+
+    @Test func failedEmitsReachabilityOpenStartedThenFinishedWithMessage() async {
+        let (defaults, cleanup) = makeSuite()
+        defer { cleanup() }
+        let store = WidgetSnapshotStore(defaults: defaults)
+        let recorder = PressRecorder()
+
+        let outcome = await OpenGateFlow().run(
+            currentState: .idle,
+            gateName: "Front Gate",
+            isReachable: true,
+            open: { .failed(message: "x") },
+            snapshot: store,
+            reloadTimelines: {},
+            journal: { recorder.record($0) }
+        )
+
+        #expect(outcome == .failed(message: "x"))
+        let phases = recorder.records.map(\.phase)
+        #expect(phases == [
+            .reachability(isReachable: true, detail: ""),
+            .openStarted,
+            .finished(outcome: "x"),
+        ])
+    }
+
+    @Test func timedOutEmitsReachabilityOpenStartedThenTimedOut() async {
+        let (defaults, cleanup) = makeSuite()
+        defer { cleanup() }
+        let store = WidgetSnapshotStore(defaults: defaults)
+        let recorder = PressRecorder()
+
+        let outcome = await OpenGateFlow().run(
+            currentState: .idle,
+            gateName: "Front Gate",
+            isReachable: true,
+            open: {
+                do {
+                    try await Task.sleep(for: .seconds(60))
+                } catch {
+                    // Cancelled by the losing side of the race.
+                }
+                return .succeeded(at: Date())
+            },
+            snapshot: store,
+            reloadTimelines: {},
+            timeout: .milliseconds(50),
+            journal: { recorder.record($0) }
+        )
+
+        #expect(outcome == .timedOut)
+        let phases = recorder.records.map(\.phase)
+        #expect(phases == [
+            .reachability(isReachable: true, detail: ""),
+            .openStarted,
+            .timedOut,
+        ])
+    }
+
+    // MARK: - TaskLocal pressId propagation into open() (gateopener-41m.22)
+
+    /// `OpenGateFlow.run` wraps `open()` in
+    /// `OpenPressContext.$pressId.withValue(pressId)`, and `open()` itself
+    /// runs inside a `TaskGroup` child task (`raceAgainstTimeout`) -- this
+    /// proves the `@TaskLocal` value set on the parent task before
+    /// `group.addTask` IS inherited by that child task, by reading
+    /// `OpenPressContext.pressId` from inside the `open` closure itself.
+    ///
+    /// MUTATION CHECK: if `run` bound the TaskLocal around a scope that did
+    /// NOT actually enclose `raceAgainstTimeout`'s `addTask` call (e.g. bound
+    /// it only around a no-op), `observedPressId` would capture `nil`
+    /// instead of the real `pressId`, and the final `#expect` would fail.
+    @Test func openClosureObservesTaskLocalPressIdSetByRun() async {
+        let (defaults, cleanup) = makeSuite()
+        defer { cleanup() }
+        let store = WidgetSnapshotStore(defaults: defaults)
+
+        let holder = PressIdHolder()
+        let explicitPressId = UUID()
+
+        let outcome = await OpenGateFlow().run(
+            currentState: .idle,
+            gateName: "Front Gate",
+            isReachable: true,
+            open: {
+                holder.record(OpenPressContext.pressId)
+                return .succeeded(at: Date())
+            },
+            snapshot: store,
+            reloadTimelines: {},
+            pressId: explicitPressId
+        )
+
+        #expect(outcome == .opened)
+        #expect(holder.value == explicitPressId)
+    }
+
+    /// End-to-end: `open` wraps a real `GateClient.open` (wired with an
+    /// `attemptObserver`), and `OpenGateFlow.run` is given an explicit
+    /// `pressId`. Every `OpenAttemptRecord` the `GateClient` call produces
+    /// must carry that same `pressId`, proving the TaskLocal set by `run`
+    /// really does reach `GateClient.report(...)` through the `open` closure
+    /// and the `raceAgainstTimeout` child task in between.
+    @Test func attemptRecordsProducedInsideOpenCarryTheFlowsPressId() async throws {
+        let (defaults, cleanup) = makeSuite()
+        defer { cleanup() }
+        let store = WidgetSnapshotStore(defaults: defaults)
+
+        let script = RequestScript(statuses: [500, 202])
+        let session = makeSequencedSession(script: script)
+        let credentialStore = MockCredentialStore()
+        let issuing = MockTokenIssuing()
+        try? credentialStore.saveCredentials(username: "alice", password: "s3cret")
+        issuing.loginResult = .success(
+            TokenSet(accessToken: "the-access-token", refreshToken: "rt", expiresIn: 3600, tokenType: "bearer")
+        )
+        let tokenManager = TokenManager(api: issuing, credentialStore: credentialStore)
+        let observer = RecordingAttemptObserver()
+        let client = GateClient(
+            session: session,
+            tokenManager: tokenManager,
+            retryPolicy: .noDelay(),
+            attemptObserver: observer
+        )
+
+        let explicitPressId = UUID()
+
+        let outcome = await OpenGateFlow().run(
+            currentState: .idle,
+            gateName: "Front Gate",
+            isReachable: true,
+            open: {
+                do {
+                    try await client.open(endpointId: "VIP#OD#SB100001.1")
+                    return .succeeded(at: Date())
+                } catch {
+                    return .failed(message: "x")
+                }
+            },
+            snapshot: store,
+            reloadTimelines: {},
+            pressId: explicitPressId
+        )
+
+        #expect(outcome == .opened)
+        let records = observer.records
+        #expect(records.count == 2)
+        #expect(records.allSatisfy { $0.pressId == explicitPressId })
+    }
+}
+
+/// Thread-safe single-slot holder for a `UUID?` observed from inside an
+/// `open` closure, same `NSLock` + `@unchecked Sendable` idiom used
+/// elsewhere in this file.
+private final class PressIdHolder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _value: UUID?
+
+    func record(_ value: UUID?) {
+        lock.lock()
+        _value = value
+        lock.unlock()
+    }
+
+    var value: UUID? {
+        lock.lock()
+        defer { lock.unlock() }
+        return _value
+    }
 }
 
 /// Actor-backed counter so `open` closures (which must be `@Sendable`) can

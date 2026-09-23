@@ -823,7 +823,13 @@ public struct GateClient: Sendable {
                 maxAttempts: retryPolicy.maxAttempts,
                 outcome: outcome,
                 elapsedMilliseconds: elapsedMilliseconds,
-                willRetry: willRetry
+                willRetry: willRetry,
+                // Correlates this attempt to the enclosing press, when
+                // `open()` is running inside `OpenPressContext.$pressId
+                // .withValue(...)` (see `OpenGateFlow.run`). `nil` when no
+                // press context is bound (e.g. `GateClient.open` called
+                // directly, as most tests in this file do).
+                pressId: OpenPressContext.pressId
             )
         )
     }

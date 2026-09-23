@@ -13,8 +13,17 @@ import Darwin
 /// `EventLog`) is useless here precisely because the intent path never
 /// shares memory with the app.
 ///
-/// FILE FORMAT: one JSON-encoded `OpenAttemptRecord` per line (JSONEncoder
-/// with `.iso8601` date encoding), newest-appended-last.
+/// FILE FORMAT: one JSON-encoded record per line (JSONEncoder with
+/// `.iso8601` date encoding), newest-appended-last. Since bead
+/// gateopener-41m.22 each line is an `OpenJournalEntry` -- either
+/// `{"kind":"press", ...OpenPressRecord fields}` or `{"kind":"attempt",
+/// ...OpenAttemptRecord fields}` -- so the journal can hold both per-attempt
+/// records (written by `GateClient.open` via `record(_: OpenAttemptRecord)`)
+/// and per-press-phase records (written by `OpenGateFlow`/callers via
+/// `record(_: OpenPressRecord)`), correlated by `OpenPressRecord.pressId` /
+/// `OpenAttemptRecord.pressId`. A line with no top-level `"kind"` key
+/// predates this bead and is decoded as a legacy `OpenAttemptRecord` (with
+/// `pressId == nil`) -- see `OpenJournalEntry`'s doc comment.
 ///
 /// WRITE STRATEGY: `record(_:)` opens the file with POSIX `open(2)` using
 /// `O_RDWR | O_APPEND | O_CREAT` (read+write, because the trim step below
@@ -122,7 +131,23 @@ public final class OpenAttemptJournal: OpenAttemptObserving, @unchecked Sendable
     /// lock failure, encode failure) — a logging failure must never affect
     /// `GateClient.open`.
     public func record(_ record: OpenAttemptRecord) {
-        guard var line = try? encoder.encode(record) else { return }
+        appendEntry(.attempt(record))
+    }
+
+    /// Appends `press` as one JSON line (`{"kind":"press", ...}`), under the
+    /// exact same atomicity/locking/trim guarantees as `record(_:
+    /// OpenAttemptRecord)` -- see this type's doc comment. One
+    /// `OpenPressRecord` is written per phase; see `OpenPressPhase`'s doc
+    /// comment for why.
+    public func record(_ press: OpenPressRecord) {
+        appendEntry(.press(press))
+    }
+
+    /// Shared append path for both record kinds: encodes `entry` as one
+    /// `OpenJournalEntry` JSON line and appends it under the same
+    /// lock/trim/failure-swallowing policy documented on this type.
+    private func appendEntry(_ entry: OpenJournalEntry) {
+        guard var line = try? encoder.encode(entry) else { return }
         line.append(0x0A) // "\n"
 
         processLock.lock()
@@ -136,20 +161,35 @@ public final class OpenAttemptJournal: OpenAttemptObserving, @unchecked Sendable
 
     // MARK: - Read access
 
-    /// All currently-persisted records, oldest first, capped at `capacity`
-    /// entries (the newest `capacity`). Returns `[]` (never throws) if the
-    /// file does not exist, cannot be read, or every line in it is corrupt.
-    /// Corrupt/partial individual lines are skipped rather than failing the
-    /// whole read.
+    /// All currently-persisted attempt records, oldest first, capped at
+    /// `capacity` entries (the newest `capacity` lines OF EITHER KIND --
+    /// i.e. capacity counts press and attempt lines together, but this
+    /// accessor then filters the result down to just the `.attempt` cases).
+    /// Returns `[]` (never throws) if the file does not exist, cannot be
+    /// read, or every line in it is corrupt. Corrupt/partial individual
+    /// lines are skipped rather than failing the whole read.
     public func entries() -> [OpenAttemptRecord] {
+        journalEntries().compactMap { entry in
+            if case .attempt(let record) = entry { return record }
+            return nil
+        }
+    }
+
+    /// All currently-persisted journal entries (press and attempt records
+    /// interleaved as written), oldest first, capped at `capacity` lines
+    /// (the newest `capacity`, counting both kinds together). Returns `[]`
+    /// (never throws) if the file does not exist, cannot be read, or every
+    /// line in it is corrupt. Corrupt/partial individual lines are skipped
+    /// rather than failing the whole read.
+    public func journalEntries() -> [OpenJournalEntry] {
         processLock.lock()
         defer { processLock.unlock() }
 
-        let records = withSharedLock { fd -> [OpenAttemptRecord] in
+        let entries = withSharedLock { fd -> [OpenJournalEntry] in
             guard let data = Self.readAllFromStart(fd) else { return [] }
             return Self.parseLines(data, decoder: decoder)
         } ?? []
-        return Array(records.suffix(capacity))
+        return Array(entries.suffix(capacity))
     }
 
     /// Removes all persisted records by truncating the journal file to
@@ -166,16 +206,16 @@ public final class OpenAttemptJournal: OpenAttemptObserving, @unchecked Sendable
 
     // MARK: - Private: line parsing
 
-    private static func parseLines(_ data: Data, decoder: JSONDecoder) -> [OpenAttemptRecord] {
+    private static func parseLines(_ data: Data, decoder: JSONDecoder) -> [OpenJournalEntry] {
         guard !data.isEmpty else { return [] }
         let newline: UInt8 = 0x0A
-        var records: [OpenAttemptRecord] = []
+        var records: [OpenJournalEntry] = []
         var start = data.startIndex
         var index = data.startIndex
         while index < data.endIndex {
             if data[index] == newline {
                 let lineData = data[start..<index]
-                if !lineData.isEmpty, let decoded = try? decoder.decode(OpenAttemptRecord.self, from: Data(lineData)) {
+                if !lineData.isEmpty, let decoded = decodeLine(Data(lineData), decoder: decoder) {
                     records.append(decoded)
                 }
                 start = data.index(after: index)
@@ -187,11 +227,28 @@ public final class OpenAttemptJournal: OpenAttemptObserving, @unchecked Sendable
         // silently if it's corrupt/incomplete.
         if start < data.endIndex {
             let lineData = data[start..<data.endIndex]
-            if let decoded = try? decoder.decode(OpenAttemptRecord.self, from: Data(lineData)) {
+            if let decoded = decodeLine(Data(lineData), decoder: decoder) {
                 records.append(decoded)
             }
         }
         return records
+    }
+
+    /// Decodes one JSONL line as an `OpenJournalEntry`. A line with a
+    /// top-level `"kind"` key decodes directly. A line WITHOUT a `"kind"`
+    /// key predates bead gateopener-41m.22 (every line ever written before
+    /// this bead) and is decoded as a legacy `OpenAttemptRecord`, wrapped as
+    /// `.attempt(...)` with `pressId == nil`. Any other decode failure
+    /// (genuinely corrupt/partial line) returns `nil`, matching this type's
+    /// skip-corrupt-lines policy.
+    private static func decodeLine(_ lineData: Data, decoder: JSONDecoder) -> OpenJournalEntry? {
+        if let entry = try? decoder.decode(OpenJournalEntry.self, from: lineData) {
+            return entry
+        }
+        if let legacy = try? decoder.decode(OpenAttemptRecord.self, from: lineData) {
+            return .attempt(legacy)
+        }
+        return nil
     }
 
     // MARK: - Private: appending + trimming (called while holding both locks)

@@ -1073,3 +1073,54 @@ final class RecordingAttemptObserver: OpenAttemptObserving, @unchecked Sendable 
 
     #expect(script.requestCount == 1)
 }
+
+// MARK: - open: OpenPressContext.pressId correlation (gateopener-41m.22)
+
+/// When `open()` runs inside `OpenPressContext.$pressId.withValue(_:)`,
+/// every `OpenAttemptRecord` it reports carries that press id.
+@Test func attemptRecordsCarryTaskLocalPressIdWhenSet() async throws {
+    let script = RequestScript(statuses: [500, 202])
+    let session = makeSequencedSession(script: script)
+
+    let (tokenManager, _) = makeTokenManager()
+    let observer = RecordingAttemptObserver()
+    let client = GateClient(
+        session: session,
+        tokenManager: tokenManager,
+        retryPolicy: .noDelay(),
+        attemptObserver: observer
+    )
+
+    let pressId = UUID()
+    try await OpenPressContext.$pressId.withValue(pressId) {
+        try await client.open(endpointId: "VIP#OD#SB100001.1")
+    }
+
+    let records = observer.records
+    #expect(records.count == 2)
+    #expect(records.allSatisfy { $0.pressId == pressId })
+}
+
+/// With no `OpenPressContext.pressId` bound at all, every reported attempt
+/// carries `pressId == nil` -- the default, pre-existing behavior for every
+/// other test in this file.
+@Test func attemptRecordsCarryNilPressIdWhenUnset() async throws {
+    let script = RequestScript(statuses: [202])
+    let session = makeSequencedSession(script: script)
+
+    let (tokenManager, _) = makeTokenManager()
+    let observer = RecordingAttemptObserver()
+    let client = GateClient(
+        session: session,
+        tokenManager: tokenManager,
+        retryPolicy: .noDelay(),
+        attemptObserver: observer
+    )
+
+    #expect(OpenPressContext.pressId == nil)
+    try await client.open(endpointId: "VIP#OD#SB100001.1")
+
+    let records = observer.records
+    #expect(records.count == 1)
+    #expect(records[0].pressId == nil)
+}

@@ -342,6 +342,134 @@ struct OpenAttemptJournalTests {
     /// append from the other "process". The physical line count must stay
     /// bounded and every physical line must decode (no torn/partial write
     /// left behind by a trim that raced with an in-flight append).
+    // MARK: - OpenJournalEntry (gateopener-41m.22): mixed press/attempt journal
+
+    private func makePressRecord(
+        pressId: UUID = UUID(),
+        timestamp: Date = Date(timeIntervalSince1970: 1_700_000_300),
+        phase: OpenPressPhase = .started,
+        elapsedMilliseconds: Int = 0
+    ) -> OpenPressRecord {
+        OpenPressRecord(
+            pressId: pressId,
+            timestamp: timestamp,
+            source: "intent",
+            process: "ie.boboco.GateOpener",
+            appVersion: "0.1.9 (11)",
+            phase: phase,
+            elapsedMilliseconds: elapsedMilliseconds
+        )
+    }
+
+    /// Both `OpenJournalEntry` cases round-trip through `JSONEncoder`/
+    /// `JSONDecoder` with the same `.iso8601` date strategy the journal
+    /// itself uses, and encode with a top-level `"kind"` discriminator.
+    @Test func journalEntryRoundTripsPressAndAttemptCases() throws {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+
+        let pressEntry = OpenJournalEntry.press(makePressRecord(phase: .reachability(isReachable: true, detail: "satisfied")))
+        let pressData = try encoder.encode(pressEntry)
+        let pressJSON = try #require(try JSONSerialization.jsonObject(with: pressData) as? [String: Any])
+        #expect(pressJSON["kind"] as? String == "press")
+        let decodedPress = try decoder.decode(OpenJournalEntry.self, from: pressData)
+        #expect(decodedPress == pressEntry)
+
+        let attemptEntry = OpenJournalEntry.attempt(makeRecord(attempt: 1))
+        let attemptData = try encoder.encode(attemptEntry)
+        let attemptJSON = try #require(try JSONSerialization.jsonObject(with: attemptData) as? [String: Any])
+        #expect(attemptJSON["kind"] as? String == "attempt")
+        let decodedAttempt = try decoder.decode(OpenJournalEntry.self, from: attemptData)
+        #expect(decodedAttempt == attemptEntry)
+    }
+
+    /// A JSONL line with no top-level `"kind"` key (i.e. every line this
+    /// journal ever wrote before this bead) decodes as a legacy
+    /// `OpenAttemptRecord` with `pressId == nil`, wrapped as `.attempt(...)`.
+    @Test func legacyLineWithoutKindDecodesAsAttemptWithNilPressId() throws {
+        let (url, cleanup) = makeTempJournalURL()
+        defer { cleanup() }
+
+        // Write a raw legacy line directly (as if written before this bead),
+        // bypassing `OpenAttemptJournal.record` entirely.
+        let legacyEncoder = JSONEncoder()
+        legacyEncoder.dateEncodingStrategy = .iso8601
+        let legacyRecord = makeRecord(attempt: 1)
+        var line = try legacyEncoder.encode(legacyRecord)
+        line.append(0x0A)
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try line.write(to: url)
+
+        let journal = OpenAttemptJournal(fileURL: url)
+        let entries = journal.journalEntries()
+        #expect(entries.count == 1)
+        guard case .attempt(let decoded) = entries[0] else {
+            Issue.record("expected .attempt, got \(entries[0])")
+            return
+        }
+        #expect(decoded.pressId == nil)
+        #expect(decoded.attempt == legacyRecord.attempt)
+        #expect(decoded.outcome == legacyRecord.outcome)
+
+        // entries() (the OpenAttemptRecord-only accessor) must also surface it.
+        let attemptOnly = journal.entries()
+        #expect(attemptOnly.count == 1)
+        #expect(attemptOnly[0].pressId == nil)
+    }
+
+    /// A mixed file (press then attempt then press) round-trips through
+    /// `journalEntries()` in order, and `entries()` filters down to just the
+    /// attempt records.
+    @Test func mixedFileJournalEntriesOrderedEntriesFilters() {
+        let (url, cleanup) = makeTempJournalURL()
+        defer { cleanup() }
+
+        let journal = OpenAttemptJournal(fileURL: url)
+        let pressId = UUID()
+        let press1 = makePressRecord(pressId: pressId, timestamp: Date(timeIntervalSince1970: 1_700_000_000), phase: .started)
+        let attempt1 = makeRecord(attempt: 1, timestamp: Date(timeIntervalSince1970: 1_700_000_001))
+        let press2 = makePressRecord(pressId: pressId, timestamp: Date(timeIntervalSince1970: 1_700_000_002), phase: .finished(outcome: "Gate opened"))
+
+        journal.record(press1)
+        journal.record(attempt1)
+        journal.record(press2)
+
+        let journalEntries = journal.journalEntries()
+        #expect(journalEntries == [.press(press1), .attempt(attempt1), .press(press2)])
+
+        let attemptsOnly = journal.entries()
+        #expect(attemptsOnly == [attempt1])
+    }
+
+    /// Trim counts lines of either kind toward `capacity` -- a mix of press
+    /// and attempt lines is trimmed down to the newest `capacity` lines
+    /// total, not `capacity` of each kind.
+    @Test func trimCountsMixedLinesTowardCapacity() {
+        let (url, cleanup) = makeTempJournalURL()
+        defer { cleanup() }
+
+        let capacity = 4
+        let journal = OpenAttemptJournal(fileURL: url, capacity: capacity)
+        var written: [OpenJournalEntry] = []
+        for index in 0..<10 {
+            if index % 2 == 0 {
+                let press = makePressRecord(timestamp: Date(timeIntervalSince1970: 1_700_000_000 + Double(index)), phase: .started)
+                journal.record(press)
+                written.append(.press(press))
+            } else {
+                let attempt = makeRecord(attempt: index, timestamp: Date(timeIntervalSince1970: 1_700_000_000 + Double(index)))
+                journal.record(attempt)
+                written.append(.attempt(attempt))
+            }
+        }
+
+        let entries = journal.journalEntries()
+        #expect(entries.count == capacity)
+        #expect(entries == Array(written.suffix(capacity)))
+    }
+
     @Test func concurrentTrimAcrossTwoInstancesStaysBoundedAndDecodable() async throws {
         let (url, cleanup) = makeTempJournalURL()
         defer { cleanup() }
