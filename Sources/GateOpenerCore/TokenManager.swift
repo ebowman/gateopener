@@ -21,6 +21,26 @@ public protocol TokenIssuing: Sendable {
 
 extension ComelitAPI: TokenIssuing {}
 
+/// How `TokenManager.resolveAccessToken()` resolved a usable access token,
+/// reported (non-secretly) via `TokenManager.onResolved` so a caller can
+/// journal it as an `OpenPressPhase.tokenResolved(kind:)` -- never the token
+/// itself.
+public enum TokenResolution: String, Sendable {
+    /// An in-memory cached token that was not near expiry.
+    case cachedInMemory
+    /// A token loaded from the credential store that was not near expiry.
+    case keychainValid
+    /// A refresh (using a stored/cached refresh token) succeeded.
+    case refreshed
+    /// A full username/password login succeeded.
+    case loggedIn
+    /// A refresh failed with a transport/availability failure, but the
+    /// existing token was still (without the 5-minute skew) genuinely
+    /// unexpired, so it was handed back rather than escalating to a login
+    /// (the "grace" path added by bead gateopener-41m.5).
+    case graceUsed
+}
+
 /// Owns the lifecycle of the OAuth access token used to call the Comelit API:
 /// caching it in memory, persisting it to a `CredentialStoring` backend,
 /// proactively refreshing it before it expires, and falling back to a full
@@ -72,14 +92,39 @@ public actor TokenManager {
     /// shared by both entry points, not a second one added for `prewarm()`.
     private var inFlightTask: Task<String, Error>?
 
+    /// Optional hook invoked synchronously, immediately after
+    /// `resolveAccessToken()` decides HOW it resolved a usable access token
+    /// -- never with the token itself. `nil` by default (production
+    /// behaviour is completely unchanged); `AppEnvironment.make()` sets this
+    /// to journal an `OpenPressPhase.tokenResolved(kind:)` press record when
+    /// a press is in progress (see `OpenPressContext.pressId`).
+    ///
+    /// MUST be synchronous and non-throwing, exactly like
+    /// `OpenAttemptObserving.record(_:)` -- this hook can never affect
+    /// `resolveAccessToken()`'s control flow or timing.
+    public var onResolved: (@Sendable (TokenResolution) -> Void)?
+
+    /// Optional hook invoked synchronously when `resolveAccessToken()` is
+    /// about to throw -- i.e. no token could be resolved at all (a full
+    /// login failed, or there are no stored credentials to attempt one
+    /// with). `description` is already sanitized (see
+    /// `TokenFailureDescription.sanitizedTokenFailureDescription`) -- never
+    /// a raw error/response body. `nil` by default; see `onResolved`'s doc
+    /// comment for the same synchronous/non-throwing contract.
+    public var onFailed: (@Sendable (String) -> Void)?
+
     public init(
         api: any TokenIssuing,
         credentialStore: any CredentialStoring,
-        now: @escaping () -> Date = Date.init
+        now: @escaping () -> Date = Date.init,
+        onResolved: (@Sendable (TokenResolution) -> Void)? = nil,
+        onFailed: (@Sendable (String) -> Void)? = nil
     ) {
         self.api = api
         self.credentialStore = credentialStore
         self.now = now
+        self.onResolved = onResolved
+        self.onFailed = onFailed
     }
 
     /// Resolve a usable access token, refreshing or logging in as needed.
@@ -183,33 +228,93 @@ public actor TokenManager {
         credentialStore = store
     }
 
+    /// Sets `onResolved`. A plain actor-isolated setter (rather than direct
+    /// property assignment from callers) so both production wiring
+    /// (`AppEnvironment.make()`) and tests can assign the hook with a single
+    /// `await`, without needing `@MainActor`/`Sendable` ceremony at the call
+    /// site beyond what an `async` actor method already requires.
+    public func setOnResolved(_ hook: (@Sendable (TokenResolution) -> Void)?) {
+        onResolved = hook
+    }
+
+    /// Sets `onFailed`. See `setOnResolved(_:)`'s doc comment.
+    public func setOnFailed(_ hook: (@Sendable (String) -> Void)?) {
+        onFailed = hook
+    }
+
     // MARK: - Resolution
 
+    /// Thin wrapper around the actual resolution logic (`resolveAccessTokenCore()`)
+    /// that reports the outcome via `onResolved`/`onFailed`, exactly once per
+    /// call, without altering any resolution semantics: every `return`/`throw`
+    /// below is unchanged from before these hooks existed.
     private func resolveAccessToken() async throws -> String {
+        do {
+            let (token, resolution) = try await resolveAccessTokenCore()
+            onResolved?(resolution)
+            return token
+        } catch {
+            onFailed?(TokenFailureDescription.sanitizedTokenFailureDescription(error))
+            throw error
+        }
+    }
+
+    private func resolveAccessTokenCore() async throws -> (String, TokenResolution) {
         if let cached = cachedToken, !cached.isExpired() {
-            return cached.accessToken
+            return (cached.accessToken, .cachedInMemory)
         }
 
         let stored = try credentialStore.loadTokens()
 
         if let stored, !stored.isExpired() {
             cachedToken = stored
-            return stored.accessToken
+            return (stored.accessToken, .keychainValid)
         }
 
         // Try a refresh first, using whichever token (stored, preferentially,
         // else the stale in-memory one) carries a refresh token.
-        if let refreshable = stored ?? cachedToken,
-           refreshable.refreshToken != nil,
-           let refreshed = try? await api.refresh(refreshable) {
-            try credentialStore.saveTokens(refreshed)
-            cachedToken = refreshed
-            return refreshed.accessToken
+        if let refreshable = stored ?? cachedToken, refreshable.refreshToken != nil {
+            do {
+                let refreshed = try await api.refresh(refreshable)
+                try credentialStore.saveTokens(refreshed)
+                cachedToken = refreshed
+                return (refreshed.accessToken, .refreshed)
+            } catch let error as ComelitError {
+                if isTransportFailure(error) {
+                    // The network is genuinely bad right now (or the server
+                    // is failing/rate-limiting): escalating to a full
+                    // 2-request login would just add more load-bearing
+                    // round trips on top of a connection that already
+                    // can't complete one. If the token we already hold is
+                    // still (really, without the 5-minute skew) unexpired,
+                    // hand it back rather than throwing -- it's still
+                    // valid, just inside the proactive-renewal window.
+                    // Otherwise rethrow so the caller sees the real
+                    // network/server failure instead of a misleading login
+                    // failure.
+                    if refreshable.expiresAt > now() {
+                        return (refreshable.accessToken, .graceUsed)
+                    }
+                    throw error
+                }
+                // Any other ComelitError (4xx such as invalid_grant,
+                // .invalidCredentials, .decoding, .missingRefreshToken)
+                // falls through below to a full login exactly as before --
+                // these mean the refresh token itself was
+                // rejected/consumed/rotated, and a full login is the
+                // correct, load-bearing self-healing path.
+            }
+            // A non-`ComelitError` thrown here (e.g. from
+            // `credentialStore.saveTokens`) also falls through to the full
+            // login below, matching the pre-existing `try?` behaviour for
+            // any refresh-path failure that isn't a recognized transport
+            // failure.
         }
 
-        // Refresh was unavailable or failed for any reason (expired/revoked
-        // refresh token, network error, etc.) -- silently fall through to a
-        // full login rather than surfacing the refresh failure.
+        // Refresh was unavailable, or failed with a non-transport error
+        // (expired/revoked refresh token, malformed response, etc.) --
+        // silently fall through to a full login rather than surfacing the
+        // refresh failure.
         guard let credentials = try credentialStore.loadCredentials() else {
             throw TokenManagerError.notConfigured
         }
@@ -220,6 +325,22 @@ public actor TokenManager {
         let loggedIn = try await api.login(username: credentials.username, password: credentials.password)
         try credentialStore.saveTokens(loggedIn)
         cachedToken = loggedIn
-        return loggedIn.accessToken
+        return (loggedIn.accessToken, .loggedIn)
+    }
+
+    /// True for the `ComelitError` cases that indicate the failure is a
+    /// transport/availability problem (network is down, or the server is
+    /// failing/overloaded) rather than the refresh token itself being
+    /// rejected. These are exactly the cases where escalating to a full
+    /// login would add more doomed round trips rather than fix anything.
+    private func isTransportFailure(_ error: ComelitError) -> Bool {
+        switch error {
+        case .network:
+            return true
+        case .server(let status, _):
+            return status >= 500 || status == 429
+        case .invalidCredentials, .decoding, .missingRefreshToken:
+            return false
+        }
     }
 }

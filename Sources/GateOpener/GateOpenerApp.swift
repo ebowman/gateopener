@@ -89,12 +89,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // an `.accessory`/`LSUIElement` app on its own.
         MainMenu.install()
 
+        // The app's single `EventLog` instance (bead gateopener-4ub.10).
+        // Constructed BEFORE `makeGateController` (rather than after, as
+        // previously) because the real (non-mock) branch now wires an
+        // `EventLogOpenAttemptObserver` wrapping this SAME instance directly
+        // into `GateClient` (bead gateopener-41m.2), so every open attempt
+        // is logged with its real attempt count and HTTP status/reason at
+        // the source, instead of the app layer inferring a coarse "1 of 1"/
+        // `.unknown` from `GateState` transitions.
+        let eventLog = EventLog()
+        self.eventLog = eventLog
+
         var appSettingsForLaunch: AppSettings?
         var doorVideoDependenciesForLaunch: (tokenManager: TokenManager, gateClient: GateClient)?
         let controller = Self.makeGateController(
             mockOut: &mockGateOpeningForSelfTest,
             appSettingsOut: &appSettingsForLaunch,
-            doorVideoDependenciesOut: &doorVideoDependenciesForLaunch
+            doorVideoDependenciesOut: &doorVideoDependenciesForLaunch,
+            eventLog: eventLog
         )
         self.appSettings = appSettingsForLaunch
         let observable = GateControllerObservable(controller: controller)
@@ -204,55 +216,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.globalHotkey = globalHotkey
         observable.globalHotkey = globalHotkey
 
-        // The app's single `EventLog` instance (bead gateopener-4ub.10).
         // Reachable by the Settings UI via `GateControllerObservable.eventLog`
-        // (set once, immediately below) so `SettingsView`'s log section can
-        // render real entries instead of the placeholder left by bead .9.
-        let eventLog = EventLog()
-        self.eventLog = eventLog
+        // (bead gateopener-4ub.10) so `SettingsView`'s log section can render
+        // real entries. `eventLog` itself was constructed above, before
+        // `makeGateController`, and (in the real, non-mock branch) is
+        // already wired directly into `GateClient` as an
+        // `EventLogOpenAttemptObserver` (bead gateopener-41m.2) — every open
+        // attempt is logged with its real attempt count and HTTP
+        // status/reason at the source. `onStateChange` below therefore no
+        // longer does ANY of its own open-attempt/success/failure logging —
+        // doing so here too would double-log every open (once from
+        // `EventLogOpenAttemptObserver.record`'s success/failure line, once
+        // more from a state-driven line here).
         observable.eventLog = eventLog
 
-        // Records `.opening` -> `.succeeded`/`.failed` transitions. This is
-        // the seam available from the app layer: `GateState` itself only
-        // carries a short human-readable failure `message`, not a
-        // per-attempt count or HTTP status code (those live inside
-        // `GateClient.open`'s internal retry loop in `GateOpenerCore`,
-        // which this bead does not restructure) — so every open here is
-        // logged as a single attempt (1 of 1), and every failure is logged
-        // via the closed `OpenFailureReason.unknown` case rather than a
-        // real HTTP status, since no status is observable from here. See
-        // the bead .10 report for the full list of event kinds this does
-        // and does not cover.
-        var lastLoggedStateWasOpening = false
         controller.onStateChange = { [weak self] state in
             observableStateChange?(state)
             self?.statusItemController.render(for: state)
             notificationPresenter.handle(state)
             overlayWindowController.handle(state)
-
-            switch state {
-            case .opening:
-                lastLoggedStateWasOpening = true
-                eventLog.logOpenAttempt(attempt: 1, of: 1)
-            case .succeeded:
-                if lastLoggedStateWasOpening {
-                    eventLog.logOpenSucceeded()
-                }
-                lastLoggedStateWasOpening = false
-            case .failed:
-                if lastLoggedStateWasOpening {
-                    eventLog.logOpenFailed(attempt: 1, of: 1, reason: .unknown)
-                }
-                lastLoggedStateWasOpening = false
-            case .needsSetup, .idle, .queued:
-                // `.queued` (bead .4: `requestOpen()`'s offline queue) is
-                // deliberately NOT treated as an open attempt here: nothing
-                // has physically started yet — the request is merely
-                // waiting for connectivity. The real `logOpenAttempt` fires
-                // when/if state later transitions to `.opening` once the
-                // queued request actually runs.
-                lastLoggedStateWasOpening = false
-            }
         }
 
         if case .needsSetup = controller.state, !hasAutoOpenedSettings {
@@ -995,10 +977,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     ///   `DoorVideoOverlayController`/"View door" menu item at all under
     ///   mock mode, rather than presenting a menu item that would always
     ///   fail.
+    /// - Parameter eventLog: the app's single `EventLog` instance
+    ///   (constructed by `applicationDidFinishLaunching` before this call).
+    ///   In the real (non-mock) branch, wrapped in an
+    ///   `EventLogOpenAttemptObserver` and passed to `GateClient` as its
+    ///   `attemptObserver` (bead gateopener-41m.2), so every open attempt is
+    ///   logged with its real attempt count and HTTP status/reason. Unused
+    ///   in the mock branch: `MockGateOpening` never calls an
+    ///   `attemptObserver` at all (it is not a `GateClient`), so wiring one
+    ///   there would have no effect.
     private static func makeGateController(
         mockOut: inout MockGateOpening?,
         appSettingsOut: inout AppSettings?,
-        doorVideoDependenciesOut: inout (tokenManager: TokenManager, gateClient: GateClient)?
+        doorVideoDependenciesOut: inout (tokenManager: TokenManager, gateClient: GateClient)?,
+        eventLog: EventLog
     ) -> GateController {
         let isMock = ProcessInfo.processInfo.environment["GATEOPENER_MOCK"] == "1"
 
@@ -1034,7 +1026,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // verified without ever opening the real gate.
             appSettings.selectedEndpointId = MockGateOpening.mockEndpoint.endpointId
             appSettings.selectedEndpointName = MockGateOpening.mockEndpoint.friendlyName
-            let mock = MockGateOpening()
+            // Mirrors the real (non-mock) branch below: wires the SAME
+            // `EventLogOpenAttemptObserver` adapter so mock mode's
+            // `EventLog` (used by the self-test's `logRecordedAttempt`/
+            // `logRecordedSuccess` assertions) is populated the same way a
+            // real open would populate it, rather than via separate
+            // state-driven logic that would double-log a real open.
+            let mock = MockGateOpening(attemptObserver: EventLogOpenAttemptObserver(eventLog: eventLog))
             mockOut = mock
             appSettingsOut = appSettings
             return GateController(
@@ -1050,7 +1048,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let credentialStore = KeychainCredentialStore()
         let api = ComelitAPI()
         let tokenManager = TokenManager(api: api, credentialStore: credentialStore)
-        let gateClient = GateClient(tokenManager: tokenManager)
+        let gateClient = GateClient(
+            tokenManager: tokenManager,
+            attemptObserver: EventLogOpenAttemptObserver(eventLog: eventLog)
+        )
         doorVideoDependenciesOut = (tokenManager: tokenManager, gateClient: gateClient)
 
         return GateController(

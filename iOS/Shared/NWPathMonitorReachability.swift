@@ -29,6 +29,13 @@ public final class NWPathMonitorReachability: ReachabilityProviding, @unchecked 
     /// delivered its first path — a real offline device will receive an
     /// `unsatisfied` update almost immediately and flip this to `false`.
     private var _isReachable = true
+    /// The latest `NWPath` delivered to `pathUpdateHandler`, if any --
+    /// `nil` before the very first delivery, mirroring `_isReachable`'s own
+    /// optimistic-default doc comment. Retained (not just its derived
+    /// `Bool`) so `pathDescription` can report interface types/
+    /// isExpensive/isConstrained too, for the press journal's
+    /// `.reachability(detail:)` phase.
+    private var _latestPath: NWPath?
     private var onChangeHandler: (@Sendable (Bool) -> Void)?
 
     public init() {
@@ -38,6 +45,7 @@ public final class NWPathMonitorReachability: ReachabilityProviding, @unchecked 
             let reachable = path.status == .satisfied
             self.lock.lock()
             self._isReachable = reachable
+            self._latestPath = path
             let handler = self.onChangeHandler
             self.lock.unlock()
             handler?(reachable)
@@ -59,5 +67,70 @@ public final class NWPathMonitorReachability: ReachabilityProviding, @unchecked 
         lock.lock()
         onChangeHandler = handler
         lock.unlock()
+    }
+
+    /// A free-form, non-secret, human-readable summary of the latest
+    /// `NWPath` this monitor has delivered -- e.g. `"satisfied wifi
+    /// expensive=false constrained=false"` -- included verbatim in the
+    /// press journal's `.reachability(detail:)` phase (see
+    /// `OpenPressPhase.reachability`). Never a token/credential/URL.
+    ///
+    /// Returns `"unknown (monitor just started)"` before the very first
+    /// `pathUpdateHandler` delivery, mirroring `isReachable`'s own
+    /// optimistic-default doc comment: a fresh instance constructed inline
+    /// in `OpenGateIntent.runFlow` has essentially no time to receive that
+    /// first update before this is read.
+    ///
+    /// THREAD-SAFE: reads `_latestPath` under the same `NSLock` that
+    /// protects `_isReachable`, so this may be called from any thread, same
+    /// as `isReachable`.
+    public var pathDescription: String {
+        lock.lock()
+        let path = _latestPath
+        lock.unlock()
+
+        guard let path else {
+            return "unknown (monitor just started)"
+        }
+
+        let statusDescription: String
+        switch path.status {
+        case .satisfied:
+            statusDescription = "satisfied"
+        case .unsatisfied:
+            statusDescription = "unsatisfied"
+        case .requiresConnection:
+            statusDescription = "requiresConnection"
+        @unknown default:
+            statusDescription = "unknown"
+        }
+
+        // `NWInterface.InterfaceType` is not `CaseIterable`, so the checked
+        // types are enumerated explicitly here, in a fixed, documented
+        // order (matching the STEPS brief: "interface types in order").
+        let allInterfaceTypes: [NWInterface.InterfaceType] = [.wifi, .cellular, .wiredEthernet, .loopback, .other]
+        let interfaceTypes: [String] = allInterfaceTypes.compactMap { type in
+            path.usesInterfaceType(type) ? Self.name(for: type) : nil
+        }
+        let interfacesDescription = interfaceTypes.isEmpty ? "none" : interfaceTypes.joined(separator: ",")
+
+        return "\(statusDescription) \(interfacesDescription) expensive=\(path.isExpensive) constrained=\(path.isConstrained)"
+    }
+
+    private static func name(for interfaceType: NWInterface.InterfaceType) -> String {
+        switch interfaceType {
+        case .wifi:
+            return "wifi"
+        case .cellular:
+            return "cellular"
+        case .wiredEthernet:
+            return "wiredEthernet"
+        case .loopback:
+            return "loopback"
+        case .other:
+            return "other"
+        @unknown default:
+            return "unknown"
+        }
     }
 }

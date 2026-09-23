@@ -55,13 +55,15 @@ struct GateOpenerIOSApp: App {
             appSettings: AppSettings(defaults: SharedContainer.sharedDefaults() ?? .standard),
             credentialStore: KeychainCredentialStore(accessGroup: SharedContainer.keychainAccessGroup)
         )
+        let appReachability = NWPathMonitorReachability()
         let environment = AppEnvironment.make(
-            reachability: NWPathMonitorReachability(),
+            reachability: appReachability,
             gateClient: DebugLaunchOptions.makeGateClientIfNeeded(),
             tokenResolver: DebugLaunchOptions.makeTokenResolverIfNeeded()
         )
         #else
-        let environment = AppEnvironment.make(reachability: NWPathMonitorReachability())
+        let appReachability = NWPathMonitorReachability()
+        let environment = AppEnvironment.make(reachability: appReachability)
         #endif
         let runner = BackgroundOpenRunner(controller: environment.controller)
         // Registered alongside `GateControllerObservable`'s own observer
@@ -72,7 +74,11 @@ struct GateOpenerIOSApp: App {
         environment.addStateObserver { [runner] newState in
             runner.stateDidChange(newState)
         }
-        let observable = GateControllerObservable(environment: environment, backgroundOpenRunner: runner)
+        let observable = GateControllerObservable(
+            environment: environment,
+            backgroundOpenRunner: runner,
+            reachabilityDetail: { appReachability.pathDescription }
+        )
 
         // `DoorVideoCoordinator`'s factory closure captures `environment`
         // (constructed above), so its `tokenManager`/`gateClient`/
@@ -89,6 +95,12 @@ struct GateOpenerIOSApp: App {
             makeSession: {
                 #if DEBUG
                 if DebugLaunchOptions.mockVideoOnLaunch {
+                    if let timeline = DebugLaunchOptions.mockVideoTimeline {
+                        return DoorVideoSession.debugStub(
+                            connectingDelay: timeline.connectingSeconds,
+                            streamingDuration: timeline.streamingSeconds
+                        )
+                    }
                     return DoorVideoSession.debugStub()
                 }
                 #endif
@@ -98,7 +110,11 @@ struct GateOpenerIOSApp: App {
                     appSettings: environment.appSettings
                 )
             },
-            isEnabled: { environment.appSettings.autoShowDoorVideoOnOpen }
+            isEnabled: { environment.appSettings.autoShowDoorVideoOnOpen },
+            isAutoStartEnabled: { environment.appSettings.autoStartDoorVideoOnLaunch },
+            eventSink: { line in
+                VideoDiagnostics.appendEvent(line, to: SharedContainer.sharedDefaults() ?? .standard)
+            }
         )
 
         _environment = State(initialValue: environment)
@@ -126,14 +142,15 @@ struct GateOpenerIOSApp: App {
             #endif
         }
         .onChange(of: scenePhase) { _, newPhase in
-            guard newPhase == .active else {
+            switch Self.videoAction(for: newPhase) {
+            case .dismiss:
                 // Backgrounding always dismisses any live door-video panel
                 // (WebRTC would be suspended by the system anyway, and
                 // `DoorVideoCoordinator.dismiss()` -> `DoorVideoSession
                 // .stop()` is idempotent, so this is always safe to call
                 // even if nothing is running) — bead gateopener-672.12 step
                 // "Wire scenePhase".
-                doorVideoCoordinator.dismiss()
+                doorVideoCoordinator.dismiss(reason: "background")
                 #if DEBUG
                 // Backgrounding also stops an in-flight `--video-harness`
                 // session, independent of `doorVideoCoordinator` (the
@@ -141,11 +158,95 @@ struct GateOpenerIOSApp: App {
                 // comment).
                 videoHarnessSession?.stop()
                 #endif
-                return
+            case .none:
+                // `.inactive` (bead gateopener-41m.17): a brief Notification
+                // Center/Control Center pull-down, app-switcher peek, call
+                // banner, Face ID, or system alert must NOT tear down a
+                // live/connecting door-video session — the app is still
+                // foreground and WebRTC keeps running underneath. Do
+                // nothing to the video session OR any other per-phase work
+                // below (token prewarm, snapshot publish, foreground
+                // auto-start all wait for the next real `.active`).
+                break
+            case .startIfAppropriate:
+                Task { await environment.tokenManager.prewarm() }
+                environment.publishSnapshot()
+                startDoorVideoForForegroundIfAppropriate()
             }
-            Task { await environment.tokenManager.prewarm() }
-            environment.publishSnapshot()
         }
+    }
+
+    /// Pure scenePhase -> video-lifecycle decision (bead gateopener-41m.17),
+    /// extracted so it is unit-testable without a live `App`/`Scene`.
+    ///
+    /// - `.background` -> `.dismiss`: matches the pre-existing behavior —
+    ///   the system may suspend/terminate the process at any point once
+    ///   backgrounded, so any live session is torn down immediately (see the
+    ///   `.dismiss` case's own comment at the call site for why this is
+    ///   always safe).
+    /// - `.inactive` -> `.none`: a brief, foreground-adjacent interruption
+    ///   (Notification Center, Control Center, app-switcher peek, a call
+    ///   banner, Face ID, or a system alert) that historically ALSO
+    ///   dismissed the panel — costing the user a fresh `rtc/offer` inside
+    ///   the door's ~15s busy window on every such blip once auto-start
+    ///   (gateopener-41m.12) landed. No concrete reason tying the dismiss to
+    ///   `.inactive` specifically (as opposed to `.background`) was found in
+    ///   history or `bd memories` — see this bead's investigation — so the
+    ///   video session and pin state are left untouched here.
+    /// - `.active` -> `.startIfAppropriate`: unchanged — prewarm, publish
+    ///   the widget snapshot, and (subject to
+    ///   `startDoorVideoForForegroundIfAppropriate()`'s own guards)
+    ///   start-or-retain door video.
+    /// - `@unknown default` -> `.none`: a future scenePhase case is treated
+    ///   conservatively as "do nothing to the video", matching `.inactive`
+    ///   rather than risking a spurious dismiss on a phase this code does
+    ///   not yet understand.
+    static func videoAction(for phase: ScenePhase) -> ScenePhaseVideoAction {
+        switch phase {
+        case .background:
+            return .dismiss
+        case .inactive:
+            return .none
+        case .active:
+            return .startIfAppropriate
+        @unknown default:
+            return .none
+        }
+    }
+
+    /// See `videoAction(for:)`.
+    enum ScenePhaseVideoAction: Equatable {
+        case dismiss
+        case none
+        case startIfAppropriate
+    }
+
+    /// Shared guard for auto-starting door video on foreground/cold-launch
+    /// (bead gateopener-41m.12): called from the `scenePhase == .active`
+    /// branch above AND from `mainContent`'s cold-launch `.task` below.
+    /// Calling this twice for the same foreground transition (which happens
+    /// on a cold launch where `scenePhase` starts `.inactive` then flips to
+    /// `.active`, firing BOTH the `.task` — guarded to check `scenePhase ==
+    /// .active` at the moment it runs — and this `onChange` handler) is
+    /// harmless: `DoorVideoCoordinator.startForForeground()` ->
+    /// `startOrRetain()` retains an already-connecting/streaming session
+    /// rather than starting a second one.
+    ///
+    /// Deliberately does NOT start video when:
+    ///   - `observable.state == .needsSetup` — `SignInView` is showing, not
+    ///     `MainView`, so there is nowhere for the video panel to appear and
+    ///     starting a session here would waste a network round trip the user
+    ///     can't even see.
+    ///   - `DebugLaunchOptions.widgetPreviewOnLaunch` / `.videoHarnessOnLaunch`
+    ///     — both debug harnesses replace or bypass the normal `MainView`
+    ///     video slot; auto-starting here would double up with (or race)
+    ///     whatever those harnesses already do.
+    private func startDoorVideoForForegroundIfAppropriate() {
+        #if DEBUG
+        guard !DebugLaunchOptions.widgetPreviewOnLaunch, !DebugLaunchOptions.videoHarnessOnLaunch else { return }
+        #endif
+        guard observable.state != .needsSetup else { return }
+        doorVideoCoordinator.startForForeground()
     }
 
     @ViewBuilder
@@ -156,6 +257,26 @@ struct GateOpenerIOSApp: App {
             appSettings: environment.appSettings,
             doorVideoCoordinator: doorVideoCoordinator
         )
+            // Cold-launch auto-start (bead gateopener-41m.12):
+            // `.onChange(of: scenePhase)` above never fires for the
+            // INITIAL scenePhase value, only on subsequent transitions — so
+            // a cold launch that starts directly `.active` would otherwise
+            // never call `startForForeground()` at all. Guarded to check
+            // `scenePhase == .active` at the moment this task actually runs
+            // (not merely "always run on first appearance"), because on a
+            // cold launch scenePhase is often still `.inactive` here and
+            // only flips to `.active` a moment later — in which case the
+            // `onChange` handler fires instead and this guard correctly
+            // no-ops, avoiding a double start (which would be harmless
+            // anyway — see `startDoorVideoForForegroundIfAppropriate`'s doc
+            // comment — but there is no reason to invite it). Also
+            // guarantees a background launch (e.g. `BackgroundOpenRunner`
+            // waking the process with no UI ever shown) never starts video:
+            // scenePhase is never `.active` in that case.
+            .task {
+                guard scenePhase == .active else { return }
+                startDoorVideoForForegroundIfAppropriate()
+            }
             #if DEBUG
             // `--run-intent` (bead gateopener-672.13 verification):
             // drives `OpenGateIntent` directly, without any

@@ -87,6 +87,11 @@ final class RequestScript: @unchecked Sendable {
     /// Lets tests prove a 401 retry used a DIFFERENT (freshly-resolved)
     /// bearer token than the first attempt, not just that a retry happened.
     private(set) var authorizationHeaders: [String] = []
+    /// `URLRequest.timeoutInterval` seen on every request, in order. Lets
+    /// tests prove the escalating per-attempt `RetryPolicy.requestTimeouts`
+    /// schedule (e.g. 3s/5s/8s) was actually applied to each attempt's
+    /// `URLRequest`, not just configured on `RetryPolicy`.
+    private(set) var timeoutIntervals: [TimeInterval] = []
 
     init(responses: [ScriptedResponse]) {
         self.responses = responses
@@ -97,12 +102,13 @@ final class RequestScript: @unchecked Sendable {
         self.init(responses: statuses.map { ScriptedResponse(status: $0) })
     }
 
-    func nextResponse(forPath path: String, authorizationHeader: String?) -> ScriptedResponse {
+    func nextResponse(forPath path: String, authorizationHeader: String?, timeoutInterval: TimeInterval) -> ScriptedResponse {
         lock.lock()
         defer { lock.unlock() }
         requestCount += 1
         lastPath = path
         authorizationHeaders.append(authorizationHeader ?? "")
+        timeoutIntervals.append(timeoutInterval)
         let response = responses[min(index, responses.count - 1)]
         index += 1
         return response
@@ -148,7 +154,7 @@ final class SequencedStubURLProtocol: URLProtocol, @unchecked Sendable {
         }
 
         let authHeader = request.value(forHTTPHeaderField: "authorization")
-        let scripted = script.nextResponse(forPath: path, authorizationHeader: authHeader)
+        let scripted = script.nextResponse(forPath: path, authorizationHeader: authHeader, timeoutInterval: request.timeoutInterval)
 
         if let transportErrorCode = scripted.transportError {
             client?.urlProtocol(self, didFailWithError: URLError(transportErrorCode))
@@ -641,10 +647,14 @@ final class SleepRecorder: @unchecked Sendable {
 
     let (tokenManager, _) = makeTokenManager()
     let recorder = SleepRecorder()
-    // Same attempt/backoff shape as `.noDelay(maxAttempts:)` (base 400ms,
-    // 6s total cap, 3s per-request timeout), but `sleep` records the
-    // requested `Duration` instead of no-op'ing, so this test can assert
-    // real backoff WOULD have slept without ever actually sleeping.
+    // Custom, intentionally larger-than-default `maxTotalDelay` (6s, versus
+    // the 2s default) so this test's own sleep-count/positivity assertions
+    // are independent of the default policy's tighter cap -- that cap is
+    // covered separately by `defaultPolicySleepsNeverExceedMaxTotalDelay`
+    // below. `sleep` records the requested `Duration` instead of no-op'ing,
+    // so this test can assert real backoff WOULD have slept without ever
+    // actually sleeping. Uses the source-compatibility single-value
+    // `requestTimeout:` initializer (uniform 3s across all attempts).
     let retryPolicy = RetryPolicy(
         maxAttempts: 3,
         baseDelay: .milliseconds(400),
@@ -665,6 +675,134 @@ final class SleepRecorder: @unchecked Sendable {
     // have actually slept -- the deterministic replacement for the old
     // wall-clock ">1s with real backoff" claim.
     #expect(recorder.durations.allSatisfy { $0 > .zero })
+}
+
+// MARK: - gateopener-41m.6: escalating per-attempt timeout, shrunk sleep budget
+
+/// Acceptance test for step 1: attempt `k`'s `URLRequest.timeoutInterval`
+/// follows the configured `requestTimeouts` schedule exactly -- 3s, 5s, 8s
+/// for the default policy -- across a 500/500/500 script that forces all 3
+/// attempts to actually happen.
+@Test func openEscalatesPerAttemptTimeoutAcrossThreeFiveEightSeconds() async throws {
+    let script = RequestScript(statuses: [500, 500, 500])
+    let session = makeSequencedSession(script: script)
+
+    let (tokenManager, _) = makeTokenManager()
+    let client = GateClient(session: session, tokenManager: tokenManager, retryPolicy: .noDelay(maxAttempts: 3))
+
+    await #expect(throws: Error.self) {
+        try await client.open(endpointId: "VIP#OD#SB100001.1")
+    }
+
+    #expect(script.timeoutIntervals == [3, 5, 8])
+}
+
+/// Edge case: `maxAttempts > requestTimeouts.count` reuses the LAST
+/// timeout value for every attempt beyond the schedule's length, rather than
+/// indexing out of bounds or wrapping.
+@Test func openReusesLastTimeoutWhenMaxAttemptsExceedsScheduleLength() async throws {
+    let script = RequestScript(statuses: [500, 500, 500, 500])
+    let session = makeSequencedSession(script: script)
+
+    let (tokenManager, _) = makeTokenManager()
+    let retryPolicy = RetryPolicy(
+        maxAttempts: 4,
+        baseDelay: .milliseconds(1),
+        maxTotalDelay: .milliseconds(1),
+        requestTimeouts: [.seconds(3), .seconds(5), .seconds(8)],
+        sleep: { _ in }
+    )
+    let client = GateClient(session: session, tokenManager: tokenManager, retryPolicy: retryPolicy)
+
+    await #expect(throws: Error.self) {
+        try await client.open(endpointId: "VIP#OD#SB100001.1")
+    }
+
+    // 4th attempt reuses the last (8s) schedule entry rather than crashing
+    // or reusing the first.
+    #expect(script.timeoutIntervals == [3, 5, 8, 8])
+}
+
+/// Edge case: `maxAttempts == 1` uses only the FIRST entry of the schedule,
+/// never a later one, and never below the 3s floor.
+@Test func openWithSingleAttemptUsesFirstTimeoutOnly() async throws {
+    let script = RequestScript(statuses: [500])
+    let session = makeSequencedSession(script: script)
+
+    let (tokenManager, _) = makeTokenManager()
+    let client = GateClient(session: session, tokenManager: tokenManager, retryPolicy: .noDelay(maxAttempts: 1))
+
+    await #expect(throws: Error.self) {
+        try await client.open(endpointId: "VIP#OD#SB100001.1")
+    }
+
+    #expect(script.timeoutIntervals == [3])
+}
+
+/// Acceptance test for step 2: the sum of every sleep the DEFAULT policy
+/// (`.noDelay()`, same backoff/cap shape as `.default`) actually requests
+/// via the injected `sleep` closure never exceeds the 2s `maxTotalDelay`
+/// budget, across a full 3-attempt failure run.
+@Test func defaultPolicySleepsNeverExceedMaxTotalDelay() async throws {
+    let script = RequestScript(statuses: [500, 500, 500])
+    let session = makeSequencedSession(script: script)
+
+    let (tokenManager, _) = makeTokenManager()
+    let recorder = SleepRecorder()
+    let retryPolicy = RetryPolicy(
+        maxAttempts: 3,
+        baseDelay: .milliseconds(400),
+        maxTotalDelay: .seconds(2),
+        requestTimeouts: [.seconds(3), .seconds(5), .seconds(8)],
+        sleep: { duration in recorder.record(duration) }
+    )
+    let client = GateClient(session: session, tokenManager: tokenManager, retryPolicy: retryPolicy)
+
+    await #expect(throws: Error.self) {
+        try await client.open(endpointId: "VIP#OD#SB100001.1")
+    }
+
+    let totalSleep = recorder.durations.reduce(Duration.zero, +)
+    #expect(totalSleep <= .seconds(2))
+}
+
+/// Confirms `RetryPolicy.default` itself (not a hand-built equivalent) uses
+/// the documented 2s `maxTotalDelay` cap and 3/5/8s escalating schedule, so
+/// a future change to one without the other is caught here.
+@Test func defaultRetryPolicyHasDocumentedShapeAndArithmetic() {
+    let policy = RetryPolicy.default
+    #expect(policy.maxAttempts == 3)
+    #expect(policy.maxTotalDelay == .seconds(2))
+    #expect(policy.requestTimeouts == [.seconds(3), .seconds(5), .seconds(8)])
+    // Worst case: 3 + 5 + 8 = 16s of requests, plus <= 2s of bounded sleep
+    // = <= 18s, comfortably under OpenGateFlow's 25s deadline.
+    let totalRequestBudget = policy.requestTimeouts.reduce(Duration.zero, +)
+    #expect(totalRequestBudget == .seconds(16))
+    #expect(totalRequestBudget + policy.maxTotalDelay == .seconds(18))
+}
+
+/// Source-compatibility: the single-value `requestTimeout:` initializer
+/// (pre-dating this bead) still compiles and behaves as a UNIFORM timeout
+/// across every attempt -- i.e. equivalent to `requestTimeouts: [value]`.
+@Test func singleValueRequestTimeoutInitializerAppliesUniformlyToEveryAttempt() async throws {
+    let script = RequestScript(statuses: [500, 500, 500])
+    let session = makeSequencedSession(script: script)
+
+    let (tokenManager, _) = makeTokenManager()
+    let retryPolicy = RetryPolicy(
+        maxAttempts: 3,
+        requestTimeout: .seconds(5),
+        sleep: { _ in }
+    )
+    #expect(retryPolicy.requestTimeouts == [.seconds(5)])
+
+    let client = GateClient(session: session, tokenManager: tokenManager, retryPolicy: retryPolicy)
+
+    await #expect(throws: Error.self) {
+        try await client.open(endpointId: "VIP#OD#SB100001.1")
+    }
+
+    #expect(script.timeoutIntervals == [5, 5, 5])
 }
 
 // MARK: - open: .invalidCredentials is never retried (safety: retrying a
@@ -693,4 +831,296 @@ final class SleepRecorder: @unchecked Sendable {
     // and the failure was never retried (would need multiple accessToken()
     // attempts / HTTP requests if it were).
     #expect(script.requestCount == 0)
+}
+
+// MARK: - open: attemptObserver (gateopener-41m.1)
+
+/// A thread-safe recording fake `OpenAttemptObserving`, same `NSLock` +
+/// `@unchecked Sendable` idiom as `RequestScript`/`SleepRecorder` above.
+final class RecordingAttemptObserver: OpenAttemptObserving, @unchecked Sendable {
+    private let lock = NSLock()
+    private var _records: [OpenAttemptRecord] = []
+
+    var records: [OpenAttemptRecord] {
+        lock.lock()
+        defer { lock.unlock() }
+        return _records
+    }
+
+    func record(_ record: OpenAttemptRecord) {
+        lock.lock()
+        _records.append(record)
+        lock.unlock()
+    }
+}
+
+/// (a) 500, 500, 202 -> 3 records, willRetry true/true/false, last is
+/// success(202).
+@Test func attemptObserverRecordsThreeAttemptsOn500x2ThenSuccess() async throws {
+    let script = RequestScript(statuses: [500, 500, 202])
+    let session = makeSequencedSession(script: script)
+
+    let (tokenManager, _) = makeTokenManager()
+    let observer = RecordingAttemptObserver()
+    let client = GateClient(
+        session: session,
+        tokenManager: tokenManager,
+        retryPolicy: .noDelay(maxAttempts: 3),
+        attemptObserver: observer
+    )
+
+    try await client.open(endpointId: "VIP#OD#SB100001.1")
+
+    let records = observer.records
+    #expect(records.count == 3)
+    #expect(records.map(\.willRetry) == [true, true, false])
+    #expect(records[0].outcome == .httpFailure(status: 500))
+    #expect(records[1].outcome == .httpFailure(status: 500))
+    #expect(records[2].outcome == .success(status: 202))
+}
+
+/// (b) transport error then 202 -> first record is `.transportFailure` with
+/// the scripted `URLError` code.
+@Test func attemptObserverRecordsTransportFailureWithScriptedURLErrorCode() async throws {
+    let script = RequestScript(responses: [
+        .transportError(.networkConnectionLost),
+        ScriptedResponse(status: 202),
+    ])
+    let session = makeSequencedSession(script: script)
+
+    let (tokenManager, _) = makeTokenManager()
+    let observer = RecordingAttemptObserver()
+    let client = GateClient(
+        session: session,
+        tokenManager: tokenManager,
+        retryPolicy: .noDelay(),
+        attemptObserver: observer
+    )
+
+    try await client.open(endpointId: "VIP#OD#SB100001.1")
+
+    let records = observer.records
+    #expect(records.count == 2)
+    #expect(records[0].outcome == .transportFailure(urlErrorCode: URLError.networkConnectionLost.rawValue))
+    #expect(records[0].willRetry == true)
+    #expect(records[1].outcome == .success(status: 202))
+    #expect(records[1].willRetry == false)
+}
+
+/// (c) 403 -> 1 record, willRetry false.
+@Test func attemptObserverRecordsSingleNonRetryable403() async throws {
+    let script = RequestScript(statuses: [403, 202, 202])
+    let session = makeSequencedSession(script: script)
+
+    let (tokenManager, _) = makeTokenManager()
+    let observer = RecordingAttemptObserver()
+    let client = GateClient(
+        session: session,
+        tokenManager: tokenManager,
+        retryPolicy: .noDelay(),
+        attemptObserver: observer
+    )
+
+    await #expect(throws: Error.self) {
+        try await client.open(endpointId: "VIP#OD#SB100001.1")
+    }
+
+    let records = observer.records
+    #expect(records.count == 1)
+    #expect(records[0].outcome == .httpFailure(status: 403))
+    #expect(records[0].willRetry == false)
+}
+
+/// (d) 401 then 202 -> 2 records; the 401 attempt is recorded as
+/// `.httpFailure(401)` with `willRetry: true`.
+@Test func attemptObserverRecordsTwoAttemptsOn401ThenSuccess() async throws {
+    let script = RequestScript(statuses: [401, 202])
+    let session = makeSequencedSession(script: script)
+
+    let store = MockCredentialStore()
+    let issuing = MockTokenIssuing()
+    try store.saveCredentials(username: "alice", password: "s3cret")
+    try store.saveTokens(
+        TokenSet(accessToken: "the-token", refreshToken: "rt", expiresIn: 3600, tokenType: "bearer")
+    )
+    let tokenManager = TokenManager(api: issuing, credentialStore: store)
+
+    let observer = RecordingAttemptObserver()
+    let client = GateClient(
+        session: session,
+        tokenManager: tokenManager,
+        retryPolicy: .noDelay(),
+        attemptObserver: observer
+    )
+
+    try await client.open(endpointId: "VIP#OD#SB100001.1")
+
+    let records = observer.records
+    #expect(records.count == 2)
+    #expect(records[0].outcome == .httpFailure(status: 401))
+    #expect(records[0].willRetry == true)
+    #expect(records[1].outcome == .success(status: 202))
+    #expect(records[1].willRetry == false)
+}
+
+/// (e) token-resolution failure -> 1 `.tokenFailure` record and zero HTTP
+/// requests.
+@Test func attemptObserverRecordsTokenFailureWithZeroHTTPRequests() async throws {
+    let script = RequestScript(statuses: [202, 202, 202])
+    let session = makeSequencedSession(script: script)
+
+    let store = MockCredentialStore()
+    let issuing = MockTokenIssuing()
+    try store.saveCredentials(username: "alice", password: "wrong-password")
+    issuing.loginResult = .failure(ComelitError.invalidCredentials)
+    let tokenManager = TokenManager(api: issuing, credentialStore: store)
+
+    let observer = RecordingAttemptObserver()
+    let client = GateClient(
+        session: session,
+        tokenManager: tokenManager,
+        retryPolicy: .noDelay(maxAttempts: 3),
+        attemptObserver: observer
+    )
+
+    await #expect(throws: ComelitError.invalidCredentials) {
+        try await client.open(endpointId: "VIP#OD#SB100001.1")
+    }
+
+    #expect(script.requestCount == 0)
+
+    let records = observer.records
+    #expect(records.count == 1)
+    #expect(records[0].willRetry == false)
+    if case .tokenFailure = records[0].outcome {
+        // expected
+    } else {
+        Issue.record("expected .tokenFailure, got \(records[0].outcome)")
+    }
+}
+
+/// Secrets hygiene: a token failure caused by `ComelitError.server` (which
+/// carries up to 300 raw characters of the auth server's response body)
+/// must never leak that body into the persisted `.tokenFailure` description
+/// -- only the sanitized "server(<status>)" form.
+@Test func attemptObserverTokenFailureDescriptionNeverContainsServerResponseBody() async throws {
+    let script = RequestScript(statuses: [202])
+    let session = makeSequencedSession(script: script)
+
+    let store = MockCredentialStore()
+    let issuing = MockTokenIssuing()
+    try store.saveCredentials(username: "alice", password: "s3cret")
+    issuing.loginResult = .failure(ComelitError.server(status: 500, body: "SECRET"))
+    let tokenManager = TokenManager(api: issuing, credentialStore: store)
+
+    let observer = RecordingAttemptObserver()
+    let client = GateClient(
+        session: session,
+        tokenManager: tokenManager,
+        retryPolicy: .noDelay(),
+        attemptObserver: observer
+    )
+
+    await #expect(throws: ComelitError.server(status: 500, body: "SECRET")) {
+        try await client.open(endpointId: "VIP#OD#SB100001.1")
+    }
+
+    let records = observer.records
+    #expect(records.count == 1)
+    if case .tokenFailure(let description) = records[0].outcome {
+        #expect(!description.contains("SECRET"))
+        #expect(description == "server(500)")
+    } else {
+        Issue.record("expected .tokenFailure, got \(records[0].outcome)")
+    }
+}
+
+/// (f) attempt numbers are 1-based and `maxAttempts` matches the policy.
+@Test func attemptObserverRecordsAreOneBasedWithMatchingMaxAttempts() async throws {
+    let script = RequestScript(statuses: [500, 500, 500, 500, 500])
+    let session = makeSequencedSession(script: script)
+
+    let (tokenManager, _) = makeTokenManager()
+    let observer = RecordingAttemptObserver()
+    let client = GateClient(
+        session: session,
+        tokenManager: tokenManager,
+        retryPolicy: .noDelay(maxAttempts: 3),
+        attemptObserver: observer
+    )
+
+    await #expect(throws: Error.self) {
+        try await client.open(endpointId: "VIP#OD#SB100001.1")
+    }
+
+    let records = observer.records
+    #expect(records.map(\.attempt) == [1, 2, 3])
+    #expect(records.allSatisfy { $0.maxAttempts == 3 })
+}
+
+/// `attemptObserver` defaults to `nil`: `open` must behave identically to
+/// every pre-existing (non-observer) test in this file with no observer
+/// wired up at all -- this is a direct check that the parameter is optional
+/// and source-compatible with every existing call site.
+@Test func attemptObserverDefaultsToNilAndOpenStillSucceeds() async throws {
+    let script = RequestScript(statuses: [202])
+    let session = makeSequencedSession(script: script)
+
+    let (tokenManager, _) = makeTokenManager()
+    let client = GateClient(session: session, tokenManager: tokenManager, retryPolicy: .noDelay())
+
+    try await client.open(endpointId: "VIP#OD#SB100001.1")
+
+    #expect(script.requestCount == 1)
+}
+
+// MARK: - open: OpenPressContext.pressId correlation (gateopener-41m.22)
+
+/// When `open()` runs inside `OpenPressContext.$pressId.withValue(_:)`,
+/// every `OpenAttemptRecord` it reports carries that press id.
+@Test func attemptRecordsCarryTaskLocalPressIdWhenSet() async throws {
+    let script = RequestScript(statuses: [500, 202])
+    let session = makeSequencedSession(script: script)
+
+    let (tokenManager, _) = makeTokenManager()
+    let observer = RecordingAttemptObserver()
+    let client = GateClient(
+        session: session,
+        tokenManager: tokenManager,
+        retryPolicy: .noDelay(),
+        attemptObserver: observer
+    )
+
+    let pressId = UUID()
+    try await OpenPressContext.$pressId.withValue(pressId) {
+        try await client.open(endpointId: "VIP#OD#SB100001.1")
+    }
+
+    let records = observer.records
+    #expect(records.count == 2)
+    #expect(records.allSatisfy { $0.pressId == pressId })
+}
+
+/// With no `OpenPressContext.pressId` bound at all, every reported attempt
+/// carries `pressId == nil` -- the default, pre-existing behavior for every
+/// other test in this file.
+@Test func attemptRecordsCarryNilPressIdWhenUnset() async throws {
+    let script = RequestScript(statuses: [202])
+    let session = makeSequencedSession(script: script)
+
+    let (tokenManager, _) = makeTokenManager()
+    let observer = RecordingAttemptObserver()
+    let client = GateClient(
+        session: session,
+        tokenManager: tokenManager,
+        retryPolicy: .noDelay(),
+        attemptObserver: observer
+    )
+
+    #expect(OpenPressContext.pressId == nil)
+    try await client.open(endpointId: "VIP#OD#SB100001.1")
+
+    let records = observer.records
+    #expect(records.count == 1)
+    #expect(records[0].pressId == nil)
 }

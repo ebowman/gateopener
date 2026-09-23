@@ -47,6 +47,18 @@ public final class AppEnvironment {
     public let gateClient: any GateOpening
     public let controller: GateController
     public let snapshotStore: WidgetSnapshotStore
+    /// The cross-process open-attempt journal (bead gateopener-41m.2),
+    /// persisted under the App Group container so BOTH this process and the
+    /// widget/App-Intent extension process (`OpenGateIntent.runFlow`, which
+    /// calls `AppEnvironment.make()` from its own out-of-process
+    /// `openAppWhenRun = false` extension) can write and later read the same
+    /// open-attempt history. `nil` when `SharedContainer
+    /// .openAttemptJournalURL()` returns `nil` (no App Group container
+    /// available, e.g. an unsigned simulator build) or when the `--mock-gate`
+    /// debug path leaves it unwired (see `make()`'s `gateClient:` parameter
+    /// doc comment) — in the mock case there is no real `GateClient` for a
+    /// journal to observe anyway.
+    public let openAttemptJournal: OpenAttemptJournal?
 
     /// Reloads widget timelines. Stored (rather than only closed over by the
     /// `controller.onStateChange` handler installed in `make()`) so
@@ -119,12 +131,20 @@ public final class AppEnvironment {
         allowWhileLocked ? .afterFirstUnlockThisDeviceOnly : .whenUnlockedThisDeviceOnly
     }
 
+    /// - Parameter openAttemptJournalURL: TEST INJECTION SEAM ONLY. When
+    ///   `nil` (the production default), resolves via `SharedContainer
+    ///   .openAttemptJournalURL()`, itself `nil` when the App Group
+    ///   container is unavailable. Passing a value here (rather than always
+    ///   consulting `SharedContainer`) is what lets tests prove `make()`
+    ///   wires an `OpenAttemptJournal` without ever touching the real
+    ///   App Group container.
     public static func make(
         defaults: UserDefaults? = nil,
         reachability: (any ReachabilityProviding)? = nil,
         timelineReloader: @escaping @Sendable () -> Void = { WidgetCenter.shared.reloadAllTimelines() },
         gateClient: (any GateOpening)? = nil,
-        tokenResolver: (any TokenResolving)? = nil
+        tokenResolver: (any TokenResolving)? = nil,
+        openAttemptJournalURL: URL?? = nil
     ) -> AppEnvironment {
         let resolvedDefaults: UserDefaults
         if let defaults {
@@ -149,8 +169,106 @@ public final class AppEnvironment {
         )
 
         let api = ComelitAPI()
-        let tokenManager = TokenManager(api: api, credentialStore: credentialStore)
-        let resolvedGateClient: any GateOpening = gateClient ?? GateClient(tokenManager: tokenManager)
+
+        // Cross-process open-attempt journal (bead gateopener-41m.2). Only
+        // built when this call is constructing a REAL `GateClient` (i.e.
+        // `gateClient` was not injected) — the `--mock-gate` debug seam's
+        // fake `GateOpening` never calls an `attemptObserver` at all, so a
+        // journal built here would sit unused; passing `nil` for it in that
+        // branch keeps `environment.openAttemptJournal` honestly `nil`
+        // rather than implying a journal is wired when nothing will ever
+        // write to it.
+        //
+        // Computed BEFORE `tokenManager` (rather than after, as before this
+        // bead) so the journal instance is available to pass into
+        // `TokenManager.init(onResolved:onFailed:)` below -- wiring the
+        // press-phase hooks at construction time, rather than via a
+        // subsequent `await tokenManager.setOnResolved(...)` call (which
+        // `make()` cannot make itself, being synchronous), avoids any
+        // window where a press could call into `TokenManager
+        // .resolveAccessToken()` before the hooks are attached.
+        let resolvedJournalURL: URL?
+        if let openAttemptJournalURL {
+            resolvedJournalURL = openAttemptJournalURL
+        } else {
+            resolvedJournalURL = SharedContainer.openAttemptJournalURL()
+        }
+        let resolvedOpenAttemptJournal: OpenAttemptJournal?
+        if gateClient != nil {
+            resolvedOpenAttemptJournal = nil
+        } else if let resolvedJournalURL {
+            // `capacity: 1000` (Core's default is 200): since bead
+            // gateopener-41m.22 the journal's capacity counts PRESS lines
+            // too (~6-8 per press, not just one line per HTTP attempt), so
+            // the original 200-line default would trim press history down
+            // to only the last ~25-30 presses. Core's own default stays 200
+            // (its tests rely on it) -- only this production wiring raises
+            // it.
+            resolvedOpenAttemptJournal = OpenAttemptJournal(fileURL: resolvedJournalURL, capacity: 1000)
+        } else {
+            resolvedOpenAttemptJournal = nil
+        }
+
+        // Token-phase press journaling (bead gateopener-41m.23): these hooks
+        // fire synchronously from inside `TokenManager.resolveAccessToken()`
+        // -- called by `GateController.performOpen()`, itself called from
+        // inside `OpenGateFlow.run`'s `open()` closure, which is exactly the
+        // scope `OpenGateFlow.run` binds `OpenPressContext.pressId`/
+        // `pressStartedAt`/`pressSource` around (see that type's `run(...)`).
+        // If `OpenPressContext.pressId` is `nil` at call time (e.g. a
+        // `prewarm()` at app foreground, which runs entirely outside any
+        // press), nothing is written -- there is no press to attribute the
+        // phase to. `source` reads `OpenPressContext.pressSource` (falling
+        // back to "?") rather than a literal "intent", since the in-app path
+        // to `TokenManager` does not go through `OpenGateFlow.run` and so
+        // never binds that TaskLocal -- its token-phase lines read "?"
+        // accordingly. `process`/`appVersion` are captured once here (both
+        // are cheap, static-for-the-process-lifetime reads).
+        let process = Bundle.main.bundleIdentifier ?? "?"
+        let appVersion = AppVersion.current
+        let tokenManager = TokenManager(
+            api: api,
+            credentialStore: credentialStore,
+            onResolved: { resolution in
+                guard let pressId = OpenPressContext.pressId, let journal = resolvedOpenAttemptJournal else { return }
+                let elapsedMilliseconds = Int(max(0, Date().timeIntervalSince(OpenPressContext.pressStartedAt ?? Date())) * 1000)
+                journal.record(
+                    OpenPressRecord(
+                        pressId: pressId,
+                        timestamp: Date(),
+                        source: OpenPressContext.pressSource ?? "?",
+                        process: process,
+                        appVersion: appVersion,
+                        phase: .tokenResolved(kind: resolution.rawValue),
+                        elapsedMilliseconds: elapsedMilliseconds
+                    )
+                )
+            },
+            onFailed: { description in
+                guard let pressId = OpenPressContext.pressId, let journal = resolvedOpenAttemptJournal else { return }
+                let elapsedMilliseconds = Int(max(0, Date().timeIntervalSince(OpenPressContext.pressStartedAt ?? Date())) * 1000)
+                journal.record(
+                    OpenPressRecord(
+                        pressId: pressId,
+                        timestamp: Date(),
+                        source: OpenPressContext.pressSource ?? "?",
+                        process: process,
+                        appVersion: appVersion,
+                        phase: .tokenFailed(description: description),
+                        elapsedMilliseconds: elapsedMilliseconds
+                    )
+                )
+            }
+        )
+
+        let resolvedGateClient: any GateOpening
+        if let gateClient {
+            resolvedGateClient = gateClient
+        } else if let resolvedOpenAttemptJournal {
+            resolvedGateClient = GateClient(tokenManager: tokenManager, attemptObserver: resolvedOpenAttemptJournal)
+        } else {
+            resolvedGateClient = GateClient(tokenManager: tokenManager)
+        }
         let resolvedReachability = reachability ?? NWPathMonitorReachability()
 
         let resolvedTokenResolver: any TokenResolving = tokenResolver ?? tokenManager
@@ -174,6 +292,7 @@ public final class AppEnvironment {
             gateClient: resolvedGateClient,
             controller: controller,
             snapshotStore: snapshotStore,
+            openAttemptJournal: resolvedOpenAttemptJournal,
             timelineReloader: timelineReloader
         )
 
@@ -209,6 +328,7 @@ public final class AppEnvironment {
         gateClient: any GateOpening,
         controller: GateController,
         snapshotStore: WidgetSnapshotStore,
+        openAttemptJournal: OpenAttemptJournal?,
         timelineReloader: @escaping @Sendable () -> Void
     ) {
         self.defaults = defaults
@@ -219,6 +339,7 @@ public final class AppEnvironment {
         self.gateClient = gateClient
         self.controller = controller
         self.snapshotStore = snapshotStore
+        self.openAttemptJournal = openAttemptJournal
         self.timelineReloader = timelineReloader
     }
 

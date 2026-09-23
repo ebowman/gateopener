@@ -38,6 +38,7 @@ struct SettingsView: View {
     @State private var refreshErrorMessage: String?
     @State private var isConfirmingSignOut = false
     @State private var lockScreenErrorMessage: String?
+    @State private var isConfirmingClearVideoLogs = false
 
     /// The full text of the last persisted `VideoDiagnostics` log (bead
     /// gateopener-672.27), or `nil` if none has ever been persisted. Loaded
@@ -48,6 +49,12 @@ struct SettingsView: View {
     /// but not observed by any `@State`/`@Observable` wiring this view
     /// already has.
     @State private var videoDiagnosticsText: String?
+
+    /// The full rolling video-diagnostics HISTORY (bead gateopener-41m.20):
+    /// every recent session's diagnostics block plus interleaved pin/
+    /// coordinator events, or `nil` if the history is empty. Reloaded
+    /// alongside `videoDiagnosticsText` — see `reloadVideoDiagnostics()`.
+    @State private var videoDiagnosticsHistoryText: String?
 
     private var username: String? {
         (try? environment.credentialStore.loadCredentials())?.username
@@ -88,6 +95,7 @@ struct SettingsView: View {
                 lockScreenSection
                 accountSection
                 videoDiagnosticsSection
+                diagnosticsSection
                 aboutSection
             }
             // Reading `refreshToken` here (even though its value is never
@@ -191,8 +199,11 @@ struct SettingsView: View {
     private var videoSection: some View {
         Section {
             Toggle("Show door camera when opening", isOn: autoShowDoorVideoOnOpenBinding)
+            Toggle("Show door camera when app opens", isOn: autoStartDoorVideoOnLaunchBinding)
         } header: {
             Text("Video")
+        } footer: {
+            Text("Starts the live camera whenever you open GateOpener.")
         }
     }
 
@@ -201,6 +212,16 @@ struct SettingsView: View {
             get: { appSettings.autoShowDoorVideoOnOpen },
             set: { newValue in
                 appSettings.autoShowDoorVideoOnOpen = newValue
+                refreshToken += 1
+            }
+        )
+    }
+
+    private var autoStartDoorVideoOnLaunchBinding: Binding<Bool> {
+        Binding(
+            get: { appSettings.autoStartDoorVideoOnLaunch },
+            set: { newValue in
+                appSettings.autoStartDoorVideoOnLaunch = newValue
                 refreshToken += 1
             }
         )
@@ -322,16 +343,34 @@ struct SettingsView: View {
                 .font(.footnote)
                 .foregroundStyle(.secondary)
 
-            if let videoDiagnosticsText {
-                ShareLink("Share log", item: videoDiagnosticsText)
+            if let videoDiagnosticsShareText {
+                ShareLink("Share log", item: videoDiagnosticsShareText)
                 Button("Copy") {
-                    UIPasteboard.general.string = videoDiagnosticsText
+                    UIPasteboard.general.string = videoDiagnosticsShareText
+                }
+            }
+
+            if videoDiagnosticsText != nil || videoDiagnosticsHistoryText != nil {
+                Button("Clear video logs", role: .destructive) {
+                    isConfirmingClearVideoLogs = true
                 }
             }
         } header: {
             Text("Video diagnostics")
         } footer: {
-            Text("Captures ICE candidate types and the failure stage from the last door-camera video attempt, so it can be shared for troubleshooting.")
+            Text("Captures ICE candidate types and the failure stage from recent door-camera video attempts (including pin/renewal history), so it can be shared for troubleshooting.")
+        }
+        .confirmationDialog(
+            "Clear video logs?",
+            isPresented: $isConfirmingClearVideoLogs,
+            titleVisibility: .visible
+        ) {
+            Button("Clear video logs", role: .destructive) {
+                clearVideoDiagnostics()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This removes all saved door-camera diagnostics history from this device.")
         }
     }
 
@@ -347,12 +386,67 @@ struct SettingsView: View {
         return String(lastLine)
     }
 
-    /// Reloads `videoDiagnosticsText` from the shared app-group defaults
-    /// (falling back to `.standard`, matching `DoorVideoSession`'s own
-    /// fallback — see `VideoDiagnostics.persist(to:)`'s call site).
+    /// The text actually shared/copied (bead gateopener-41m.20): the full
+    /// rolling HISTORY (every recent session plus interleaved pin/
+    /// coordinator events) when available, falling back to the last single
+    /// session's log when the history is empty (e.g. immediately after
+    /// `Clear video logs`/a fresh install, before any event/session has
+    /// been recorded to the history stream). `nil` only when NEITHER has
+    /// ever been recorded, matching the pre-existing "nothing to share yet"
+    /// behavior.
+    ///
+    /// Prefixed with the app version/build and today's date, so a shared
+    /// log is self-describing even once detached from this app's context.
+    private var videoDiagnosticsShareText: String? {
+        guard let body = videoDiagnosticsHistoryText ?? videoDiagnosticsText else { return nil }
+        return "\(videoDiagnosticsSharePrefix)\n\n\(body)"
+    }
+
+    private static let shareDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+        return formatter
+    }()
+
+    /// `GateOpener <version> (<build>) — <date>`, per this bead's STEP 5.
+    private var videoDiagnosticsSharePrefix: String {
+        "GateOpener \(appVersion) — \(Self.shareDateFormatter.string(from: Date()))"
+    }
+
+    /// Reloads `videoDiagnosticsText`/`videoDiagnosticsHistoryText` from the
+    /// shared app-group defaults (falling back to `.standard`, matching
+    /// `DoorVideoSession`'s own fallback — see `VideoDiagnostics
+    /// .persist(to:)`'s call site).
     private func reloadVideoDiagnostics() {
         let defaults = SharedContainer.sharedDefaults() ?? .standard
         videoDiagnosticsText = VideoDiagnostics.loadLast(from: defaults)
+        videoDiagnosticsHistoryText = VideoDiagnostics.loadHistory(from: defaults)
+    }
+
+    /// Clears BOTH the rolling history and the last-session key (bead
+    /// gateopener-41m.20 STEP 5), then reloads so this view immediately
+    /// reflects the empty state.
+    private func clearVideoDiagnostics() {
+        let defaults = SharedContainer.sharedDefaults() ?? .standard
+        VideoDiagnostics.clearHistory(in: defaults)
+        defaults.removeObject(forKey: VideoDiagnostics.defaultsKey)
+        reloadVideoDiagnostics()
+    }
+
+    // MARK: - Diagnostics
+
+    /// Bead gateopener-41m.3: entry point to `OpenHistoryView`, so the
+    /// operator can see WHY an Action Button/widget/app open failed (and
+    /// share the history) without needing to reproduce it live.
+    private var diagnosticsSection: some View {
+        Section {
+            NavigationLink("Open history") {
+                OpenHistoryView(journal: environment.openAttemptJournal)
+            }
+        } header: {
+            Text("Diagnostics")
+        }
     }
 
     // MARK: - About

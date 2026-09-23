@@ -34,4 +34,24 @@ public enum SharedContainer {
     public static func sharedDefaults() -> UserDefaults? {
         UserDefaults(suiteName: appGroupId)
     }
+
+    /// The file URL for the cross-process open-attempt journal (bead
+    /// gateopener-41m.2): `<app group container>/open-attempts.jsonl`, read
+    /// and written by `OpenAttemptJournal` from BOTH the app process and the
+    /// widget/App-Intent extension process.
+    ///
+    /// Returns `nil` — rather than crashing or falling back to some other
+    /// location — when the App Group container itself is unavailable (e.g.
+    /// an unsigned/ad-hoc simulator build with no App Groups entitlement, or
+    /// a plain SPM test target with no entitlements at all). Callers must
+    /// treat `nil` as "no journal available in this environment" and must
+    /// not attempt to log anywhere else instead — logging to a
+    /// process-local location would defeat the entire cross-process point of
+    /// this journal.
+    public static func openAttemptJournalURL() -> URL? {
+        guard let container = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroupId) else {
+            return nil
+        }
+        return container.appendingPathComponent("open-attempts.jsonl")
+    }
 }

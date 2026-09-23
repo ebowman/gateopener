@@ -25,7 +25,11 @@ public enum GateErrorMessage {
             switch comelitError {
             case .invalidCredentials:
                 return "Wrong username or password"
-            case .network, .server, .missingRefreshToken:
+            case .network(_, let code):
+                return networkFailureMessage(forURLErrorCode: code)
+            case .server(let status, _):
+                return serverFailureMessage(forStatus: status)
+            case .missingRefreshToken:
                 return "Could not reach the gate"
             case .decoding:
                 return "Could not reach the gate"
@@ -44,6 +48,41 @@ public enum GateErrorMessage {
         // description (which could contain a URL, status body fragment, or
         // other implementation detail unsuitable for end-user display).
         return "Could not open the gate"
+    }
+
+    /// Maps a `ComelitError.network`'s optional `URLError.code.rawValue` to
+    /// a specific, actionable message. `nil` (no `URLError` origin, e.g. an
+    /// invalid URL or non-HTTP response) and any transport `URLError` code
+    /// not explicitly listed below (e.g. `cannotFindHost`,
+    /// `cannotConnectToHost`, `dnsLookupFailed`, `secureConnectionFailed`)
+    /// fall through to the unchanged, generic "Could not reach the gate".
+    private static func networkFailureMessage(forURLErrorCode code: Int?) -> String {
+        guard let code else { return "Could not reach the gate" }
+        switch code {
+        case URLError.notConnectedToInternet.rawValue,
+            URLError.dataNotAllowed.rawValue,
+            URLError.internationalRoamingOff.rawValue:
+            return "No internet connection"
+        case URLError.timedOut.rawValue,
+            URLError.networkConnectionLost.rawValue:
+            return "Network too slow - try again"
+        default:
+            return "Could not reach the gate"
+        }
+    }
+
+    /// Maps a `ComelitError.server`'s HTTP status to a specific message for
+    /// 5xx (service error, with the status inlined) and 429 (rate-limited/
+    /// busy); every other status (e.g. 4xx other than 429) keeps the
+    /// unchanged, generic "Could not reach the gate".
+    private static func serverFailureMessage(forStatus status: Int) -> String {
+        if status == 429 {
+            return "Gate service busy - try again"
+        }
+        if status >= 500 {
+            return "Gate service error (\(status))"
+        }
+        return "Could not reach the gate"
     }
 
     /// The sign-in-specific mapping used by `iOS/App/SignInView.swift`.

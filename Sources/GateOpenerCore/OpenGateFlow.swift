@@ -95,14 +95,45 @@ public struct OpenGateFlow: Sendable {
     ///   - reloadTimelines: Invoked after every snapshot write.
     ///   - timeout: How long to wait for `open()` before giving up and
     ///     returning `.timedOut`. Defaults to 25s — comfortably above the
-    ///     ~15s worst-case `GateClient` retry budget (see the
-    ///     `comelit-cloud-latency-and-timeout-budget` memory: do NOT shrink
-    ///     the underlying per-request timeout to "fix" this; 25s here is
-    ///     purely an extension-lifetime safety net) and comfortably below
-    ///     the ~30s a widget/App-Intent extension process is typically
-    ///     killed at.
+    ///     `<= 18s` worst-case `GateClient` retry budget (default
+    ///     `RetryPolicy`: escalating 3s/5s/8s per-attempt timeouts across 3
+    ///     attempts = 16s of requests, plus <= 2s of bounded backoff sleep;
+    ///     see the `comelit-cloud-latency-and-timeout-budget` memory: do NOT
+    ///     shrink the underlying per-request timeouts below that schedule
+    ///     -- and never below 3s on the first attempt -- to "fix" this; 25s
+    ///     here is purely an extension-lifetime safety net) and comfortably
+    ///     below the ~30s a widget/App-Intent extension process is
+    ///     typically killed at.
     ///   - now: Injectable clock for the snapshot's `updatedAt`, defaulting
     ///     to `Date.init`.
+    ///   - journal: Optional sink for `OpenPressRecord` phase checkpoints
+    ///     (see `OpenPressPhase`), called synchronously once per phase this
+    ///     method emits. `nil` by default, in which case `run` behaves
+    ///     exactly as if journaling did not exist -- this bead (Core only)
+    ///     wires phase emission itself; the actual `OpenAttemptJournal`-
+    ///     backed closure and source/process/appVersion metadata are wired
+    ///     by callers (iOS, bead gateopener-41m.23), not by this type.
+    ///   - pressId: Correlates every phase emitted by this call, and (via
+    ///     `OpenPressContext.$pressId.withValue`, bound only around the
+    ///     `open()` invocation) every `OpenAttemptRecord` produced inside
+    ///     `open()`. Defaults to a fresh `UUID()` per call.
+    ///   - pressStartedAt: When this press began, for computing each
+    ///     emitted phase's `elapsedMilliseconds`. Defaults to `Date()` (now)
+    ///     -- callers that already know the press's true start time (e.g.
+    ///     the intent's own entry point) should pass it explicitly so
+    ///     elapsed times reflect the whole press, not just this call.
+    ///   - reachabilityDetail: Free-form, non-secret string describing the
+    ///     `isReachable` reading (e.g. the underlying `NWPath` status name),
+    ///     included verbatim in the emitted `.reachability` phase. Defaults
+    ///     to `""`.
+    ///   - pressSource: `OpenPressRecord.source` for every phase this call
+    ///     emits, e.g. "intent"/"app"/"queued". Defaults to `"intent"` (this
+    ///     flow's original, and still primary, caller).
+    ///   - pressProcess: `OpenPressRecord.process` for every phase this call
+    ///     emits, e.g. `Bundle.main.bundleIdentifier ?? "?"` (this Core
+    ///     target never reads `Bundle.main` itself). Defaults to `"?"`.
+    ///   - pressAppVersion: `OpenPressRecord.appVersion` for every phase
+    ///     this call emits, e.g. `"0.1.9 (11)"`. Defaults to `""`.
     public func run(
         currentState: GateState,
         gateName: String?,
@@ -111,22 +142,63 @@ public struct OpenGateFlow: Sendable {
         snapshot: WidgetSnapshotStore,
         reloadTimelines: @Sendable () -> Void,
         timeout: Duration = .seconds(25),
-        now: @Sendable () -> Date = Date.init
+        now: @Sendable () -> Date = Date.init,
+        journal: (@Sendable (OpenPressRecord) -> Void)? = nil,
+        pressId: UUID = UUID(),
+        pressStartedAt: Date = Date(),
+        reachabilityDetail: String = "",
+        pressSource: String = "intent",
+        pressProcess: String = "?",
+        pressAppVersion: String = ""
     ) async -> Outcome {
+        func emit(_ phase: OpenPressPhase) {
+            guard let journal else { return }
+            let elapsedMilliseconds: Int
+            switch phase {
+            case .started:
+                elapsedMilliseconds = 0
+            default:
+                let elapsedSeconds = now().timeIntervalSince(pressStartedAt)
+                elapsedMilliseconds = Int(max(0, elapsedSeconds) * 1000)
+            }
+            journal(
+                OpenPressRecord(
+                    pressId: pressId,
+                    timestamp: now(),
+                    source: pressSource,
+                    process: pressProcess,
+                    appVersion: pressAppVersion,
+                    phase: phase,
+                    elapsedMilliseconds: elapsedMilliseconds
+                )
+            )
+        }
+
+        emit(.reachability(isReachable: isReachable, detail: reachabilityDetail))
+
         if currentState == .needsSetup {
             write(.needsSetup, gateName: gateName, snapshot: snapshot, reloadTimelines: reloadTimelines, now: now)
+            emit(.finished(outcome: Outcome.needsSetup.dialog))
             return .needsSetup
         }
 
         guard isReachable else {
             let message = "No network"
             write(.failed(message: message), gateName: gateName, snapshot: snapshot, reloadTimelines: reloadTimelines, now: now)
+            emit(.finished(outcome: message))
             return .failed(message: message)
         }
 
         write(.opening, gateName: gateName, snapshot: snapshot, reloadTimelines: reloadTimelines, now: now)
+        emit(.openStarted)
 
-        let resultState = await raceAgainstTimeout(timeout: timeout, open: open)
+        let resultState = await OpenPressContext.$pressId.withValue(pressId) {
+            await OpenPressContext.$pressStartedAt.withValue(pressStartedAt) {
+                await OpenPressContext.$pressSource.withValue(pressSource) {
+                    await raceAgainstTimeout(timeout: timeout, open: open)
+                }
+            }
+        }
 
         let outcome: Outcome
         let terminalState: GateState
@@ -153,6 +225,11 @@ public struct OpenGateFlow: Sendable {
         }
 
         write(terminalState, gateName: gateName, snapshot: snapshot, reloadTimelines: reloadTimelines, now: now)
+        if outcome == .timedOut {
+            emit(.timedOut)
+        } else {
+            emit(.finished(outcome: outcome.dialog))
+        }
         return outcome
     }
 

@@ -122,6 +122,19 @@ public final class DoorVideoSession: NSObject {
     /// callback channel into a displayed `<video>` element).
     private static let plateauInterval: TimeInterval = 6
 
+    /// How long after `sessionStartedAt` with NO frame ever having arrived
+    /// before the session is declared failed (as opposed to a stall, which
+    /// only applies once at least one frame has been seen — see
+    /// `livenessVerdict(elapsedSinceStart:sinceLastFrame:hardTimeout:plateau:
+    /// firstFrameTimeout:)`). This is the "rtc/offer succeeded (HTTP 200 +
+    /// answer applied) but the door never actually sends media" case from
+    /// bead gateopener-12h.10 (2 of 5 rapid reopens got 200 but zero
+    /// frames). Matches `../comelit`'s `FIRST_FRAME_TIMEOUT_SECONDS`.
+    ///
+    /// Instance-level (not `static`) so it is injectable per-session for
+    /// tests, but every real call site relies on the default.
+    private let firstFrameTimeout: TimeInterval
+
     /// The `WKWebView` hosting `door-video.html`. Exposed directly (rather
     /// than wrapped in a custom view) because the `<video>` element inside
     /// the page is displayed DIRECTLY on iOS — see this type's doc comment
@@ -143,6 +156,22 @@ public final class DoorVideoSession: NSObject {
                 // is guaranteed to leave a persisted log regardless of
                 // which code path produced it.
                 persistDiagnostics()
+
+                // Registry bookkeeping lives at this SAME choke point (bead
+                // gateopener-41m.9), for the identical reason: EVERY terminal
+                // transition — `stop()`, `endDueToLiveness(reason:)`,
+                // `endDueToNoFirstFrame()` (the first-frame-timeout path from
+                // gateopener-41m.8, which ends via `performLivenessTeardown`
+                // AFTER the offer was accepted), and every early-return
+                // `.failed` inside `start()` — passes through here exactly
+                // once (this `didSet` already only fires on a genuine value
+                // change). See `DoorVideoSessionRegistry.
+                // shouldRecordEnd(offerAccepted:)`'s doc comment for why a
+                // session that never had its offer accepted must NOT record
+                // an end.
+                if DoorVideoSessionRegistry.shouldRecordEnd(offerAccepted: offerAccepted) {
+                    registry.recordSessionEnded()
+                }
             case .streaming:
                 // Bead gateopener-672.30: iOS pauses/refuses inline media
                 // playback in a hidden (opacity-0) web view, and by the
@@ -175,12 +204,50 @@ public final class DoorVideoSession: NSObject {
     private let appSettings: AppSettings
     private let urlSession: URLSession
 
+    /// The `DoorVideoSessionRegistry` consulted for the door-busy cooldown
+    /// (bead gateopener-41m.9), mirroring macOS's `DoorVideoSession`, which
+    /// always uses `DoorVideoSessionRegistry.shared`. Injectable (default
+    /// `.shared`) purely so tests can supply an isolated instance rather
+    /// than mutating the process-wide singleton.
+    private let registry: DoorVideoSessionRegistry
+
+    /// Sleeps out the door-busy cooldown computed from `registry`. Injected
+    /// (default `Task.sleep(for:)`) so tests can observe/skip the actual
+    /// wait without a real delay.
+    private let cooldownSleep: (Duration) async throws -> Void
+
     /// Guards `stop()` idempotency and lets `start()`'s in-flight guards
     /// (`guard !hasStopped else { return }`) bail out promptly if `stop()`
     /// races an in-progress `start()`. `start()` itself is re-entrant per
     /// `GateOpenerCore.DoorVideoSessionRetention` — see that method's doc
     /// comment — rather than guarded by a separate "already started" flag.
     private var hasStopped = false
+
+    /// Set to `true` the instant an `rtc/offer` PUT is accepted (HTTP 200)
+    /// by the door. Consulted at every terminal transition (`.ended`,
+    /// `.failed`, `stop()`) via `DoorVideoSessionRegistry.
+    /// shouldRecordEnd(offerAccepted:)` to decide whether that transition
+    /// should call `registry.recordSessionEnded()` — a session that never
+    /// occupied the door's one session slot must NOT start a busy-cooldown
+    /// window for the NEXT attempt. Mirrors macOS's `DoorVideoSession.
+    /// offerAccepted` exactly.
+    private var offerAccepted = false
+
+    /// Non-`nil` while `start()` is sleeping out a door-busy cooldown before
+    /// issuing the `rtc/offer` PUT (bead gateopener-41m.9); the deadline the
+    /// wait is sleeping until. `nil` at every other time (before the wait
+    /// starts, after it ends, and on every terminal transition). Surfaced to
+    /// `DoorVideoCoordinator` via `onCooldownChange`.
+    private(set) var cooldownUntil: Date? {
+        didSet {
+            guard oldValue != cooldownUntil else { return }
+            onCooldownChange?(cooldownUntil)
+        }
+    }
+
+    /// Invoked on every `cooldownUntil` change. Always invoked on the main
+    /// actor, mirroring `onStateChange`.
+    public var onCooldownChange: ((Date?) -> Void)?
 
     private var pageLoadContinuation: CheckedContinuation<Void, Never>?
 
@@ -198,12 +265,14 @@ public final class DoorVideoSession: NSObject {
     private var livenessTask: Task<Void, Never>?
 
     #if DEBUG
-    /// Set only by `debugStub(connectingDelay:streamingDuration:)` below.
-    /// When non-`nil`, `start()` skips ALL real work (no network, no
+    /// Set only by `debugStub(connectingDelay:streamingDuration:failAfter:)`
+    /// below. When non-`nil`, `start()` skips ALL real work (no network, no
     /// WKWebView page load, no token resolution) and instead runs this
-    /// canned `.connecting` -> `.streaming` -> `.ended` timeline — see that
-    /// factory's doc comment.
-    private var debugStubTimeline: (connectingDelay: TimeInterval, streamingDuration: TimeInterval)?
+    /// canned timeline — see that factory's doc comment. `failAfter == nil`
+    /// runs the normal `.connecting` -> `.streaming` -> `.ended` timeline;
+    /// `failAfter == message` instead finishes as `.failed(message)` after
+    /// `connectingDelay` (never reaching `.streaming`).
+    private var debugStubTimeline: (connectingDelay: TimeInterval, streamingDuration: TimeInterval, failAfter: String?)?
     #endif
 
     /// - Parameter appSettings: Supplies `cachedGates` — the last
@@ -217,12 +286,18 @@ public final class DoorVideoSession: NSObject {
         tokenManager: TokenManager,
         gateClient: any GateOpening,
         appSettings: AppSettings,
-        urlSession: URLSession = .shared
+        urlSession: URLSession = .shared,
+        firstFrameTimeout: TimeInterval = 10,
+        registry: DoorVideoSessionRegistry = .shared,
+        cooldownSleep: @escaping (Duration) async throws -> Void = { try await Task.sleep(for: $0) }
     ) {
         self.tokenManager = tokenManager
         self.gateClient = gateClient
         self.appSettings = appSettings
         self.urlSession = urlSession
+        self.firstFrameTimeout = firstFrameTimeout
+        self.registry = registry
+        self.cooldownSleep = cooldownSleep
 
         let config = WKWebViewConfiguration()
         // Without these two, iOS refuses to autoplay the <video> element
@@ -309,6 +384,13 @@ public final class DoorVideoSession: NSObject {
         lastFrameAt = nil
         livenessTask?.cancel()
         livenessTask = nil
+        // CARRY-OVER from 41m.9 review: without this reset, a replayed
+        // instance that fails BEFORE this new attempt's `rtc/offer` is
+        // accepted would still read the PREVIOUS attempt's `offerAccepted
+        // == true`, wrongly recording a session end / starting a bogus 15s
+        // busy-cooldown for an attempt that never actually occupied the
+        // door's one session slot.
+        offerAccepted = false
 
         #if DEBUG
         if let timeline = debugStubTimeline {
@@ -321,14 +403,32 @@ public final class DoorVideoSession: NSObject {
 
         state = .connecting
 
-        guard let endpointId = try? await resolveCameraEndpointId() else {
-            // No camera endpoint discovered: fail immediately. See
-            // `resolveCameraEndpointId()`'s doc comment — when a camera was
-            // already known from a previous discovery
-            // (`appSettings.cachedGates`), this makes NO network call at
-            // all; only a genuinely stale/empty cache falls through to a
-            // live discovery round trip.
+        let endpointId: String
+        do {
+            endpointId = try await resolveCameraEndpointId()
+        } catch DoorVideoSessionError.cameraNotFound {
+            // A live discovery genuinely found no camera endpoint anywhere
+            // -- this IS "No camera", the only case that message should be
+            // used for. See `resolveCameraEndpointId()`'s doc comment: when
+            // a camera id was already cached (from `appSettings.
+            // cachedCameraEndpointId` or, failing that, `appSettings.
+            // cachedGates`), this makes NO network call at all; only a
+            // genuinely stale/empty cache falls through to a live discovery
+            // round trip.
             state = .failed("No camera")
+            return
+        } catch {
+            // Bead gateopener-41m.19 ROOT CAUSE fix: any OTHER failure from
+            // discovery (timeout, 5xx, offline blip, token failure) is NOT
+            // "no camera" -- it is a failed attempt to find out. Reporting
+            // it as "No camera" is what caused three transient discovery
+            // failures in a row to burn a pinned session's whole failure
+            // budget. The underlying error's SANITIZED description (case
+            // name / status code only, never a response body) is logged to
+            // diagnostics for later triage.
+            let sanitized = TokenFailureDescription.sanitizedTokenFailureDescription(error)
+            diagnostics.append("[\(Self.diagTimestamp())] camera discovery failed: \(sanitized)")
+            state = .failed("Could not reach door camera")
             return
         }
         diagnostics.append("[\(Self.diagTimestamp())] camera endpoint chosen: \(endpointId)")
@@ -392,9 +492,34 @@ public final class DoorVideoSession: NSObject {
 
         guard !hasStopped else { return }
 
+        // Wait out any remaining door-busy cooldown from a PRIOR session in
+        // this process (see `DoorVideoBusyPolicy`/`DoorVideoSessionRegistry`)
+        // before issuing the offer PUT at all. `state` stays `.connecting`
+        // throughout — mirrors macOS's `DoorVideoSession.start()` exactly.
+        await waitOutCooldownIfNeeded()
+
+        // `stop()` may have been called while sleeping out the cooldown
+        // above — no offer PUT may be sent in that case.
+        guard !hasStopped else { return }
+
         let answerSDP: String
         do {
             answerSDP = try await putOfferWithRetry(endpointId: endpointId, token: token, sdp: offerSDP)
+        } catch let DoorVideoSessionError.offer(outcome) {
+            Self.logger.error("rtc/offer failed: \(String(describing: outcome), privacy: .public)")
+            // Bead gateopener-41m.19 STEP 3: a 404/410 means the door/cloud
+            // no longer recognizes this endpoint id at all -- clear the
+            // cache so the NEXT session rediscovers rather than repeatedly
+            // retrying a dead id. Deliberately NOT done for `.doorBusy`
+            // (500, a normal transient condition), `.timedOut`, or
+            // `.network` -- see `shouldInvalidateCachedCamera(forHTTPStatus:)`'s
+            // doc comment.
+            if case .serverError(let status) = outcome, Self.shouldInvalidateCachedCamera(forHTTPStatus: status) {
+                appSettings.cachedCameraEndpointId = nil
+            }
+            let message = DoorVideoBusyPolicy.failureMessage(for: outcome)
+            state = .failed(message)
+            return
         } catch {
             Self.logger.error("rtc/offer failed after retry: \(String(describing: error), privacy: .public)")
             state = .failed("Could not reach door camera")
@@ -430,6 +555,7 @@ public final class DoorVideoSession: NSObject {
     public func stop() {
         guard !hasStopped else { return }
         hasStopped = true
+        cooldownUntil = nil
 
         diagnostics.append("[\(Self.diagTimestamp())] terminal reason: stopped")
         persistDiagnostics()
@@ -476,33 +602,88 @@ public final class DoorVideoSession: NSObject {
 
     // MARK: - Camera endpoint selection
 
-    /// Selects the door camera endpoint: `friendlyName` containing "entry"
-    /// (case-insensitive) takes priority; otherwise the first endpoint
-    /// whose id ends with the known camera id suffix (`VIP#EN#SB100001`,
-    /// matched as the final `_`-separated id component). Mirrors the macOS
-    /// `DoorVideoSession.resolveCameraEndpointId()`/
-    /// `endpointIdMatchesCameraSuffix` matching logic exactly.
+    /// Selects the door camera endpoint id, in this order (bead
+    /// gateopener-41m.19, replacing the earlier `cachedGates`-first policy
+    /// that could never actually hit — see `resolveCameraEndpointId(cachedId:
+    /// cachedEndpoints:discover:persist:)`'s doc comment for the full
+    /// rationale):
     ///
-    /// Cache-then-live-discovery policy (the "no camera -> `.failed`
-    /// immediately, with no network call" edge case from this bead):
-    /// `appSettings.cachedGates` — the last locally-persisted discovery
-    /// result `GateController.discover()` already wrote, a synchronous,
-    /// no-network read — is checked FIRST. If it already contains a camera
-    /// match, that endpoint id is returned immediately with zero network
-    /// calls. Only when the cache is empty or has no camera match does this
-    /// fall back to a live `gateClient.discover(aptId:)` round trip (the
-    /// cache may simply be stale/never populated, e.g. first run before
-    /// Settings has ever loaded gates) — a live "no camera anywhere" result
-    /// is what throws `DoorVideoSessionError.cameraNotFound`.
+    ///  1. `appSettings.cachedCameraEndpointId`, if non-`nil` — a camera id
+    ///     a PAST session already discovered and persisted. Zero network
+    ///     calls.
+    ///  2. `appSettings.cachedGates` — the filtered gate-candidate cache
+    ///     (harmless to keep checking; see the seam's doc comment for why
+    ///     this can never actually match in practice, but it costs nothing
+    ///     and a future relaxation of `candidateGates` filtering could make
+    ///     it match).
+    ///  3. A live `gateClient.discover(aptId: nil)` round trip. On success,
+    ///     the found id is persisted to `appSettings.cachedCameraEndpointId`
+    ///     so the NEXT session (in this run or a future one) skips this
+    ///     round trip entirely.
+    ///
+    /// Delegates the actual ordering/persistence logic to the static,
+    /// network/WKWebView-free seam below so it is directly unit-testable.
     private func resolveCameraEndpointId() async throws -> String {
-        if let cached = Self.findCameraEndpointId(in: appSettings.cachedGates) {
+        try await Self.resolveCameraEndpointId(
+            cachedId: appSettings.cachedCameraEndpointId,
+            cachedEndpoints: appSettings.cachedGates,
+            discover: { try await self.gateClient.discover(aptId: nil) },
+            persist: { self.appSettings.cachedCameraEndpointId = $0 }
+        )
+    }
+
+    /// Pure(ish) ordering seam backing `resolveCameraEndpointId()`, factored
+    /// out so a test can exercise it with a canned `cachedId`/`cachedEndpoints`
+    /// and an injected `discover`/`persist` closure — no network, no
+    /// `WKWebView`, no real `AppSettings`.
+    ///
+    /// - Parameters:
+    ///   - cachedId: `appSettings.cachedCameraEndpointId` at call time. When
+    ///     non-`nil`, this is returned IMMEDIATELY with zero calls to
+    ///     `discover`/`persist` — this is the whole point of the cache (bead
+    ///     gateopener-41m.19's field report: every video session was paying
+    ///     for a live discovery round trip, and any transient discovery
+    ///     failure was being reported as "No camera").
+    ///   - cachedEndpoints: `appSettings.cachedGates` at call time — checked
+    ///     SECOND, only when `cachedId == nil`. Kept for parity with the
+    ///     pre-existing behavior and because it costs nothing, but as of this
+    ///     bead's root-cause finding this can never actually contain a camera
+    ///     match in production: `GateController.performFirstTimeSetup`/
+    ///     `refreshGates` only ever assign it `GateClient.candidateGates(from:)`
+    ///     output, which is filtered to power-controller/`LOCK_GENERIC`
+    ///     endpoints and therefore excludes the camera's `VIP`-suffixed id.
+    ///   - discover: Performs a live discovery round trip. Called ONLY when
+    ///     neither `cachedId` nor `cachedEndpoints` yields a match.
+    ///   - persist: Called with the discovered camera endpoint id
+    ///     immediately after a SUCCESSFUL `discover` match, before returning
+    ///     — writes `appSettings.cachedCameraEndpointId` in the real caller.
+    ///     NEVER called when `discover` throws, and NEVER called when
+    ///     `discover` succeeds but finds no camera (that path throws
+    ///     `DoorVideoSessionError.cameraNotFound` instead, leaving any
+    ///     existing cached value untouched).
+    /// - Throws: Whatever `discover` throws, propagated unchanged (nothing is
+    ///   persisted in that case); or `DoorVideoSessionError.cameraNotFound` if
+    ///   `discover` succeeds but no endpoint matches
+    ///   `findCameraEndpointId(in:)` (nothing is persisted in that case
+    ///   either).
+    static func resolveCameraEndpointId(
+        cachedId: String?,
+        cachedEndpoints: [Endpoint],
+        discover: () async throws -> [Endpoint],
+        persist: (String) -> Void
+    ) async throws -> String {
+        if let cachedId {
+            return cachedId
+        }
+        if let cached = findCameraEndpointId(in: cachedEndpoints) {
             return cached
         }
 
-        let endpoints = try await gateClient.discover(aptId: nil)
-        guard let found = Self.findCameraEndpointId(in: endpoints) else {
+        let endpoints = try await discover()
+        guard let found = findCameraEndpointId(in: endpoints) else {
             throw DoorVideoSessionError.cameraNotFound
         }
+        persist(found)
         return found
     }
 
@@ -577,6 +758,38 @@ public final class DoorVideoSession: NSObject {
         _ = try await webView.callAsyncJavaScript(js, contentWorld: .page)
     }
 
+    /// Consults `registry.waitBeforeOffer()` and, if positive, sets
+    /// `cooldownUntil` to the resulting deadline and sleeps it out via the
+    /// injected `cooldownSleep` closure before returning — a dedicated,
+    /// `WKWebView`-free seam (bead gateopener-41m.9) factored out of
+    /// `start()` so it can be exercised directly by a test (with a fake
+    /// `registry`/`cooldownSleep`) without driving the rest of `start()`'s
+    /// WKWebView/network pipeline.
+    ///
+    /// `cooldownUntil` is set BEFORE the sleep and cleared in a `defer` (so
+    /// it is also cleared if `cooldownSleep` throws, e.g. a cancelled
+    /// `Task.sleep` from `stop()` racing this wait) — a `stop()` called
+    /// during the wait leaves no stale `cooldownUntil` behind, and the
+    /// caller's own `guard !hasStopped` immediately after this returns is
+    /// what prevents the offer PUT itself from ever being sent in that case.
+    /// `state` is left untouched here — it stays whatever the caller already
+    /// set it to (`.connecting`) — this is not a new user-visible phase.
+    ///
+    /// `internal` (not `private`) so `@testable import GateOpener` test
+    /// targets can call it directly.
+    func waitOutCooldownIfNeeded() async {
+        let cooldown = registry.waitBeforeOffer()
+        guard cooldown > .zero else { return }
+
+        let deadline = Date().addingTimeInterval(
+            Double(cooldown.components.seconds) + Double(cooldown.components.attoseconds) / 1e18
+        )
+        cooldownUntil = deadline
+        diagnostics.append("[\(Self.diagTimestamp())] door-busy cooldown wait: \(deadline.timeIntervalSinceNow)s")
+        defer { cooldownUntil = nil }
+        try? await cooldownSleep(cooldown)
+    }
+
     /// Calls `door-video.html`'s `window.ensurePlaying()` and appends the
     /// returned status string ("playing"/"resumed"/"rejected:<name>"/
     /// "no-video") to `diagnostics` (bead gateopener-672.30). Fire-and-
@@ -610,12 +823,78 @@ public final class DoorVideoSession: NSObject {
 
     // MARK: - Liveness watchdog
 
+    /// The three-way (four-way counting `.keepGoing`) liveness decision,
+    /// returned by the pure `livenessVerdict(elapsedSinceStart:
+    /// sinceLastFrame:hardTimeout:plateau:firstFrameTimeout:)` function
+    /// below so it can be unit-tested without a `WKWebView`.
+    enum LivenessVerdict: Equatable {
+        /// No terminal condition met yet; keep polling.
+        case keepGoing
+        /// `elapsedSinceStart >= hardTimeout`. Ends in `.ended` (the door's
+        /// own ~28-30s window, or the backstop, is a normal end).
+        case endedHardTimeout
+        /// A frame HAS arrived before, but none for >= `plateau`. Ends in
+        /// `.ended` (a genuine stall of an established stream is also a
+        /// normal end).
+        case endedStall
+        /// NO frame has EVER arrived and `elapsedSinceStart >=
+        /// firstFrameTimeout`. Ends in `.failed("No video from door
+        /// camera")` — the rtc/offer succeeded but the door never actually
+        /// sent media, which is an error, not a normal end.
+        case failedNoFirstFrame
+    }
+
+    /// Pure decision function backing `startLivenessWatchdog()`'s per-tick
+    /// logic — kept free of `self`/`WKWebView` so it can be exhaustively
+    /// unit-tested.
+    ///
+    /// Precedence when more than one condition is simultaneously true:
+    /// **hard timeout > no-first-frame > stall.** In practice hard timeout
+    /// (35s) and no-first-frame (10s) can only coincide if `firstFrameTimeout
+    /// >= hardTimeout` (not the production configuration), and stall
+    /// requires a frame to have already arrived (so it can never coincide
+    /// with no-first-frame); the explicit ordering below is what makes that
+    /// guarantee hold regardless of how the two timeouts are configured.
+    ///
+    /// - Parameters:
+    ///   - elapsedSinceStart: `now - sessionStartedAt`.
+    ///   - sinceLastFrame: `now - lastFrameAt`, or `nil` if no frame has ever
+    ///     arrived.
+    ///   - hardTimeout: The absolute session-length backstop.
+    ///   - plateau: How long with no new frame (after at least one frame
+    ///     arrived) before a stall is declared.
+    ///   - firstFrameTimeout: How long with no frame EVER arriving before the
+    ///     session is declared failed.
+    static func livenessVerdict(
+        elapsedSinceStart: TimeInterval,
+        sinceLastFrame: TimeInterval?,
+        hardTimeout: TimeInterval,
+        plateau: TimeInterval,
+        firstFrameTimeout: TimeInterval
+    ) -> LivenessVerdict {
+        if elapsedSinceStart >= hardTimeout {
+            return .endedHardTimeout
+        }
+        guard let sinceLastFrame else {
+            // No frame has ever arrived.
+            if elapsedSinceStart >= firstFrameTimeout {
+                return .failedNoFirstFrame
+            }
+            return .keepGoing
+        }
+        if sinceLastFrame >= plateau {
+            return .endedStall
+        }
+        return .keepGoing
+    }
+
     /// Watches for new "frame" messages (see `userContentController(_:
     /// didReceive:)` below) and ends the session on a stall
-    /// (`plateauInterval` with no new frame) or the hard timeout —
-    /// NEVER on ICE connection state, per this type's doc comment and bd
-    /// memory `gateopener-live-video-architecture` (ICE can stay
-    /// "connected" for ~10s after the door actually stops sending media).
+    /// (`plateauInterval` with no new frame), the hard timeout, or (bead
+    /// gateopener-41m.8) a first-frame timeout — NEVER on ICE connection
+    /// state, per this type's doc comment and bd memory
+    /// `gateopener-live-video-architecture` (ICE can stay "connected" for
+    /// ~10s after the door actually stops sending media).
     private func startLivenessWatchdog() {
         livenessTask = Task { [weak self] in
             while true {
@@ -623,44 +902,61 @@ public final class DoorVideoSession: NSObject {
                 if Task.isCancelled { return }
                 guard let self, !self.hasStopped else { return }
 
+                guard let startedAt = self.sessionStartedAt else { continue }
                 let now = Date()
-                if let startedAt = self.sessionStartedAt, now.timeIntervalSince(startedAt) >= Self.hardTimeout {
+                let elapsedSinceStart = now.timeIntervalSince(startedAt)
+                let sinceLastFrame = self.lastFrameAt.map { now.timeIntervalSince($0) }
+
+                let verdict = Self.livenessVerdict(
+                    elapsedSinceStart: elapsedSinceStart,
+                    sinceLastFrame: sinceLastFrame,
+                    hardTimeout: Self.hardTimeout,
+                    plateau: Self.plateauInterval,
+                    firstFrameTimeout: self.firstFrameTimeout
+                )
+
+                switch verdict {
+                case .keepGoing:
+                    continue
+                case .endedHardTimeout:
                     Self.logger.notice("hard timeout (\(Self.hardTimeout, privacy: .public)s) reached; ending session")
                     self.endDueToLiveness(reason: "hard timeout after \(Self.hardTimeout)s")
                     return
-                }
-
-                guard let lastFrameAt = self.lastFrameAt else {
-                    // No frame has arrived yet; only the hard timeout above
-                    // (not the plateau interval) applies until the first
-                    // frame is seen, matching `DoorVideoLiveness
-                    // .rtpCountersShowProgress`'s "a nil baseline must not
-                    // count as progress OR as an immediate stall" guard —
-                    // a session that never receives any frame at all still
-                    // needs to end via the hard timeout, not a premature
-                    // plateau firing before any frame was ever possible.
-                    continue
-                }
-                if now.timeIntervalSince(lastFrameAt) >= Self.plateauInterval {
+                case .endedStall:
                     Self.logger.notice("no new frame for \(Self.plateauInterval, privacy: .public)s; ending session (stall)")
                     self.endDueToLiveness(reason: "stall after \(Self.plateauInterval)s")
+                    return
+                case .failedNoFirstFrame:
+                    Self.logger.notice("no first frame after \(self.firstFrameTimeout, privacy: .public)s; failing session")
+                    self.endDueToNoFirstFrame()
                     return
                 }
             }
         }
     }
 
-    /// Common teardown for both stall and hard-timeout endings: runs the
-    /// same JS teardown/blank as `stop()` and transitions to `.ended`
-    /// (never `.failed` — the door closing its own ~28-30s window, or a
-    /// genuine stall, is a NORMAL end of session, not an error).
+    /// Shared teardown steps for every liveness-driven ending
+    /// (`endDueToLiveness(reason:)` and `endDueToNoFirstFrame()`): guards
+    /// `hasStopped` idempotency, appends + persists a diagnostics line,
+    /// resumes any in-flight page-load continuation, blanks the page
+    /// (`markClosing()` then `closeSession()`, best-effort, same order and
+    /// rationale as `stop()`), and removes both script-message handlers.
+    /// Does NOT set `state` — callers set the terminal state themselves
+    /// (`.ended` vs `.failed`) after this returns.
     ///
-    /// - Parameter reason: A short, human-readable terminal reason (e.g.
-    ///   "stall after 6.0s" or "hard timeout after 35.0s") appended to
-    ///   `diagnostics` and persisted before `state` transitions to `.ended`.
-    private func endDueToLiveness(reason: String) {
-        guard !hasStopped else { return }
+    /// - Parameter reason: Appended to `diagnostics` as `terminal reason:
+    ///   <reason>`.
+    /// - Returns: `true` if teardown ran (the caller should proceed to set
+    ///   `state`); `false` if the session had already stopped (the caller
+    ///   must NOT touch `state` — this is what prevents a first frame that
+    ///   arrives between the verdict and the teardown from resurrecting the
+    ///   session, since `recordFrameReceived()` itself also checks
+    ///   `hasStopped`, and either guard winning is sufficient).
+    @discardableResult
+    private func performLivenessTeardown(reason: String) -> Bool {
+        guard !hasStopped else { return false }
         hasStopped = true
+        cooldownUntil = nil
 
         diagnostics.append("[\(Self.diagTimestamp())] terminal reason: \(reason)")
         persistDiagnostics()
@@ -688,19 +984,94 @@ public final class DoorVideoSession: NSObject {
         webView.configuration.userContentController.removeScriptMessageHandler(forName: "frame")
         webView.configuration.userContentController.removeScriptMessageHandler(forName: "diag")
 
+        return true
+    }
+
+    /// Common teardown for both stall and hard-timeout endings: runs the
+    /// shared teardown steps (`performLivenessTeardown(reason:)`) and
+    /// transitions to `.ended` (never `.failed` — the door closing its own
+    /// ~28-30s window, or a genuine stall, is a NORMAL end of session, not
+    /// an error).
+    ///
+    /// - Parameter reason: A short, human-readable terminal reason (e.g.
+    ///   "stall after 6.0s" or "hard timeout after 35.0s") appended to
+    ///   `diagnostics` and persisted before `state` transitions to `.ended`.
+    private func endDueToLiveness(reason: String) {
+        guard performLivenessTeardown(reason: reason) else { return }
         state = .ended
+    }
+
+    /// Teardown for the "rtc/offer succeeded but no frame ever arrived"
+    /// failure (bead gateopener-41m.8): runs the SAME shared teardown steps
+    /// as `endDueToLiveness(reason:)` via `performLivenessTeardown(reason:)`,
+    /// but transitions to `.failed("No video from door camera")` instead of
+    /// `.ended` — unlike a stall or the hard timeout, a session that never
+    /// received a single frame is an error, not a normal end of stream.
+    private func endDueToNoFirstFrame() {
+        guard performLivenessTeardown(reason: "no first frame after \(firstFrameTimeout)s") else { return }
+        state = .failed("No video from door camera")
     }
 
     // MARK: - rtc/offer (Swift-side; the bearer token never reaches page JS)
 
     private struct OfferResponse: Decodable { let answer: String }
 
-    private func putOffer(endpointId: String, token: String, sdp: String, sessionId: String) async throws -> String {
+    /// Maps a `URLError` (the request never reached the door at all) to a
+    /// `DoorVideoBusyPolicy.OfferOutcome` via `DoorVideoBusyPolicy.classify`
+    /// — a pure, `WKWebView`/network-free seam (bead gateopener-41m.9) so
+    /// the "500 -> no retry, URLError -> retry" decision can be exercised in
+    /// a test without an actual `URLSession` round trip. `internal` (not
+    /// `private`) so `@testable import GateOpener` test targets can call it
+    /// directly.
+    static func classifyTransportFailure(_ urlError: URLError) -> DoorVideoBusyPolicy.OfferOutcome {
+        let transportError: DoorVideoBusyPolicy.OfferTransportError = urlError.code == .timedOut ? .timedOut : .other
+        return DoorVideoBusyPolicy.classify(httpStatus: nil, transportError: transportError)
+    }
+
+    /// Bead gateopener-41m.19 STEP 3 (stale-cache self-heal): whether an
+    /// `rtc/offer` PUT's HTTP response status means the endpoint id used for
+    /// that PUT is no longer valid and `appSettings.cachedCameraEndpointId`
+    /// should be cleared so the NEXT session performs a fresh live discovery
+    /// rather than repeatedly retrying a dead cached id.
+    ///
+    /// `true` ONLY for `404` (endpoint unknown to the door/cloud) and `410`
+    /// (endpoint gone — treated identically to 404 per this bead's brief,
+    /// since distinguishing them offers no different action). Every other
+    /// status — in particular `500` (door busy, a normal transient
+    /// condition, NOT a sign the endpoint id is wrong) and any other
+    /// 4xx/5xx — returns `false`. Also `false` for a `nil` status (timeouts
+    /// and other transport/network failures never reached the door at all,
+    /// so they say nothing about whether the endpoint id itself is valid).
+    ///
+    /// `internal` (not `private`) so `@testable import GateOpener` test
+    /// targets can call it directly without exercising a real `URLSession`
+    /// round trip.
+    static func shouldInvalidateCachedCamera(forHTTPStatus status: Int?) -> Bool {
+        switch status {
+        case 404, 410:
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// A single `rtc/offer` PUT attempt, classified via
+    /// `DoorVideoBusyPolicy.classify(httpStatus:transportError:)` rather than
+    /// thrown as a raw HTTP-status/transport `Error` — mirrors macOS's
+    /// `DoorVideoSession.putOfferOnce` exactly (including the malformed-URL
+    /// fallback to `.network`, an unreachable-in-practice programmer-error
+    /// path).
+    private func putOfferOnce(
+        endpointId: String,
+        token: String,
+        sdp: String,
+        sessionId: String
+    ) async -> (outcome: DoorVideoBusyPolicy.OfferOutcome, answer: String?) {
         // '#' -> %23 only, matching the proven recipe (NOT full percent
         // encoding, which the door's signaling backend does not expect).
         let encodedEndpoint = endpointId.replacingOccurrences(of: "#", with: "%23")
         guard let url = URL(string: "\(ComelitAPI.baseURL)/servicerest/devicecom/endpoint/\(encodedEndpoint)/rtc/offer") else {
-            throw DoorVideoSessionError.invalidURL
+            return (.network, nil)
         }
         var request = URLRequest(url: url)
         request.httpMethod = "PUT"
@@ -708,73 +1079,106 @@ public final class DoorVideoSession: NSObject {
         request.setValue("application/json", forHTTPHeaderField: "content-type")
         request.setValue("ktor-client", forHTTPHeaderField: "user-agent")
         let body: [String: String] = ["sessionId": sessionId, "offer": sdp]
-        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        guard let httpBody = try? JSONSerialization.data(withJSONObject: body) else {
+            return (.network, nil)
+        }
+        request.httpBody = httpBody
 
         let (data, response): (Data, URLResponse)
         do {
             (data, response) = try await urlSession.data(for: request)
+        } catch let urlError as URLError {
+            return (Self.classifyTransportFailure(urlError), nil)
         } catch {
-            throw DoorVideoSessionError.network
+            return (DoorVideoBusyPolicy.classify(httpStatus: nil, transportError: .other), nil)
         }
         guard let http = response as? HTTPURLResponse else {
-            throw DoorVideoSessionError.network
+            return (DoorVideoBusyPolicy.classify(httpStatus: nil, transportError: .other), nil)
         }
-        guard http.statusCode == 200 else {
-            throw DoorVideoSessionError.server(status: http.statusCode)
+        let outcome = DoorVideoBusyPolicy.classify(httpStatus: http.statusCode, transportError: nil)
+        guard outcome == .accepted else {
+            return (outcome, nil)
         }
-        let decoded = try JSONDecoder().decode(OfferResponse.self, from: data)
-        return decoded.answer
+        guard let decoded = try? JSONDecoder().decode(OfferResponse.self, from: data) else {
+            // The door said 200 but the body did not decode -- treat as a
+            // server-error outcome (distinct from `.doorBusy`/`.accepted`)
+            // rather than accepting a session with no usable answer SDP.
+            return (.serverError(http.statusCode), nil)
+        }
+        return (.accepted, decoded.answer)
     }
 
-    /// Wraps `putOffer` with a bounded retry — same semantics as macOS's
-    /// `DoorVideoSession.putOfferWithRetry`: 2 attempts total, retryable
-    /// only on HTTP 500/network errors, a fresh `sessionId` per attempt,
-    /// the SAME offer SDP reused across attempts.
+    /// Issues the `rtc/offer` PUT with the same policy as macOS's
+    /// `DoorVideoSession.putOfferWithRetry`: ONE attempt, classified via
+    /// `DoorVideoBusyPolicy.classify`. Per that policy's `shouldRetry`, the
+    /// ONLY retryable outcome is `.network` — retried exactly ONCE, after
+    /// 500ms, with a FRESH `sessionId`. Every other outcome (`.doorBusy`,
+    /// `.unauthorized`, `.serverError`, `.timedOut`) is NOT retried and
+    /// thrown immediately as `DoorVideoSessionError.offer(outcome)` so
+    /// `start()` can map the SPECIFIC outcome via
+    /// `DoorVideoBusyPolicy.failureMessage(for:)`.
+    ///
+    /// The SAME offer SDP is reused across the one allowed retry
+    /// (deliberately NOT regenerated) — see macOS's doc comment on the same
+    /// method for why.
+    ///
+    /// On `.accepted`, records `registry.recordSessionAccepted(at:)` and
+    /// sets `offerAccepted = true` (consulted at every terminal transition
+    /// via `DoorVideoSessionRegistry.shouldRecordEnd(offerAccepted:)`)
+    /// before returning the answer SDP.
+    ///
+    /// Every `await` in this func is followed by a `hasStopped` check before
+    /// any further diagnostics/registry side effect, so a `stop()` racing an
+    /// in-flight PUT or the retry's sleep cannot record a diag line or
+    /// registry mutation after the session has been torn down.
     private func putOfferWithRetry(endpointId: String, token: String, sdp: String) async throws -> String {
-        let policy = RetryPolicy(
-            maxAttempts: 2,
-            baseDelay: .milliseconds(500),
-            maxTotalDelay: .seconds(2),
-            requestTimeout: .seconds(5)
-        )
+        let maxAttempts = 2 // one attempt + at most one .network retry
 
-        var lastError: Error = DoorVideoSessionError.network
-        for attempt in 1...policy.maxAttempts {
+        for attempt in 1...maxAttempts {
+            guard !hasStopped else { throw DoorVideoSessionError.offer(.network) }
+
             let sessionId = UUID().uuidString.lowercased()
             let attemptStart = Date()
-            do {
-                let answer = try await putOffer(endpointId: endpointId, token: token, sdp: sdp, sessionId: sessionId)
-                let latencyMs = Int(Date().timeIntervalSince(attemptStart) * 1000)
-                Self.logger.notice("rtc/offer attempt \(attempt, privacy: .public)/\(policy.maxAttempts, privacy: .public) succeeded")
-                diagnostics.append("[\(Self.diagTimestamp())] rtc/offer attempt \(attempt)/\(policy.maxAttempts) status=200 latencyMs=\(latencyMs)")
-                return answer
-            } catch {
-                let latencyMs = Int(Date().timeIntervalSince(attemptStart) * 1000)
-                lastError = error
-                let retryable: Bool
-                if case DoorVideoSessionError.server(let status) = error, status == 500 {
-                    retryable = true
-                } else if case DoorVideoSessionError.network = error {
-                    retryable = true
-                } else {
-                    retryable = false
-                }
-                Self.logger.notice("rtc/offer attempt \(attempt, privacy: .public)/\(policy.maxAttempts, privacy: .public) failed: \(String(describing: error), privacy: .public), retryable=\(retryable, privacy: .public)")
-                let statusDescription: String
-                if case DoorVideoSessionError.server(let status) = error {
-                    statusDescription = "\(status)"
-                } else {
-                    statusDescription = "network-error"
-                }
-                diagnostics.append("[\(Self.diagTimestamp())] rtc/offer attempt \(attempt)/\(policy.maxAttempts) status=\(statusDescription) latencyMs=\(latencyMs) retryable=\(retryable)")
+            let (outcome, answer) = await putOfferOnce(endpointId: endpointId, token: token, sdp: sdp, sessionId: sessionId)
+            let latencyMs = Int(Date().timeIntervalSince(attemptStart) * 1000)
 
-                guard retryable, attempt < policy.maxAttempts else {
-                    throw error
-                }
-                try? await policy.sleep(policy.baseDelay)
+            guard !hasStopped else { throw DoorVideoSessionError.offer(.network) }
+
+            if outcome == .accepted, let answer {
+                Self.logger.notice("rtc/offer attempt \(attempt, privacy: .public)/\(maxAttempts, privacy: .public) succeeded")
+                diagnostics.append("[\(Self.diagTimestamp())] rtc/offer attempt \(attempt)/\(maxAttempts) status=200 latencyMs=\(latencyMs)")
+                offerAccepted = true
+                registry.recordSessionAccepted(at: Date())
+                return answer
             }
+
+            let retryable = DoorVideoBusyPolicy.shouldRetry(outcome)
+            Self.logger.notice("rtc/offer attempt \(attempt, privacy: .public)/\(maxAttempts, privacy: .public) failed: \(String(describing: outcome), privacy: .public), retryable=\(retryable, privacy: .public)")
+
+            let diagLabel = DoorVideoBusyPolicy.diagLabel(for: outcome)
+            let statusDescription: String
+            switch outcome {
+            case .doorBusy:
+                statusDescription = "500 \(diagLabel)"
+            case .serverError(let status):
+                statusDescription = "\(status) \(diagLabel)"
+            case .unauthorized, .timedOut, .network, .accepted:
+                statusDescription = diagLabel
+            }
+            diagnostics.append("[\(Self.diagTimestamp())] rtc/offer attempt \(attempt)/\(maxAttempts) status=\(statusDescription) latencyMs=\(latencyMs) retryable=\(retryable)")
+
+            guard !hasStopped else { throw DoorVideoSessionError.offer(outcome) }
+
+            guard retryable, attempt < maxAttempts else {
+                throw DoorVideoSessionError.offer(outcome)
+            }
+
+            try? await Task.sleep(for: .milliseconds(500))
+            guard !hasStopped else { throw DoorVideoSessionError.offer(outcome) }
         }
-        throw lastError
+        // Unreachable: the loop above always either returns or throws on
+        // its final iteration.
+        throw DoorVideoSessionError.offer(.network)
     }
 
     // MARK: - Diagnostics (bead gateopener-672.27)
@@ -868,19 +1272,42 @@ extension DoorVideoSession {
     ///
     /// - Parameters:
     ///   - connectingDelay: How long `state` stays `.connecting` before
-    ///     flipping to `.streaming`. Defaults to 2s.
+    ///     flipping to `.streaming` (or, when `failAfter` is non-`nil`, to
+    ///     `.failed`). Defaults to 2s.
     ///   - streamingDuration: How long `state` stays `.streaming` before
-    ///     flipping to `.ended`. Defaults to 8s.
+    ///     flipping to `.ended`. Defaults to 8s. Ignored when `failAfter` is
+    ///     non-`nil`, since that timeline never reaches `.streaming`.
+    ///   - failAfter: When non-`nil` (bead gateopener-41m.14, for testing
+    ///     `DoorVideoPinPolicy`-driven renewal on a `.failed` outcome), the
+    ///     stub finishes as `.failed(failAfter)` after `connectingDelay`
+    ///     instead of ever reaching `.streaming`. `nil` (the default) runs
+    ///     the normal `.connecting` -> `.streaming` -> `.ended` timeline.
+    ///   - registry: The `DoorVideoSessionRegistry` this stub is constructed
+    ///     with. Defaults to a FRESH, isolated instance (NOT `.shared`) —
+    ///     bead gateopener-41m.9's edge case: `debugStub` must not consult
+    ///     the process-wide registry unless a caller opts in explicitly by
+    ///     passing one (e.g. a test asserting registry interaction), since
+    ///     other tests rely on `debugStub`'s instant, side-effect-free
+    ///     starts and must not have their timing perturbed by a busy-cooldown
+    ///     left behind by an unrelated real session. In practice this stub's
+    ///     canned timeline never calls into the registry either way (it never
+    ///     reaches `putOfferWithRetry` or the terminal-state registry hook's
+    ///     `offerAccepted` check, which is always `false` here) — the fresh
+    ///     instance is defensive/documentation-of-intent rather than
+    ///     load-bearing today.
     public static func debugStub(
         connectingDelay: TimeInterval = 2,
-        streamingDuration: TimeInterval = 8
+        streamingDuration: TimeInterval = 8,
+        failAfter: String? = nil,
+        registry: DoorVideoSessionRegistry = DoorVideoSessionRegistry()
     ) -> DoorVideoSession {
         let session = DoorVideoSession(
             tokenManager: TokenManager(api: ComelitAPI(), credentialStore: DebugStubNullCredentialStore()),
             gateClient: DebugStubNullGateOpening(),
-            appSettings: AppSettings(defaults: UserDefaults(suiteName: "ie.boboco.GateOpener.debugStub") ?? .standard)
+            appSettings: AppSettings(defaults: UserDefaults(suiteName: "ie.boboco.GateOpener.debugStub") ?? .standard),
+            registry: registry
         )
-        session.debugStubTimeline = (connectingDelay: connectingDelay, streamingDuration: streamingDuration)
+        session.debugStubTimeline = (connectingDelay: connectingDelay, streamingDuration: streamingDuration, failAfter: failAfter)
         return session
     }
 
@@ -889,10 +1316,16 @@ extension DoorVideoSession {
     /// observable effect, matching what `DoorVideoView` needs to render the
     /// "Connecting…" overlay and then the (blank, since no real page is
     /// loaded) streaming state.
-    fileprivate func runDebugStubTimeline(_ timeline: (connectingDelay: TimeInterval, streamingDuration: TimeInterval)) async {
+    fileprivate func runDebugStubTimeline(_ timeline: (connectingDelay: TimeInterval, streamingDuration: TimeInterval, failAfter: String?)) async {
         state = .connecting
         try? await Task.sleep(for: .seconds(timeline.connectingDelay))
         guard !hasStopped else { return }
+
+        if let failureMessage = timeline.failAfter {
+            hasStopped = true
+            state = .failed(failureMessage)
+            return
+        }
 
         state = .streaming
         try? await Task.sleep(for: .seconds(timeline.streamingDuration))
@@ -927,9 +1360,12 @@ private struct DebugStubNullGateOpening: GateOpening {
 enum DoorVideoSessionError: Error, Equatable {
     case cameraNotFound
     case negotiationFailed
-    case invalidURL
-    case network
-    case server(status: Int)
+    /// Wraps a classified `rtc/offer` failure outcome so callers (`start()`)
+    /// can distinguish `.doorBusy`/`.unauthorized`/`.timedOut`/`.network`/
+    /// `.serverError` and map each to its own `DoorVideoSession.State.failed`
+    /// message via `DoorVideoBusyPolicy.failureMessage(for:)`. Mirrors
+    /// macOS's `DoorVideoSessionError.offer` exactly.
+    case offer(DoorVideoBusyPolicy.OfferOutcome)
 }
 
 // MARK: - WKNavigationDelegate
