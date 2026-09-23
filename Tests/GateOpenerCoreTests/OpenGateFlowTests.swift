@@ -386,6 +386,73 @@ struct OpenGateFlowTests {
         #expect(holder.value == explicitPressId)
     }
 
+    /// `OpenGateFlow.run` binds `OpenPressContext.$pressStartedAt` around the
+    /// same scope as `$pressId` (see `run`'s implementation) -- this proves
+    /// `pressStartedAt` is likewise visible from inside the `open` closure,
+    /// exactly like `pressId` above, so hooks that run during `open()` (e.g.
+    /// `TokenManager.onResolved`/`onFailed`, wired by `AppEnvironment.make()`)
+    /// can compute an elapsed time relative to the press's true start.
+    ///
+    /// MUTATION CHECK: if `run` only bound `$pressId` and not
+    /// `$pressStartedAt` around `raceAgainstTimeout`'s `addTask` scope,
+    /// `observedPressStartedAt` would capture `nil` here, failing the final
+    /// `#expect`.
+    @Test func openClosureObservesTaskLocalPressStartedAtSetByRun() async {
+        let (defaults, cleanup) = makeSuite()
+        defer { cleanup() }
+        let store = WidgetSnapshotStore(defaults: defaults)
+
+        let holder = PressStartedAtHolder()
+        let explicitPressStartedAt = Date(timeIntervalSince1970: 1_700_000_000)
+
+        let outcome = await OpenGateFlow().run(
+            currentState: .idle,
+            gateName: "Front Gate",
+            isReachable: true,
+            open: {
+                holder.record(OpenPressContext.pressStartedAt)
+                return .succeeded(at: Date())
+            },
+            snapshot: store,
+            reloadTimelines: {},
+            pressStartedAt: explicitPressStartedAt
+        )
+
+        #expect(outcome == .opened)
+        #expect(holder.value == explicitPressStartedAt)
+    }
+
+    /// Mirrors `openClosureObservesTaskLocalPressStartedAtSetByRun` for
+    /// `OpenPressContext.pressSource`: `OpenGateFlow.run` must bind
+    /// `pressSource` (alongside `pressId`/`pressStartedAt`) around its
+    /// `open()` invocation, so code running inside `open()` (e.g.
+    /// `AppEnvironment.make()`'s `TokenManager.onResolved`/`onFailed` hooks)
+    /// can read the current press's source without it being threaded through
+    /// as an explicit parameter.
+    @Test func openClosureObservesTaskLocalPressSourceSetByRun() async {
+        let (defaults, cleanup) = makeSuite()
+        defer { cleanup() }
+        let store = WidgetSnapshotStore(defaults: defaults)
+
+        let holder = PressSourceHolder()
+
+        let outcome = await OpenGateFlow().run(
+            currentState: .idle,
+            gateName: "Front Gate",
+            isReachable: true,
+            open: {
+                holder.record(OpenPressContext.pressSource)
+                return .succeeded(at: Date())
+            },
+            snapshot: store,
+            reloadTimelines: {},
+            pressSource: "queued"
+        )
+
+        #expect(outcome == .opened)
+        #expect(holder.value == "queued")
+    }
+
     /// End-to-end: `open` wraps a real `GateClient.open` (wired with an
     /// `attemptObserver`), and `OpenGateFlow.run` is given an explicit
     /// `pressId`. Every `OpenAttemptRecord` the `GateClient` call produces
@@ -454,6 +521,40 @@ private final class PressIdHolder: @unchecked Sendable {
     }
 
     var value: UUID? {
+        lock.lock()
+        defer { lock.unlock() }
+        return _value
+    }
+}
+
+private final class PressStartedAtHolder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _value: Date?
+
+    func record(_ value: Date?) {
+        lock.lock()
+        _value = value
+        lock.unlock()
+    }
+
+    var value: Date? {
+        lock.lock()
+        defer { lock.unlock() }
+        return _value
+    }
+}
+
+private final class PressSourceHolder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _value: String?
+
+    func record(_ value: String?) {
+        lock.lock()
+        _value = value
+        lock.unlock()
+    }
+
+    var value: String? {
         lock.lock()
         defer { lock.unlock() }
         return _value

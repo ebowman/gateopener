@@ -27,6 +27,19 @@ public struct OpenGateIntent: AppIntent {
     )
     public static let openAppWhenRun = false
 
+    /// TEST SEAM ONLY, `DEBUG`-gated: overrides the URL `runFlow` opens its
+    /// OWN direct `OpenAttemptJournal` at (see `runFlow`'s doc comment on
+    /// why that journal is opened directly rather than only through
+    /// `AppEnvironment`). `nil` in production (and reset to `nil` by every
+    /// test after use), in which case `runFlow` resolves
+    /// `SharedContainer.openAttemptJournalURL()` exactly as before. This
+    /// exists purely so `iOS/Tests` never touches the real App Group
+    /// container while still exercising the intent's own direct-journal
+    /// press logging.
+    #if DEBUG
+    nonisolated(unsafe) static var journalURLOverride: URL??
+    #endif
+
     public init() {}
 
     public func perform() async throws -> some IntentResult & ProvidesDialog {
@@ -39,6 +52,23 @@ public struct OpenGateIntent: AppIntent {
     /// `GateOpenerIOSApp`'s DEBUG `--run-intent` launch flag (bead .13 step
     /// 6's verification) without going through the full `AppIntents`
     /// invocation machinery, which is not drivable from a plain app launch.
+    ///
+    /// PRESS JOURNALING (bead gateopener-41m.23): the very first things this
+    /// method does -- before `AppEnvironment.make()`, which can itself take
+    /// non-trivial time (Keychain access, `TokenManager`/`GateController`
+    /// construction) -- are recording `pressStartedAt`/`pressId` and writing
+    /// an `OpenPressPhase.started` press record directly to the shared
+    /// journal, via a journal instance THIS method opens itself (NOT
+    /// `environment.openAttemptJournal`, which does not exist yet at this
+    /// point). This is so a press that dies before `AppEnvironment.make()`
+    /// even finishes (e.g. the extension is killed by iOS under memory
+    /// pressure, or hangs on a slow Keychain call) still leaves a `.started`
+    /// line on disk -- the whole point of this bead. `environment
+    /// .openAttemptJournal` (once it exists) is used for nothing here;
+    /// writing directly avoids depending on `AppEnvironment` ever finishing
+    /// construction. Both journal instances write to the same underlying
+    /// file (`SharedContainer.openAttemptJournalURL()`), safely, thanks to
+    /// `OpenAttemptJournal`'s cross-process `flock`-based locking.
     ///
     /// - Parameter environment: TEST/DEBUG SEAM ONLY. When `nil` (the
     ///   production default, and the only value ever used by `perform()`
@@ -56,7 +86,52 @@ public struct OpenGateIntent: AppIntent {
     ///   tokenResolver:)`'s own doc comment warns against.
     @MainActor
     static func runFlow(environment: AppEnvironment? = nil) async -> OpenGateFlow.Outcome {
+        // FIRST statements: press identity + the direct journal write,
+        // before AppEnvironment.make() -- see this method's doc comment.
+        let pressStartedAt = Date()
+        let pressId = UUID()
+        let process = Bundle.main.bundleIdentifier ?? "?"
+        let appVersion = AppVersion.current
+
+        #if DEBUG
+        let journalURL: URL? = journalURLOverride ?? SharedContainer.openAttemptJournalURL()
+        #else
+        let journalURL: URL? = SharedContainer.openAttemptJournalURL()
+        #endif
+        let journal: OpenAttemptJournal?
+        if let journalURL {
+            journal = OpenAttemptJournal(fileURL: journalURL, capacity: 1000)
+        } else {
+            journal = nil
+        }
+
+        func emit(_ phase: OpenPressPhase) {
+            guard let journal else { return }
+            let elapsedMilliseconds: Int
+            switch phase {
+            case .started:
+                elapsedMilliseconds = 0
+            default:
+                elapsedMilliseconds = Int(max(0, Date().timeIntervalSince(pressStartedAt)) * 1000)
+            }
+            journal.record(
+                OpenPressRecord(
+                    pressId: pressId,
+                    timestamp: Date(),
+                    source: "intent",
+                    process: process,
+                    appVersion: appVersion,
+                    phase: phase,
+                    elapsedMilliseconds: elapsedMilliseconds
+                )
+            )
+        }
+
+        emit(.started)
+
         let environment = environment ?? AppEnvironment.make()
+
+        emit(.environmentReady)
 
         // Reachability seam: `AppEnvironment.make()` defaults to a real
         // `NWPathMonitorReachability()` (see that type's initializer) when
@@ -86,6 +161,13 @@ public struct OpenGateIntent: AppIntent {
         let currentState = environment.controller.state
         let gateName = environment.appSettings.selectedEndpointName
 
+        let journalWriter: (@Sendable (OpenPressRecord) -> Void)?
+        if let journal {
+            journalWriter = { (record: OpenPressRecord) in journal.record(record) }
+        } else {
+            journalWriter = nil
+        }
+
         let outcome = await OpenGateFlow().run(
             currentState: currentState,
             gateName: gateName,
@@ -95,7 +177,14 @@ public struct OpenGateIntent: AppIntent {
                 return await environment.controller.state
             },
             snapshot: environment.snapshotStore,
-            reloadTimelines: { WidgetCenter.shared.reloadAllTimelines() }
+            reloadTimelines: { WidgetCenter.shared.reloadAllTimelines() },
+            journal: journalWriter,
+            pressId: pressId,
+            pressStartedAt: pressStartedAt,
+            reachabilityDetail: reachability.pathDescription,
+            pressSource: "intent",
+            pressProcess: process,
+            pressAppVersion: appVersion
         )
 
         return outcome

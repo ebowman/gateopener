@@ -55,13 +55,15 @@ struct GateOpenerIOSApp: App {
             appSettings: AppSettings(defaults: SharedContainer.sharedDefaults() ?? .standard),
             credentialStore: KeychainCredentialStore(accessGroup: SharedContainer.keychainAccessGroup)
         )
+        let appReachability = NWPathMonitorReachability()
         let environment = AppEnvironment.make(
-            reachability: NWPathMonitorReachability(),
+            reachability: appReachability,
             gateClient: DebugLaunchOptions.makeGateClientIfNeeded(),
             tokenResolver: DebugLaunchOptions.makeTokenResolverIfNeeded()
         )
         #else
-        let environment = AppEnvironment.make(reachability: NWPathMonitorReachability())
+        let appReachability = NWPathMonitorReachability()
+        let environment = AppEnvironment.make(reachability: appReachability)
         #endif
         let runner = BackgroundOpenRunner(controller: environment.controller)
         // Registered alongside `GateControllerObservable`'s own observer
@@ -72,7 +74,11 @@ struct GateOpenerIOSApp: App {
         environment.addStateObserver { [runner] newState in
             runner.stateDidChange(newState)
         }
-        let observable = GateControllerObservable(environment: environment, backgroundOpenRunner: runner)
+        let observable = GateControllerObservable(
+            environment: environment,
+            backgroundOpenRunner: runner,
+            reachabilityDetail: { appReachability.pathDescription }
+        )
 
         // `DoorVideoCoordinator`'s factory closure captures `environment`
         // (constructed above), so its `tokenManager`/`gateClient`/

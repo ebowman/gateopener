@@ -348,4 +348,25 @@ public enum OpenJournalEntry: Codable, Sendable, Equatable {
 /// `GateClientTests`/`OpenGateFlowTests`'s TaskLocal-focused cases).
 public enum OpenPressContext {
     @TaskLocal public static var pressId: UUID?
+
+    /// The moment the current press began (see `OpenPressPhase.started`),
+    /// bound alongside `pressId` by `OpenGateFlow.run` around its `open()`
+    /// invocation. Lets code running inside `open()` (e.g. `AppEnvironment
+    /// .make()`'s `TokenManager.onResolved`/`onFailed` hooks) compute an
+    /// `OpenPressRecord.elapsedMilliseconds` relative to the press's true
+    /// start, without threading an extra parameter through `GateController
+    /// .performOpen()`/`TokenManager.accessToken()`. `nil` outside any press
+    /// context, exactly like `pressId`.
+    @TaskLocal public static var pressStartedAt: Date?
+
+    /// `OpenPressRecord.source` for the current press (e.g. "intent"/"app"/
+    /// "queued"), bound alongside `pressId`/`pressStartedAt` by `OpenGateFlow
+    /// .run` around its `open()` invocation. Lets code running inside
+    /// `open()` (e.g. `AppEnvironment.make()`'s `TokenManager.onResolved`/
+    /// `onFailed` hooks) label the `OpenPressRecord`s it writes with the same
+    /// source as the press's other phases, without threading an extra
+    /// parameter through `GateController.performOpen()`/`TokenManager
+    /// .accessToken()`. `nil` outside any press context, exactly like
+    /// `pressId` -- callers reading it should fall back to `"?"`.
+    @TaskLocal public static var pressSource: String?
 }

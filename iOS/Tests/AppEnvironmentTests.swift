@@ -141,4 +141,32 @@ struct AppEnvironmentTests {
 
         #expect(environment.openAttemptJournal == nil)
     }
+
+    // MARK: - (41m.23) journal capacity raised to 1000 in production wiring
+
+    /// `make()`'s production journal wiring passes `capacity: 1000` (Core's
+    /// own default, used when a caller constructs `OpenAttemptJournal`
+    /// directly, stays 200) — since bead gateopener-41m.22 the journal's
+    /// capacity counts PRESS lines too (~6-8 per press), so the original
+    /// 200-line default would only retain roughly the last 25-30 presses.
+    ///
+    /// MUTATION CHECK: reverting `AppEnvironment.make()`'s
+    /// `OpenAttemptJournal(fileURL:capacity:)` call back to the
+    /// default-`capacity` initializer makes `environment.openAttemptJournal
+    /// ?.capacity` read `200` instead of `1000`, failing this test.
+    @Test func makeWiresOpenAttemptJournalWithCapacityOneThousand() {
+        let (defaults, cleanupDefaults) = makeInMemoryDefaults()
+        defer { cleanupDefaults() }
+        let (journalURL, cleanupJournal) = makeTempJournalURL()
+        defer { cleanupJournal() }
+
+        let environment = AppEnvironment.make(
+            defaults: defaults,
+            reachability: FakeReachabilityProviding(isReachable: true),
+            timelineReloader: {},
+            openAttemptJournalURL: journalURL
+        )
+
+        #expect(environment.openAttemptJournal?.capacity == 1000)
+    }
 }

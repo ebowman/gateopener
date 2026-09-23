@@ -169,7 +169,6 @@ public final class AppEnvironment {
         )
 
         let api = ComelitAPI()
-        let tokenManager = TokenManager(api: api, credentialStore: credentialStore)
 
         // Cross-process open-attempt journal (bead gateopener-41m.2). Only
         // built when this call is constructing a REAL `GateClient` (i.e.
@@ -179,6 +178,15 @@ public final class AppEnvironment {
         // branch keeps `environment.openAttemptJournal` honestly `nil`
         // rather than implying a journal is wired when nothing will ever
         // write to it.
+        //
+        // Computed BEFORE `tokenManager` (rather than after, as before this
+        // bead) so the journal instance is available to pass into
+        // `TokenManager.init(onResolved:onFailed:)` below -- wiring the
+        // press-phase hooks at construction time, rather than via a
+        // subsequent `await tokenManager.setOnResolved(...)` call (which
+        // `make()` cannot make itself, being synchronous), avoids any
+        // window where a press could call into `TokenManager
+        // .resolveAccessToken()` before the hooks are attached.
         let resolvedJournalURL: URL?
         if let openAttemptJournalURL {
             resolvedJournalURL = openAttemptJournalURL
@@ -186,16 +194,79 @@ public final class AppEnvironment {
             resolvedJournalURL = SharedContainer.openAttemptJournalURL()
         }
         let resolvedOpenAttemptJournal: OpenAttemptJournal?
+        if gateClient != nil {
+            resolvedOpenAttemptJournal = nil
+        } else if let resolvedJournalURL {
+            // `capacity: 1000` (Core's default is 200): since bead
+            // gateopener-41m.22 the journal's capacity counts PRESS lines
+            // too (~6-8 per press, not just one line per HTTP attempt), so
+            // the original 200-line default would trim press history down
+            // to only the last ~25-30 presses. Core's own default stays 200
+            // (its tests rely on it) -- only this production wiring raises
+            // it.
+            resolvedOpenAttemptJournal = OpenAttemptJournal(fileURL: resolvedJournalURL, capacity: 1000)
+        } else {
+            resolvedOpenAttemptJournal = nil
+        }
+
+        // Token-phase press journaling (bead gateopener-41m.23): these hooks
+        // fire synchronously from inside `TokenManager.resolveAccessToken()`
+        // -- called by `GateController.performOpen()`, itself called from
+        // inside `OpenGateFlow.run`'s `open()` closure, which is exactly the
+        // scope `OpenGateFlow.run` binds `OpenPressContext.pressId`/
+        // `pressStartedAt`/`pressSource` around (see that type's `run(...)`).
+        // If `OpenPressContext.pressId` is `nil` at call time (e.g. a
+        // `prewarm()` at app foreground, which runs entirely outside any
+        // press), nothing is written -- there is no press to attribute the
+        // phase to. `source` reads `OpenPressContext.pressSource` (falling
+        // back to "?") rather than a literal "intent", since the in-app path
+        // to `TokenManager` does not go through `OpenGateFlow.run` and so
+        // never binds that TaskLocal -- its token-phase lines read "?"
+        // accordingly. `process`/`appVersion` are captured once here (both
+        // are cheap, static-for-the-process-lifetime reads).
+        let process = Bundle.main.bundleIdentifier ?? "?"
+        let appVersion = AppVersion.current
+        let tokenManager = TokenManager(
+            api: api,
+            credentialStore: credentialStore,
+            onResolved: { resolution in
+                guard let pressId = OpenPressContext.pressId, let journal = resolvedOpenAttemptJournal else { return }
+                let elapsedMilliseconds = Int(max(0, Date().timeIntervalSince(OpenPressContext.pressStartedAt ?? Date())) * 1000)
+                journal.record(
+                    OpenPressRecord(
+                        pressId: pressId,
+                        timestamp: Date(),
+                        source: OpenPressContext.pressSource ?? "?",
+                        process: process,
+                        appVersion: appVersion,
+                        phase: .tokenResolved(kind: resolution.rawValue),
+                        elapsedMilliseconds: elapsedMilliseconds
+                    )
+                )
+            },
+            onFailed: { description in
+                guard let pressId = OpenPressContext.pressId, let journal = resolvedOpenAttemptJournal else { return }
+                let elapsedMilliseconds = Int(max(0, Date().timeIntervalSince(OpenPressContext.pressStartedAt ?? Date())) * 1000)
+                journal.record(
+                    OpenPressRecord(
+                        pressId: pressId,
+                        timestamp: Date(),
+                        source: OpenPressContext.pressSource ?? "?",
+                        process: process,
+                        appVersion: appVersion,
+                        phase: .tokenFailed(description: description),
+                        elapsedMilliseconds: elapsedMilliseconds
+                    )
+                )
+            }
+        )
+
         let resolvedGateClient: any GateOpening
         if let gateClient {
             resolvedGateClient = gateClient
-            resolvedOpenAttemptJournal = nil
-        } else if let resolvedJournalURL {
-            let journal = OpenAttemptJournal(fileURL: resolvedJournalURL)
-            resolvedOpenAttemptJournal = journal
-            resolvedGateClient = GateClient(tokenManager: tokenManager, attemptObserver: journal)
+        } else if let resolvedOpenAttemptJournal {
+            resolvedGateClient = GateClient(tokenManager: tokenManager, attemptObserver: resolvedOpenAttemptJournal)
         } else {
-            resolvedOpenAttemptJournal = nil
             resolvedGateClient = GateClient(tokenManager: tokenManager)
         }
         let resolvedReachability = reachability ?? NWPathMonitorReachability()

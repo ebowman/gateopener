@@ -193,7 +193,11 @@ public struct OpenGateFlow: Sendable {
         emit(.openStarted)
 
         let resultState = await OpenPressContext.$pressId.withValue(pressId) {
-            await raceAgainstTimeout(timeout: timeout, open: open)
+            await OpenPressContext.$pressStartedAt.withValue(pressStartedAt) {
+                await OpenPressContext.$pressSource.withValue(pressSource) {
+                    await raceAgainstTimeout(timeout: timeout, open: open)
+                }
+            }
         }
 
         let outcome: Outcome

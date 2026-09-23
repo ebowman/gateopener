@@ -156,6 +156,33 @@ final class MockTokenIssuing: TokenIssuing, @unchecked Sendable {
     }
 }
 
+/// Thread-safe recorder for `TokenManager.onResolved`/`onFailed` hook calls.
+final class TokenResolutionRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _resolved: [TokenResolution] = []
+    private var _failed: [String] = []
+
+    func recordResolved(_ resolution: TokenResolution) {
+        lock.lock(); defer { lock.unlock() }
+        _resolved.append(resolution)
+    }
+
+    func recordFailed(_ description: String) {
+        lock.lock(); defer { lock.unlock() }
+        _failed.append(description)
+    }
+
+    var resolved: [TokenResolution] {
+        lock.lock(); defer { lock.unlock() }
+        return _resolved
+    }
+
+    var failed: [String] {
+        lock.lock(); defer { lock.unlock() }
+        return _failed
+    }
+}
+
 // MARK: - Test helpers
 
 private func makeTokenSet(
@@ -645,6 +672,133 @@ private func makeTokenSet(
     #expect(persistedNew?.accessToken == "refreshed-token")
     let persistedOld = try oldStore.loadTokens()
     #expect(persistedOld?.accessToken == "old-token")
+}
+
+// MARK: - onResolved/onFailed hooks (gateopener-41m.23)
+
+@Test func onResolvedFiresWithCachedInMemoryOnSecondCall() async throws {
+    let store = MockCredentialStore()
+    let issuing = MockTokenIssuing()
+    let fresh = makeTokenSet(accessToken: "fresh-token", expiresIn: 3600)
+    try store.saveCredentials(username: "alice", password: "s3cret")
+    try store.saveTokens(fresh)
+
+    let manager = TokenManager(api: issuing, credentialStore: store)
+    let recorder = TokenResolutionRecorder()
+    await manager.setOnResolved(recorder.recordResolved)
+    await manager.setOnFailed(recorder.recordFailed)
+
+    _ = try await manager.accessToken() // .keychainValid, not asserted here
+    _ = try await manager.accessToken() // should be .cachedInMemory
+
+    #expect(recorder.resolved == [.keychainValid, .cachedInMemory])
+    #expect(recorder.failed.isEmpty)
+}
+
+@Test func onResolvedFiresWithKeychainValid() async throws {
+    let store = MockCredentialStore()
+    let issuing = MockTokenIssuing()
+    let comfortable = makeTokenSet(accessToken: "comfortable-token", expiresIn: 600)
+    try store.saveCredentials(username: "alice", password: "s3cret")
+    try store.saveTokens(comfortable)
+
+    let manager = TokenManager(api: issuing, credentialStore: store)
+    let recorder = TokenResolutionRecorder()
+    await manager.setOnResolved(recorder.recordResolved)
+
+    _ = try await manager.accessToken()
+
+    #expect(recorder.resolved == [.keychainValid])
+}
+
+@Test func onResolvedFiresWithRefreshed() async throws {
+    let store = MockCredentialStore()
+    let issuing = MockTokenIssuing()
+    let expired = makeTokenSet(accessToken: "old-token", expiresIn: -10)
+    let refreshed = makeTokenSet(accessToken: "refreshed-token", expiresIn: 3600)
+    try store.saveCredentials(username: "alice", password: "s3cret")
+    try store.saveTokens(expired)
+    issuing.refreshResult = .success(refreshed)
+
+    let manager = TokenManager(api: issuing, credentialStore: store)
+    let recorder = TokenResolutionRecorder()
+    await manager.setOnResolved(recorder.recordResolved)
+
+    _ = try await manager.accessToken()
+
+    #expect(recorder.resolved == [.refreshed])
+}
+
+@Test func onResolvedFiresWithLoggedIn() async throws {
+    let store = MockCredentialStore()
+    let issuing = MockTokenIssuing()
+    let loggedIn = makeTokenSet(accessToken: "login-token", expiresIn: 3600)
+    try store.saveCredentials(username: "alice", password: "s3cret")
+    issuing.loginResult = .success(loggedIn)
+
+    let manager = TokenManager(api: issuing, credentialStore: store)
+    let recorder = TokenResolutionRecorder()
+    await manager.setOnResolved(recorder.recordResolved)
+
+    _ = try await manager.accessToken()
+
+    #expect(recorder.resolved == [.loggedIn])
+}
+
+@Test func onResolvedFiresWithGraceUsed() async throws {
+    let store = MockCredentialStore()
+    let issuing = MockTokenIssuing()
+    let receivedAt = Date()
+    let nearExpiry = makeTokenSet(accessToken: "near-expiry", expiresIn: 120)
+    try store.saveCredentials(username: "alice", password: "s3cret")
+    try store.saveTokens(nearExpiry)
+    issuing.refreshResult = .failure(ComelitError.network("offline"))
+
+    let manager = TokenManager(api: issuing, credentialStore: store, now: { receivedAt })
+    let recorder = TokenResolutionRecorder()
+    await manager.setOnResolved(recorder.recordResolved)
+
+    _ = try await manager.accessToken()
+
+    #expect(recorder.resolved == [.graceUsed])
+}
+
+@Test func onFailedFiresWithSanitizedDescriptionAndNeverOnResolved() async throws {
+    let store = MockCredentialStore()
+    let issuing = MockTokenIssuing()
+    #expect(store.isEmpty)
+
+    let manager = TokenManager(api: issuing, credentialStore: store)
+    let recorder = TokenResolutionRecorder()
+    await manager.setOnResolved(recorder.recordResolved)
+    await manager.setOnFailed(recorder.recordFailed)
+
+    await #expect(throws: TokenManagerError.notConfigured) {
+        _ = try await manager.accessToken()
+    }
+
+    #expect(recorder.resolved.isEmpty)
+    #expect(recorder.failed.count == 1)
+    // Never the raw error description/response body -- just a short,
+    // sanitized label.
+    #expect(recorder.failed.first == "notConfigured")
+}
+
+@Test func onFailedFiresWithSanitizedInvalidCredentialsDescription() async throws {
+    let store = MockCredentialStore()
+    let issuing = MockTokenIssuing()
+    try store.saveCredentials(username: "alice", password: "wrong-password")
+    issuing.loginResult = .failure(ComelitError.invalidCredentials)
+
+    let manager = TokenManager(api: issuing, credentialStore: store)
+    let recorder = TokenResolutionRecorder()
+    await manager.setOnFailed(recorder.recordFailed)
+
+    await #expect(throws: ComelitError.invalidCredentials) {
+        _ = try await manager.accessToken()
+    }
+
+    #expect(recorder.failed == ["invalidCredentials"])
 }
 
 @Test func concurrentPrewarmAndAccessTokenCoalesceToOneRefresh() async throws {
