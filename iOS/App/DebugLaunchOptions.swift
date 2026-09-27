@@ -33,6 +33,7 @@ import os
 ///   - `--mock-video [<connectingSeconds> <streamingSeconds>]`: see
 ///     `mockVideoOnLaunch`/`mockVideoTimeline`.
 ///   - `--auto-pin-after <seconds>`: see `autoPinAfterSeconds`.
+///   - `--auto-call-after <seconds>`: see `autoCallAfterSeconds`.
 ///   - `--mic-probe`: see `micProbeOnLaunch`.
 enum DebugLaunchOptions {
     /// The fake `GateOpening` mode requested by `--mock-gate`, or `nil` if
@@ -74,6 +75,21 @@ enum DebugLaunchOptions {
     /// reconnecting/countdown states without UI automation.
     static var autoPinAfterSeconds: Double? {
         parseSecondsFlag("--auto-pin-after", in: ProcessInfo.processInfo.arguments)
+    }
+
+    /// Parses `--auto-call-after <seconds>` from the process's launch
+    /// arguments, mirroring `autoPinAfterSeconds`'s parsing exactly. Returns
+    /// `nil` if the argument is absent or malformed.
+    ///
+    /// DEBUG-only verification hook for bead gateopener-1pm.5's Talk/Mute/
+    /// Hang up UI: `MainView` schedules a single `doorVideoCoordinator
+    /// .startCall()` call after this delay, since the "Talk" button itself
+    /// needs a real tap, which `simctl launch` cannot perform — combined with
+    /// `--mock-gate ok --mock-video <connecting> <streaming>`, this lets a
+    /// screenshot script capture the placeholder-with-Talk, connecting-call,
+    /// and live-call (Hang up/Mute) states without UI automation.
+    static var autoCallAfterSeconds: Double? {
+        parseSecondsFlag("--auto-call-after", in: ProcessInfo.processInfo.arguments)
     }
 
     /// Shared single-`Double`-argument flag parser for `--auto-open-after`/

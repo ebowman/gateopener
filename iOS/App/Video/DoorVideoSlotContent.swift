@@ -67,6 +67,20 @@ enum DoorVideoSlotContent: Equatable {
         /// so the operator is never told video is continuous when the door
         /// actually enforces a ~15s gap between sessions.
         case reconnecting
+        /// Bead gateopener-1pm.5: a `.call` session (`isCall`) — or a
+        /// `.view` session in the process of being switched to a `.call`
+        /// (`pendingCall`) — is not yet `.streaming`. Takes priority over
+        /// `.reconnecting` (a call always reads "Connecting call…", never
+        /// the generic "Reconnecting…", even for a pinned call's later
+        /// renewals) but never over `.busyRetry`'s own door-busy-cooldown
+        /// window, which instead reports its remaining seconds through THIS
+        /// case's own `secondsRemaining` (non-`nil`, "Connecting call -
+        /// Ns") rather than `.busyRetry`'s generic "Door camera busy" text —
+        /// a call switch/start genuinely does wait out the SAME
+        /// registry cooldown a view session would, just narrated
+        /// call-appropriately. `nil` means no cooldown is in play right now:
+        /// "Connecting call…".
+        case connectingCall(secondsRemaining: Int?)
     }
 
     /// Pure derivation of what the slot should show.
@@ -105,6 +119,18 @@ enum DoorVideoSlotContent: Equatable {
     ///     auto-stopped itself; consulted only when there is no visible
     ///     session, taking priority over the plain "Tap to view door" text
     ///     but leaving the tap-to-view affordance/behavior unchanged.
+    ///   - isCall: `DoorVideoCoordinator.isCallActive` (bead gateopener-1pm.5)
+    ///     — the mounted session is a `.call`. Combined with `pendingCall`
+    ///     to decide `.connectingCall` (see that case's doc comment); takes
+    ///     priority over `.reconnecting` whenever both would otherwise
+    ///     apply, but never over `.busyRetry`'s cooldown window (which
+    ///     instead surfaces as `.connectingCall(secondsRemaining:)`'s own
+    ///     non-`nil` seconds, not `.busyRetry` itself, while `isCall` or
+    ///     `pendingCall` is `true`).
+    ///   - pendingCall: `DoorVideoCoordinator.pendingCall` (bead
+    ///     gateopener-1pm.5) — `true` while switching an in-progress `.view`
+    ///     session (or starting fresh) into a `.call` before it first reaches
+    ///     `.streaming`. See `isCall`'s doc comment above.
     ///   - now: Injected (rather than read via `Date()` internally) so this
     ///     stays a pure function callers can unit-test deterministically,
     ///     and so a `TimelineView`'s per-second tick can re-invoke it with a
@@ -144,6 +170,8 @@ enum DoorVideoSlotContent: Equatable {
         isPinned: Bool = false,
         isRenewal: Bool = false,
         pinStopMessage: String? = nil,
+        isCall: Bool = false,
+        pendingCall: Bool = false,
         now: Date
     ) -> DoorVideoSlotContent {
         guard hasVisibleSession else {
@@ -159,6 +187,7 @@ enum DoorVideoSlotContent: Equatable {
         }
 
         let showsReconnecting = isPinned && isRenewal
+        let showsConnectingCall = isCall || pendingCall
 
         switch sessionState {
         case .streaming:
@@ -172,12 +201,22 @@ enum DoorVideoSlotContent: Equatable {
                 // `cooldownUntil` is a hair in the future due to floating-
                 // point/clock granularity but the ceiling of the difference
                 // would otherwise round to 0.
-                //
-                // Busy-retry takes priority over `.reconnecting` (see
-                // `SessionOverlay.busyRetry`'s doc comment) — checked first
-                // regardless of `showsReconnecting`.
                 let remaining = max(1, Int(ceil(cooldownUntil.timeIntervalSince(now))))
+                // Bead gateopener-1pm.5: a call switch/start waits out the
+                // SAME registry cooldown a view session would — narrated as
+                // "Connecting call - Ns" rather than the generic "Door
+                // camera busy" text whenever `isCall`/`pendingCall`.
+                if showsConnectingCall {
+                    return .session(overlay: .connectingCall(secondsRemaining: remaining))
+                }
                 return .session(overlay: .busyRetry(secondsRemaining: remaining))
+            }
+            // `.connectingCall` (no cooldown) takes priority over
+            // `.reconnecting` — a call always reads "Connecting call…", even
+            // for a pinned call's later renewals, never the generic
+            // "Reconnecting…" text.
+            if showsConnectingCall {
+                return .session(overlay: .connectingCall(secondsRemaining: nil))
             }
             return .session(overlay: showsReconnecting ? .reconnecting : .none)
         case .failed:
@@ -185,9 +224,13 @@ enum DoorVideoSlotContent: Equatable {
             // keeps the failed session mounted with `hasVisibleSession ==
             // true` for up to `pinPolicy.failureBackoff` seconds — a REAL,
             // reachable path, not merely defensive. During that window the
-            // scrim must read "Reconnecting…", covering `DoorVideoView`'s
-            // own "Camera unavailable" text, so the operator is not told the
-            // pin has failed when it is about to retry.
+            // scrim must read "Reconnecting…" (or, for a call,
+            // "Connecting call…"), covering `DoorVideoView`'s own "Camera
+            // unavailable" text, so the operator is not told the pin has
+            // failed when it is about to retry.
+            if showsConnectingCall {
+                return .session(overlay: .connectingCall(secondsRemaining: nil))
+            }
             return .session(overlay: showsReconnecting ? .reconnecting : .none)
         case .ended:
             // Defensive only — `DoorVideoCoordinator.handleStateChange` sets

@@ -579,6 +579,22 @@ public final class DoorVideoSession: NSObject {
         offerAccepted = false
 
         #if DEBUG
+        // Bead gateopener-1pm.5: an EXPLICIT `.call` argument (as opposed to
+        // the default `.view` every pre-existing call site still passes)
+        // must flip a debug stub's `mode` BEFORE the early-return below runs
+        // its canned timeline — this is what lets `DoorVideoCoordinator
+        // .startCall()` request `.call` on a stub the app's `makeSession`
+        // factory built with no knowledge of which mode the coordinator
+        // would eventually ask for (see `GateOpenerIOSApp`'s `makeSession`
+        // closure). Guarded on `mode == .call` specifically (not "always
+        // assign") so every `DoorVideoSessionCallModeTests` call site that
+        // pre-configures a `.call` stub via `debugStub(mode: .call)` and
+        // then calls plain `start()` (argument defaults to `.view`) is
+        // UNAFFECTED — that omitted argument must never clobber the stub's
+        // pre-set mode back to `.view`.
+        if mode == .call {
+            self.mode = mode
+        }
         if let timeline = debugStubTimeline {
             await runDebugStubTimeline(timeline)
             return
@@ -839,6 +855,38 @@ public final class DoorVideoSession: NSObject {
             return
         }
         state = .ended
+    }
+
+    // MARK: - Call-mode page bridging (bead gateopener-1pm.5)
+
+    /// Thin bridge to `door-video.html`'s `window.setMicEnabled(enabled)`
+    /// (bead gateopener-1pm.3): toggles the acquired mic track's `.enabled`
+    /// flag without touching the peer connection or renegotiating. Called by
+    /// `DoorVideoCoordinator.setMicMuted(_:)`. A no-op for `.view` sessions
+    /// (no mic was ever acquired) and effectively a no-op for a DEBUG
+    /// `debugStub` session too (no real page was ever loaded, so this fires
+    /// a harmless `callAsyncJavaScript` against a blank `WKWebView`, caught
+    /// by `try?`).
+    public func setMicEnabled(_ enabled: Bool) {
+        guard mode == .call else { return }
+        Task { [weak webView] in
+            guard let webView else { return }
+            _ = try? await webView.callAsyncJavaScript(
+                "if (window.setMicEnabled) { window.setMicEnabled(\(enabled)); }",
+                contentWorld: .page
+            )
+        }
+    }
+
+    /// Thin, semantically-named alias for `stop()` (bead gateopener-1pm.5),
+    /// used by `DoorVideoCoordinator.hangUp()` — identical behavior (tears
+    /// down the peer connection via `window.hangUp()`/`Self.teardownJS`,
+    /// stopping any acquired mic track, and transitions to `.ended`, or
+    /// preserves an already-reported `.failed`), just named for the explicit
+    /// call-hang-up call site rather than the generic "stop this session"
+    /// one every other teardown path already uses.
+    public func hangUp() {
+        stop()
     }
 
     // MARK: - Camera endpoint selection

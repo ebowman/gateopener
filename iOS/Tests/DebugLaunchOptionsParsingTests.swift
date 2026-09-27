@@ -56,6 +56,16 @@ struct DebugLaunchOptionsParsingTests {
         #expect(DebugLaunchOptions.parseSecondsFlag("--auto-pin-after", in: arguments) == 9)
     }
 
+    /// `--auto-call-after <seconds>` (bead gateopener-1pm.5) parses through
+    /// the exact same shared `parseSecondsFlag` helper, distinct from
+    /// `--auto-pin-after`/`--auto-open-after` also present on the command
+    /// line.
+    @Test func parseSecondsFlagParsesAutoCallAfterDistinctFromOtherFlags() {
+        let arguments = ["app", "--auto-pin-after", "9", "--auto-call-after", "4"]
+        #expect(DebugLaunchOptions.parseSecondsFlag("--auto-call-after", in: arguments) == 4)
+        #expect(DebugLaunchOptions.parseSecondsFlag("--auto-pin-after", in: arguments) == 9)
+    }
+
     // MARK: - parseMockVideoTimeline (--mock-video [<connecting> <streaming>])
 
     /// MUTATION CHECK: swapping which of `flagIndex + 1`/`flagIndex + 2` maps
