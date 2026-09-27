@@ -102,15 +102,28 @@ final class RequestScript: @unchecked Sendable {
         self.init(responses: statuses.map { ScriptedResponse(status: $0) })
     }
 
+    /// Optional side-effect invoked on every request, INSIDE the lock-free
+    /// window between bookkeeping and returning the scripted response --
+    /// i.e. synchronously during `SequencedStubURLProtocol.startLoading()`,
+    /// which itself runs synchronously inside the `await session.data(for:)`
+    /// call `GateClient.open` is suspended on. Lets a test advance a
+    /// test-controlled clock so that clock only moves "during the request",
+    /// never during backoff sleep (which happens strictly after the request
+    /// completes and `report(...)` has already been called). `nil` by
+    /// default so every pre-existing use of `RequestScript` is unaffected.
+    var onRequest: (@Sendable () -> Void)?
+
     func nextResponse(forPath path: String, authorizationHeader: String?, timeoutInterval: TimeInterval) -> ScriptedResponse {
         lock.lock()
-        defer { lock.unlock() }
         requestCount += 1
         lastPath = path
         authorizationHeaders.append(authorizationHeader ?? "")
         timeoutIntervals.append(timeoutInterval)
         let response = responses[min(index, responses.count - 1)]
         index += 1
+        let hook = onRequest
+        lock.unlock()
+        hook?()
         return response
     }
 }
@@ -1150,4 +1163,173 @@ final class RecordingAttemptObserver: OpenAttemptObserving, @unchecked Sendable 
     let records = observer.records
     #expect(records.count == 1)
     #expect(records[0].pressId == nil)
+}
+
+// MARK: - gateopener-91s: elapsedMilliseconds excludes backoff sleep;
+// CancellationError propagates out of the retry loop without a spurious
+// record
+
+/// Thread-safe, fully-controlled fake clock. `advanceDuringRequest(by:)` is
+/// called from `RequestScript.onRequest` (i.e. synchronously inside
+/// `SequencedStubURLProtocol.startLoading()`, while `GateClient.open` is
+/// suspended awaiting the HTTP response) so its advance is bracketed exactly
+/// between `attemptStartedAt = now()` and `report`'s own `now()` call --
+/// i.e. it simulates "time passed while the request was in flight". A
+/// SEPARATE, distinguishably-sized advance is applied from the injected
+/// `RetryPolicy.sleep` closure, so a bug that measured elapsed time across
+/// the sleep (instead of only across the request) would inflate
+/// `elapsedMilliseconds` by that distinguishable amount and the test's exact
+/// equality assertions below would fail.
+final class FakeClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var current: Date
+
+    init(start: Date) {
+        self.current = start
+    }
+
+    func now() -> Date {
+        lock.lock()
+        defer { lock.unlock() }
+        return current
+    }
+
+    func advance(by seconds: TimeInterval) {
+        lock.lock()
+        current = current.addingTimeInterval(seconds)
+        lock.unlock()
+    }
+}
+
+/// Thread-safe monotonically-incrementing counter, used to index into
+/// `requestAdvances` below without triggering the Swift 6 "mutation of
+/// captured var in concurrently-executing code" diagnostic that a plain
+/// `var` capture would.
+final class GateClientTestsLockedCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = 0
+
+    func incrementAndGetPrevious() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        let previous = value
+        value += 1
+        return previous
+    }
+}
+
+/// (1) `elapsedMilliseconds` measures only time spent IN the HTTP request,
+/// never time spent sleeping between attempts.
+///
+/// MUTATION CHECK: if `GateClient.report`'s `startedAt` were captured before
+/// the PRECEDING attempt's backoff sleep (or if `elapsedMilliseconds` were
+/// otherwise measured across the sleep), the 5000ms sleep-only advance would
+/// leak into one or both records' `elapsedMilliseconds`, and the exact
+/// equality assertions below (250, then 750) would fail instead of matching
+/// the request-only advances.
+@Test func elapsedMillisecondsExcludesBackoffSleep() async throws {
+    let script = RequestScript(statuses: [500, 202])
+    let clock = FakeClock(start: Date(timeIntervalSince1970: 1_700_000_000))
+
+    // Distinguishable per-request advances: attempt 1 (failing 500) "takes"
+    // 250ms of request time, attempt 2 (succeeding 202) "takes" 750ms.
+    let requestAdvances: [TimeInterval] = [0.250, 0.750]
+    let requestAdvanceCounter = GateClientTestsLockedCounter()
+    script.onRequest = {
+        let i = requestAdvanceCounter.incrementAndGetPrevious()
+        clock.advance(by: requestAdvances[min(i, requestAdvances.count - 1)])
+    }
+
+    let session = makeSequencedSession(script: script)
+    let (tokenManager, _) = makeTokenManager()
+    let observer = RecordingAttemptObserver()
+
+    // Sleep advances the SAME clock by a large, distinguishable amount
+    // (5000ms) that must NOT show up in either record's
+    // `elapsedMilliseconds` -- proving the measurement window excludes
+    // backoff sleep entirely.
+    let retryPolicy = RetryPolicy(
+        maxAttempts: 2,
+        baseDelay: .milliseconds(1),
+        maxTotalDelay: .seconds(10),
+        requestTimeouts: [.seconds(3)],
+        sleep: { _ in clock.advance(by: 5.0) }
+    )
+
+    let client = GateClient(
+        session: session,
+        tokenManager: tokenManager,
+        retryPolicy: retryPolicy,
+        attemptObserver: observer,
+        now: { clock.now() }
+    )
+
+    try await client.open(endpointId: "VIP#OD#SB100001.1")
+
+    #expect(script.requestCount == 2)
+    let records = observer.records
+    #expect(records.count == 2)
+    #expect(records[0].outcome == .httpFailure(status: 500))
+    #expect(records[0].elapsedMilliseconds == 250)
+    #expect(records[1].outcome == .success(status: 202))
+    #expect(records[1].elapsedMilliseconds == 750)
+}
+
+/// (2) `CancellationError` thrown by the injected `RetryPolicy.sleep`
+/// (i.e. during backoff, after a retryable 500) propagates out of
+/// `open()` AS `CancellationError` -- not wrapped/mapped into a
+/// `ComelitError` -- and the cancelled retry never happens: exactly one
+/// HTTP request is made, and the observer has exactly one record (the
+/// initial 500 attempt, `willRetry: true`); there is no record for the
+/// cancelled second attempt, since no outcome was ever decided for it.
+///
+/// Catch-order finding (confirmed by reading `GateClient.open`): the
+/// `catch` block's FIRST statement is `if error is CancellationError {
+/// throw error }`, which runs before the `RawTransportError`/`ComelitError`
+/// classification/reporting below it. `backoffAndAdvance` (called from
+/// inside the same `do` block that the retry-continue path runs in) awaits
+/// `retryPolicy.sleep`, so a `CancellationError` thrown there is caught by
+/// that same `catch` and rethrown immediately at that first line, before
+/// any further reporting and before the loop ever `continue`s to a second
+/// request.
+///
+/// MUTATION CHECK: temporarily removing the `if error is CancellationError
+/// { throw error }` rethrow causes `CancellationError` to fall through to
+/// the `else` branch (neither `RawTransportError` nor `ComelitError`),
+/// which classifies it as a fallback `ComelitError.network(...)`, reports a
+/// SECOND record, and retries with a second HTTP request instead of
+/// propagating cancellation -- i.e. `open()` throws `ComelitError`, not
+/// `CancellationError`, `script.requestCount == 2`, and
+/// `observer.records.count == 2`. 
+@Test func cancellationDuringBackoffPropagatesWithoutFurtherRequestsOrRecords() async throws {
+    let script = RequestScript(statuses: [500, 202])
+    let session = makeSequencedSession(script: script)
+
+    let (tokenManager, _) = makeTokenManager()
+    let observer = RecordingAttemptObserver()
+
+    let retryPolicy = RetryPolicy(
+        maxAttempts: 2,
+        baseDelay: .milliseconds(1),
+        maxTotalDelay: .seconds(10),
+        requestTimeouts: [.seconds(3)],
+        sleep: { _ in throw CancellationError() }
+    )
+
+    let client = GateClient(
+        session: session,
+        tokenManager: tokenManager,
+        retryPolicy: retryPolicy,
+        attemptObserver: observer
+    )
+
+    await #expect(throws: CancellationError.self) {
+        try await client.open(endpointId: "VIP#OD#SB100001.1")
+    }
+
+    #expect(script.requestCount == 1)
+    let records = observer.records
+    #expect(records.count == 1)
+    #expect(records[0].outcome == .httpFailure(status: 500))
+    #expect(records[0].willRetry == true)
 }
