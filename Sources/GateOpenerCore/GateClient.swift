@@ -502,8 +502,7 @@ public struct GateClient: Sendable {
             // schedule is exhausted the last value is reused for any
             // further attempts.
             let timeoutForAttempt = retryPolicy.requestTimeouts[min(attempt - 1, retryPolicy.requestTimeouts.count - 1)]
-            request.timeoutInterval = TimeInterval(timeoutForAttempt.components.seconds)
-                + Double(timeoutForAttempt.components.attoseconds) / 1e18
+            request.timeoutInterval = timeoutForAttempt.timeInterval
 
             do {
                 let token = try await tokenManager.accessToken()

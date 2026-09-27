@@ -77,7 +77,7 @@ struct OpenHistoryView: View {
                         } label: {
                             HStack {
                                 VStack(alignment: .leading, spacing: 2) {
-                                    Text(Self.groupHeaderDateFormatter.string(from: group.time))
+                                    Text(Self.makeGroupHeaderDateFormatter().string(from: group.time))
                                     Text(group.sourceLabel)
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
@@ -411,11 +411,15 @@ struct OpenHistoryView: View {
     /// caller-supplied `prefix` line (e.g. "GateOpener 1.0 (10) — Sep 21,
     /// 2026 at 9:00 AM").
     nonisolated static func shareText(for entries: [OpenJournalEntry], prefix: String) -> String {
+        let dateFormatter = makeGroupHeaderDateFormatter()
         var lines = [prefix, ""]
         for group in groups(from: entries) {
-            lines.append("\(groupHeaderDateFormatter.string(from: group.time)) — \(group.sourceLabel) — \(resultBadge(for: group))")
+            lines.append("\(dateFormatter.string(from: group.time)) — \(group.sourceLabel) — \(resultBadge(for: group))")
             for line in timelineLines(for: group) {
                 lines.append("  \(line)")
+            }
+            if group.resultBadge == "Unfinished" {
+                lines.append("  \(unfinishedFootnote)")
             }
             lines.append("")
         }
@@ -427,10 +431,15 @@ struct OpenHistoryView: View {
         return lines.joined(separator: "\n")
     }
 
-    private static let groupHeaderDateFormatter: DateFormatter = {
+    /// Builds a fresh `DateFormatter` per call: `DateFormatter` is not
+    /// `Sendable`, so a single shared instance can't safely be read from a
+    /// `nonisolated` context (like `shareText(for:prefix:)`) as well as the
+    /// `@MainActor`-isolated view body. Constructing one per call is cheap at
+    /// the volume of history entries this view deals with.
+    nonisolated static func makeGroupHeaderDateFormatter() -> DateFormatter {
         let formatter = DateFormatter()
         formatter.dateStyle = .medium
         formatter.timeStyle = .short
         return formatter
-    }()
+    }
 }

@@ -133,7 +133,7 @@ public struct ComelitAPI: Sendable {
         request.setValue("application/json", forHTTPHeaderField: "content-type")
         request.setValue(Self.userAgent, forHTTPHeaderField: "user-agent")
         request.setValue("application/json,application/xml,text/xml", forHTTPHeaderField: "accept")
-        request.timeoutInterval = TimeInterval(requestTimeout.components.seconds)
+        request.timeoutInterval = requestTimeout.timeInterval
         do {
             request.httpBody = try JSONSerialization.data(withJSONObject: body)
         } catch {
@@ -343,7 +343,7 @@ public struct ComelitAPI: Sendable {
         )
         request.setValue(Self.userAgent, forHTTPHeaderField: "user-agent")
         request.setValue("application/json", forHTTPHeaderField: "accept")
-        request.timeoutInterval = TimeInterval(requestTimeout.components.seconds)
+        request.timeoutInterval = requestTimeout.timeInterval
         request.httpBody = Self.formURLEncode(form).data(using: .utf8)
 
         do {

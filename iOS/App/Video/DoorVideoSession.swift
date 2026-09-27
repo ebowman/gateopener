@@ -107,6 +107,24 @@ public final class DoorVideoSession: NSObject {
     private static let stunHost = "stun.cloud.comelitgroup.com"
     private static let stunPort = 3478
 
+    /// Per-attempt bound on the `rtc/offer` PUT, matching macOS's
+    /// `DoorVideoSession.putOfferOnce` exactly. `internal` (not `private`)
+    /// so `@testable import GateOpener` test targets can assert the built
+    /// request carries this value without exercising a real `URLSession`
+    /// round trip.
+    ///
+    /// Set explicitly on the REQUEST (not relying on the session's
+    /// configuration): `URLRequest.timeoutInterval` takes precedence over
+    /// `URLSessionConfiguration.timeoutIntervalForRequest` for the request
+    /// it is set on, per Foundation's documented behavior, so this is
+    /// effective regardless of the session's configuration UNLESS that
+    /// configuration's `timeoutIntervalForRequest` is somehow shorter than
+    /// this and takes priority in some undocumented edge case -- the real
+    /// call sites use `URLSession.shared`, whose default configuration's
+    /// `timeoutIntervalForRequest` is 60s (longer than this), so this
+    /// request-level timeout is the binding one in practice.
+    static let offerTimeout: TimeInterval = 12
+
     /// Hard ceiling on total session length, matching the door's own
     /// ~28-30s streaming window plus slack — measured on macOS against the
     /// same hardware/protocol (bd memory `gateopener-live-video-
@@ -1055,6 +1073,37 @@ public final class DoorVideoSession: NSObject {
         }
     }
 
+    /// Builds the `URLRequest` for a single `rtc/offer` PUT attempt — a
+    /// pure, `WKWebView`/network-free seam so the request's shape
+    /// (method, headers, endpoint percent-encoding, JSON body,
+    /// `timeoutInterval`) can be asserted in a test without an actual
+    /// `URLSession` round trip. `internal` (not `private`) so `@testable
+    /// import GateOpener` test targets can call it directly.
+    ///
+    /// Returns `nil` on a malformed URL or a JSON-encoding failure of the
+    /// body — both unreachable-in-practice programmer-error paths, matching
+    /// `putOfferOnce`'s `.network` fallback for either case.
+    static func makeOfferRequest(endpointId: String, sessionId: String, offerSDP: String, token: String) -> URLRequest? {
+        // '#' -> %23 only, matching the proven recipe (NOT full percent
+        // encoding, which the door's signaling backend does not expect).
+        let encodedEndpoint = endpointId.replacingOccurrences(of: "#", with: "%23")
+        guard let url = URL(string: "\(ComelitAPI.baseURL)/servicerest/devicecom/endpoint/\(encodedEndpoint)/rtc/offer") else {
+            return nil
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "PUT"
+        request.timeoutInterval = Self.offerTimeout
+        request.setValue("bearer \(token)", forHTTPHeaderField: "authorization")
+        request.setValue("application/json", forHTTPHeaderField: "content-type")
+        request.setValue("ktor-client", forHTTPHeaderField: "user-agent")
+        let body: [String: String] = ["sessionId": sessionId, "offer": offerSDP]
+        guard let httpBody = try? JSONSerialization.data(withJSONObject: body) else {
+            return nil
+        }
+        request.httpBody = httpBody
+        return request
+    }
+
     /// A single `rtc/offer` PUT attempt, classified via
     /// `DoorVideoBusyPolicy.classify(httpStatus:transportError:)` rather than
     /// thrown as a raw HTTP-status/transport `Error` — mirrors macOS's
@@ -1067,22 +1116,9 @@ public final class DoorVideoSession: NSObject {
         sdp: String,
         sessionId: String
     ) async -> (outcome: DoorVideoBusyPolicy.OfferOutcome, answer: String?) {
-        // '#' -> %23 only, matching the proven recipe (NOT full percent
-        // encoding, which the door's signaling backend does not expect).
-        let encodedEndpoint = endpointId.replacingOccurrences(of: "#", with: "%23")
-        guard let url = URL(string: "\(ComelitAPI.baseURL)/servicerest/devicecom/endpoint/\(encodedEndpoint)/rtc/offer") else {
+        guard let request = Self.makeOfferRequest(endpointId: endpointId, sessionId: sessionId, offerSDP: sdp, token: token) else {
             return (.network, nil)
         }
-        var request = URLRequest(url: url)
-        request.httpMethod = "PUT"
-        request.setValue("bearer \(token)", forHTTPHeaderField: "authorization")
-        request.setValue("application/json", forHTTPHeaderField: "content-type")
-        request.setValue("ktor-client", forHTTPHeaderField: "user-agent")
-        let body: [String: String] = ["sessionId": sessionId, "offer": sdp]
-        guard let httpBody = try? JSONSerialization.data(withJSONObject: body) else {
-            return (.network, nil)
-        }
-        request.httpBody = httpBody
 
         let (data, response): (Data, URLResponse)
         do {

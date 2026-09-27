@@ -3,6 +3,99 @@ import Testing
 import GateOpenerCore
 @testable import GateOpener
 
+/// A `renewSleep` test double that PARKS on a continuation instead of
+/// actually sleeping, and that genuinely responds to the surrounding
+/// `Task`'s cancellation by THROWING `CancellationError` out of the parked
+/// call -- unlike `DoorVideoCoordinatorPinTests.instantRenewSleep` (which
+/// returns immediately and can never observe a `renewTask?.cancel()`) and
+/// unlike `Tests/GateOpenerCoreTests/GateControllerTests.swift`'s
+/// `GatedSleep` (which parks on a plain `withCheckedContinuation` that is
+/// only ever resumed by an explicit `advance()`/`release()` call, never by
+/// task cancellation). This is essential for proving `DoorVideoCoordinator`
+/// actually calls `renewTask?.cancel()` on the pending backoff task, as
+/// opposed to merely discarding its reference (which would leave the parked
+/// sleep running forever and the test hanging, or -- for `instantRenewSleep`
+/// -- never parked in the first place).
+///
+/// `withTaskCancellationHandler`'s `onCancel` closure fires synchronously
+/// the moment the enclosing task is cancelled (even before the parked
+/// continuation is ever resumed a normal way), so it is used here to resume
+/// the continuation itself, making the parked `await` throw
+/// `CancellationError` -- exactly what a cancelled `Task.sleep(for:)` does in
+/// production.
+final class GatedRenewSleep: @unchecked Sendable {
+    private let lock = NSLock()
+    private var pendingContinuation: CheckedContinuation<Void, Error>?
+    private(set) var wasCancelled = false
+    private(set) var didPark = false
+
+    /// Suitable for `DoorVideoCoordinator(renewSleep:)`. Parks until either
+    /// `release()` is called (resumes normally, mirroring a real sleep
+    /// elapsing) or the enclosing `Task` is cancelled (resumes by throwing
+    /// `CancellationError`, mirroring a real `Task.sleep(for:)` being
+    /// cancelled).
+    func sleep(_ duration: Duration) async throws {
+        markParked()
+
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                self.storeContinuation(continuation)
+            }
+        } onCancel: { [weak self] in
+            self?.cancelPendingContinuation()
+        }
+    }
+
+    /// Resumes the parked sleep normally (as if the backoff duration simply
+    /// elapsed). No-op if nothing is currently parked, or if cancellation
+    /// already resumed it.
+    func release() {
+        takePendingContinuation()?.resume()
+    }
+
+    /// True once `sleep(_:)` has been entered and is currently parked
+    /// waiting on either `release()` or cancellation.
+    func isParked() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return pendingContinuation != nil
+    }
+
+    // MARK: - synchronous, lock-guarded helpers (never called from an
+    // `async` context directly -- `NSLock.lock()/unlock()` are unavailable
+    // there; each call site above hops into one of these plain synchronous
+    // methods instead).
+
+    private func markParked() {
+        lock.lock()
+        defer { lock.unlock() }
+        didPark = true
+    }
+
+    private func storeContinuation(_ continuation: CheckedContinuation<Void, Error>) {
+        lock.lock()
+        defer { lock.unlock() }
+        pendingContinuation = continuation
+    }
+
+    private func takePendingContinuation() -> CheckedContinuation<Void, Error>? {
+        lock.lock()
+        defer { lock.unlock() }
+        let continuation = pendingContinuation
+        pendingContinuation = nil
+        return continuation
+    }
+
+    private func cancelPendingContinuation() {
+        lock.lock()
+        let continuation = pendingContinuation
+        pendingContinuation = nil
+        wasCancelled = true
+        lock.unlock()
+        continuation?.resume(throwing: CancellationError())
+    }
+}
+
 /// Tests for `DoorVideoCoordinator`'s pin state and bounded session renewal
 /// (bead gateopener-41m.14): `setPinned(_:)`, `pinPolicy`-driven renew/stop
 /// decisions on `.ended`/`.failed`, and the pin's interaction with
@@ -295,36 +388,47 @@ struct DoorVideoCoordinatorPinTests {
 
     // MARK: - dismiss() while pinned -> unpinned, no further sessions even after renew delay
 
+    /// Uses a `GatedRenewSleep` (never released) instead of a real 5s
+    /// backoff, so this test is deterministic: any incorrect renewal firing
+    /// would have to come from the abandoned/uncancelled backoff task
+    /// itself, not from a wall-clock race against a short test sleep.
+    ///
     /// MUTATION CHECK: removing `isPinned = false` from `dismiss()` would
-    /// leave the pin active; if the pending renew task were not cancelled
-    /// either, `sessionStartCount` would grow past 1 once the (non-instant)
-    /// backoff elapses.
+    /// leave the pin active, but -- since `dismiss()` unconditionally
+    /// cancels `renewTask` regardless of `isPinned` -- would NOT by itself
+    /// make a second session start here; this MUTATION alone still passes,
+    /// which is expected (see `dismissCancelsPendingBackoffRenewal` below for
+    /// the test that actually pins down `dismiss()`'s `renewTask?.cancel()`
+    /// call).
     @Test func dismissWhilePinnedUnpinsAndPreventsFurtherSessions() async {
         var callCount = 0
+        let gatedSleep = GatedRenewSleep()
         let coordinator = DoorVideoCoordinator(
             makeSession: {
                 defer { callCount += 1 }
                 return DoorVideoSession.debugStub(connectingDelay: 0.02, failAfter: "boom")
             },
             isEnabled: { true },
-            pinPolicy: DoorVideoPinPolicy(maxConsecutiveFailures: 3, failureBackoff: 5)
-            // Real renewSleep (not instant): the backoff must still be
-            // pending when dismiss() arrives below, otherwise this test
-            // would not actually exercise cancellation.
+            pinPolicy: DoorVideoPinPolicy(maxConsecutiveFailures: 3, failureBackoff: 5),
+            renewSleep: gatedSleep.sleep
         )
 
         coordinator.setPinned(true)
         await waitUntil { coordinator.sessionStartCount == 1 }
-        // Let the first session fail and enter its (real, 5s) backoff wait.
+        // Let the first session fail and enter its backoff wait, parked on
+        // `gatedSleep` (never released).
         await waitUntil(timeout: 1) { coordinator.session?.state.phase == .failed }
+        await waitUntil(timeout: 1) { gatedSleep.isParked() }
 
         coordinator.dismiss()
 
         #expect(coordinator.isPinned == false)
 
-        // Wait comfortably longer than a mistaken short backoff (but well
-        // under the real 5s one) to prove no renewal sneaks through.
-        try? await Task.sleep(for: .milliseconds(300))
+        // Give any (incorrect) renewal a chance to run -- the gate is never
+        // released, so a correct implementation can only ever observe
+        // `sessionStartCount == 1` here.
+        await Task.yield()
+        try? await Task.sleep(for: .milliseconds(20))
 
         #expect(coordinator.sessionStartCount == 1)
         #expect(coordinator.session == nil)
@@ -332,13 +436,26 @@ struct DoorVideoCoordinatorPinTests {
 
     // MARK: - startForOpen() during a backoff wait -> exactly one new session
 
-    /// MUTATION CHECK: removing `renewTask?.cancel(); renewTask = nil` from
-    /// `DoorVideoCoordinator.startOrRetain()` would let the pending renewal
-    /// ALSO fire once its backoff elapses, producing a second, unwanted
-    /// session on top of the one `startForOpen()` triggers here -- observed
-    /// as `sessionStartCount` exceeding 2.
+    /// Uses a `GatedRenewSleep` (rather than a real multi-second backoff) so
+    /// the pending renewal is DETERMINISTICALLY still parked, mid-backoff,
+    /// when `startForOpen()` arrives below -- no wall-clock race between a
+    /// short test sleep and the real backoff duration.
+    ///
+    /// NOTE: this test's own MUTATION CHECK claim used to be false --
+    /// removing `renewTask?.cancel(); renewTask = nil` from
+    /// `DoorVideoCoordinator.startOrRetain()` alone does NOT fail this test,
+    /// because with a real (or gated-but-never-released) `renewSleep` the
+    /// orphaned backoff task simply never resumes within this test's
+    /// lifetime, so no second renewal ever fires for it to observe. The
+    /// cancellation itself is proven separately and directly by
+    /// `startOrRetainCancelsPendingBackoffRenewal` below (which asserts
+    /// `gatedSleep.wasCancelled` on the SAME task this test exercises); this
+    /// test's own job is narrower: proving `startForOpen()` during a backoff
+    /// wait starts exactly one new session, regardless of whether the old
+    /// backoff task is cancelled or merely abandoned.
     @Test func startForOpenDuringBackoffWaitStartsExactlyOneNewSession() async {
         var callCount = 0
+        let gatedSleep = GatedRenewSleep()
         let coordinator = DoorVideoCoordinator(
             makeSession: {
                 defer { callCount += 1 }
@@ -348,25 +465,28 @@ struct DoorVideoCoordinatorPinTests {
                 return DoorVideoSession.debugStub(connectingDelay: 10, streamingDuration: 10)
             },
             isEnabled: { true },
-            pinPolicy: DoorVideoPinPolicy(maxConsecutiveFailures: 5, failureBackoff: 5)
-            // Real renewSleep (not instant): the backoff must still be
-            // pending when startForOpen() arrives below.
+            pinPolicy: DoorVideoPinPolicy(maxConsecutiveFailures: 5, failureBackoff: 5),
+            renewSleep: gatedSleep.sleep
         )
 
         coordinator.setPinned(true)
         await waitUntil { coordinator.sessionStartCount == 1 }
         await waitUntil(timeout: 1) { coordinator.session?.state.phase == .failed }
+        await waitUntil(timeout: 1) { gatedSleep.isParked() }
 
-        // The pinned session failed and is backing off (5s); a user-driven
-        // startForOpen() arrives during that wait.
+        // The pinned session failed and is backing off (parked on
+        // `gatedSleep`, never released); a user-driven startForOpen()
+        // arrives during that wait.
         coordinator.startForOpen()
         await Task.yield()
 
         #expect(coordinator.sessionStartCount == 2)
 
-        // Wait past the original backoff window to prove the cancelled
-        // renewal never ALSO fires a third session.
-        try? await Task.sleep(for: .milliseconds(200))
+        // Give any (incorrect) delayed renewal a chance to run -- the gate
+        // is never released, so a correct implementation can only reach
+        // `sessionStartCount == 2` via `startForOpen()`'s own replacement.
+        await Task.yield()
+        try? await Task.sleep(for: .milliseconds(20))
         #expect(coordinator.sessionStartCount == 2)
     }
 
@@ -674,5 +794,154 @@ struct DoorVideoCoordinatorPinTests {
 
         #expect(coordinator.pinRenewalCount == 0)
         #expect(coordinator.isRenewing == false)
+    }
+
+    // MARK: - renewTask cancellation during backoff (GatedRenewSleep)
+
+    /// A pending backoff renewal parked in `renewSleep` is genuinely
+    /// CANCELLED (its sleep throws `CancellationError`, observed via
+    /// `gatedSleep.wasCancelled`) when a new user/foreground-initiated start
+    /// arrives via `viewDoor()` -> `startOrRetain()`, and exactly one new
+    /// session starts as a result.
+    ///
+    /// MUTATION CHECK: removing `renewTask?.cancel(); renewTask = nil` from
+    /// `DoorVideoCoordinator.startOrRetain()` (around line 414) would leave
+    /// `gatedSleep.wasCancelled == false` (the parked sleep is simply
+    /// abandoned, never cancelled) -- failing the first assertion below --
+    /// while `sessionStartCount` would still read `2` at the moment of the
+    /// assertion (the orphaned backoff task's own eventual resumption would
+    /// only be observed by racing a real/advanced sleep, which this test
+    /// does not do), so the cancellation assertion is what this mutation
+    /// actually catches, not the count.
+    @Test func startOrRetainCancelsPendingBackoffRenewal() async {
+        var callCount = 0
+        let gatedSleep = GatedRenewSleep()
+        let coordinator = DoorVideoCoordinator(
+            makeSession: {
+                defer { callCount += 1 }
+                if callCount == 0 {
+                    return DoorVideoSession.debugStub(connectingDelay: 0.02, failAfter: "boom")
+                }
+                return DoorVideoSession.debugStub(connectingDelay: 10, streamingDuration: 10)
+            },
+            isEnabled: { true },
+            pinPolicy: DoorVideoPinPolicy(maxConsecutiveFailures: 5, failureBackoff: 5),
+            renewSleep: gatedSleep.sleep
+        )
+
+        coordinator.setPinned(true)
+        await waitUntil { coordinator.sessionStartCount == 1 }
+        await waitUntil(timeout: 1) { coordinator.session?.state.phase == .failed }
+        await waitUntil(timeout: 1) { gatedSleep.isParked() }
+
+        // A user-driven "View door" tap arrives mid-backoff.
+        coordinator.viewDoor()
+        await waitUntil(timeout: 1) { gatedSleep.wasCancelled }
+
+        #expect(gatedSleep.wasCancelled == true)
+        #expect(coordinator.sessionStartCount == 2)
+    }
+
+    /// A pending backoff renewal is CANCELLED when `dismiss()` arrives
+    /// mid-backoff, and no new session starts as a result (the pin is torn
+    /// down entirely, not renewed).
+    ///
+    /// MUTATION CHECK: removing `renewTask?.cancel(); renewTask = nil` from
+    /// `DoorVideoCoordinator.dismiss()` would leave `gatedSleep.wasCancelled
+    /// == false`, failing the first assertion below.
+    @Test func dismissCancelsPendingBackoffRenewal() async {
+        let gatedSleep = GatedRenewSleep()
+        let coordinator = DoorVideoCoordinator(
+            makeSession: { DoorVideoSession.debugStub(connectingDelay: 0.02, failAfter: "boom") },
+            isEnabled: { true },
+            pinPolicy: DoorVideoPinPolicy(maxConsecutiveFailures: 5, failureBackoff: 5),
+            renewSleep: gatedSleep.sleep
+        )
+
+        coordinator.setPinned(true)
+        await waitUntil(timeout: 1) { coordinator.session?.state.phase == .failed }
+        await waitUntil(timeout: 1) { gatedSleep.isParked() }
+
+        coordinator.dismiss()
+        await waitUntil(timeout: 1) { gatedSleep.wasCancelled }
+
+        #expect(gatedSleep.wasCancelled == true)
+
+        // Give any (incorrect) delayed renewal a chance to run.
+        await Task.yield()
+        try? await Task.sleep(for: .milliseconds(20))
+        #expect(coordinator.sessionStartCount == 1)
+    }
+
+    /// A pending backoff renewal is CANCELLED when `setPinned(false)` arrives
+    /// mid-backoff, and no new session starts as a result.
+    ///
+    /// MUTATION CHECK: removing `renewTask?.cancel(); renewTask = nil` from
+    /// `DoorVideoCoordinator.setPinned(_:)`'s `false` branch would leave
+    /// `gatedSleep.wasCancelled == false`, failing the first assertion below.
+    @Test func setPinnedFalseCancelsPendingBackoffRenewal() async {
+        let gatedSleep = GatedRenewSleep()
+        let coordinator = DoorVideoCoordinator(
+            makeSession: { DoorVideoSession.debugStub(connectingDelay: 0.02, failAfter: "boom") },
+            isEnabled: { true },
+            pinPolicy: DoorVideoPinPolicy(maxConsecutiveFailures: 5, failureBackoff: 5),
+            renewSleep: gatedSleep.sleep
+        )
+
+        coordinator.setPinned(true)
+        await waitUntil(timeout: 1) { coordinator.session?.state.phase == .failed }
+        await waitUntil(timeout: 1) { gatedSleep.isParked() }
+
+        coordinator.setPinned(false)
+        await waitUntil(timeout: 1) { gatedSleep.wasCancelled }
+
+        #expect(gatedSleep.wasCancelled == true)
+
+        // Give any (incorrect) delayed renewal a chance to run.
+        await Task.yield()
+        try? await Task.sleep(for: .milliseconds(20))
+        #expect(coordinator.sessionStartCount == 1)
+    }
+
+    // MARK: - fresh DoorVideoSession instance on renewal
+
+    /// Across a `.renew(after: 0)` seam, the replacement `session` is a
+    /// GENUINELY FRESH `DoorVideoSession` instance (a new `makeSession()`
+    /// call), never the just-ended instance reused via its own `start()` --
+    /// a reused instance's script message handlers/navigation delegate are
+    /// torn down by `stop()`/`endDueToLiveness` and would be silently
+    /// broken. Checked two ways: `ObjectIdentifier` differs, and the
+    /// `makeSession` factory's own call count increments by exactly one
+    /// across the seam.
+    ///
+    /// MUTATION CHECK: making the `.renew(after: 0)` path call `.start()` on
+    /// the OLD (just-ended) session instance again, instead of
+    /// `startSession(resetPanelVisible: false)` building a fresh one via
+    /// `makeSession()`, would leave `ObjectIdentifier(coordinator.session!)`
+    /// unchanged across the seam and `factoryCallCount.value` stuck at `1`,
+    /// failing both assertions below. Verified by actually applying this
+    /// mutation, confirming the failure, then restoring the original code.
+    @Test func renewalSeamProducesFreshSessionInstance() async {
+        var callCount = 0
+        let coordinator = DoorVideoCoordinator(
+            makeSession: {
+                defer { callCount += 1 }
+                return callCount == 0
+                    ? DoorVideoSession.debugStub(connectingDelay: 0.02, streamingDuration: 0.02)
+                    : DoorVideoSession.debugStub(connectingDelay: 10, streamingDuration: 10)
+            },
+            isEnabled: { true }
+        )
+
+        coordinator.setPinned(true)
+        await waitUntil { coordinator.sessionStartCount == 1 }
+        let firstSessionID = ObjectIdentifier(coordinator.session!)
+        let callCountAfterFirstStart = callCount
+
+        await waitUntil { coordinator.sessionStartCount == 2 }
+        let secondSessionID = ObjectIdentifier(coordinator.session!)
+
+        #expect(secondSessionID != firstSessionID)
+        #expect(callCount == callCountAfterFirstStart + 1)
     }
 }

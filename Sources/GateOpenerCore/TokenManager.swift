@@ -160,8 +160,7 @@ public actor TokenManager {
         }
 
         let referenceNow = now()
-        let windowSeconds = TimeInterval(window.components.seconds)
-            + TimeInterval(window.components.attoseconds) / 1e18
+        let windowSeconds = window.timeInterval
         guard stored.expiresAt <= referenceNow.addingTimeInterval(windowSeconds) else {
             return
         }
@@ -260,13 +259,13 @@ public actor TokenManager {
     }
 
     private func resolveAccessTokenCore() async throws -> (String, TokenResolution) {
-        if let cached = cachedToken, !cached.isExpired() {
+        if let cached = cachedToken, !cached.isExpired(now: now()) {
             return (cached.accessToken, .cachedInMemory)
         }
 
         let stored = try credentialStore.loadTokens()
 
-        if let stored, !stored.isExpired() {
+        if let stored, !stored.isExpired(now: now()) {
             cachedToken = stored
             return (stored.accessToken, .keychainValid)
         }
@@ -276,8 +275,14 @@ public actor TokenManager {
         if let refreshable = stored ?? cachedToken, refreshable.refreshToken != nil {
             do {
                 let refreshed = try await api.refresh(refreshable)
-                try credentialStore.saveTokens(refreshed)
+                // The refresh itself succeeded -- the fresh token is good
+                // and must not be thrown away over a persistence failure.
+                // Cache it in memory and return it unconditionally; only the
+                // (best-effort) save to the credential store is allowed to
+                // fail here. A Keychain write failure must never fail an
+                // open when we already hold a perfectly usable token.
                 cachedToken = refreshed
+                try? credentialStore.saveTokens(refreshed)
                 return (refreshed.accessToken, .refreshed)
             } catch let error as ComelitError {
                 if isTransportFailure(error) {
@@ -304,11 +309,15 @@ public actor TokenManager {
                 // rejected/consumed/rotated, and a full login is the
                 // correct, load-bearing self-healing path.
             }
-            // A non-`ComelitError` thrown here (e.g. from
-            // `credentialStore.saveTokens`) also falls through to the full
-            // login below, matching the pre-existing `try?` behaviour for
-            // any refresh-path failure that isn't a recognized transport
-            // failure.
+            // A non-`ComelitError` thrown by `api.refresh` itself (e.g. a
+            // `CancellationError`, or any other error type entirely) is NOT
+            // caught above, so it propagates straight out of
+            // `resolveAccessTokenCore()` -- it does NOT fall through to a
+            // full login. Only a recognized `ComelitError` that isn't a
+            // transport failure falls through below. (A failure from
+            // `credentialStore.saveTokens` AFTER a successful refresh can no
+            // longer reach this point at all: it is swallowed with `try?`
+            // immediately above, since the refresh already succeeded.)
         }
 
         // Refresh was unavailable, or failed with a non-transport error

@@ -526,7 +526,10 @@ private func makeTokenSet(
     let store = MockCredentialStore()
     let issuing = MockTokenIssuing()
     let fixedNow = Date()
-    let soonToExpire = makeTokenSet(accessToken: "soon-to-expire", expiresIn: 300)
+    // 290s, not 300s: see the comment in
+    // `prewarmSwallowsFailureAndLeavesOldTokensStored` -- avoids landing
+    // exactly on the 300s default `isExpired` skew boundary.
+    let soonToExpire = makeTokenSet(accessToken: "soon-to-expire", expiresIn: 290)
     try store.saveCredentials(username: "alice", password: "s3cret")
     try store.saveTokens(soonToExpire)
     issuing.refreshResult = .failure(ComelitError.network("offline"))
@@ -569,8 +572,11 @@ private func makeTokenSet(
     let store = MockCredentialStore()
     let issuing = MockTokenIssuing()
     let fixedNow = Date()
-    // Expires in 5 minutes -- inside the default 600s (10 min) prewarm window.
-    let soonToExpire = makeTokenSet(accessToken: "soon-to-expire", expiresIn: 300)
+    // 290s, not 300s: inside the default 600s (10 min) prewarm window, and
+    // comfortably inside (not exactly on the boundary of) the 300s default
+    // `isExpired` skew -- avoids flakiness from the small real-clock gap
+    // between `fixedNow` and the `Date()` captured inside `makeTokenSet`.
+    let soonToExpire = makeTokenSet(accessToken: "soon-to-expire", expiresIn: 290)
     let refreshed = makeTokenSet(accessToken: "refreshed-token", expiresIn: 3600)
     try store.saveCredentials(username: "alice", password: "s3cret")
     try store.saveTokens(soonToExpire)
@@ -604,7 +610,11 @@ private func makeTokenSet(
     let store = MockCredentialStore()
     let issuing = MockTokenIssuing()
     let fixedNow = Date()
-    let soonToExpire = makeTokenSet(accessToken: "soon-to-expire", expiresIn: 300)
+    // 290s, not 300s: comfortably inside the 300s default `isExpired` skew
+    // (not just exactly on its boundary), so this is robust to the small
+    // real-clock gap between `fixedNow` and the `Date()` captured inside
+    // `makeTokenSet` -- avoids a flaky pass/fail at the exact 300s edge.
+    let soonToExpire = makeTokenSet(accessToken: "soon-to-expire", expiresIn: 290)
     try store.saveTokens(soonToExpire)
     // No stored credentials, so the fallback-to-login path cannot succeed
     // either: refresh fails, then login fails with .notConfigured.
@@ -620,6 +630,49 @@ private func makeTokenSet(
     // The old token set must remain stored, untouched by the failed attempt.
     let persisted = try store.loadTokens()
     #expect(persisted?.accessToken == "soon-to-expire")
+}
+
+/// Acceptance test for gateopener-69h: `prewarm(expiringWithin:)`'s
+/// `Duration` -> `TimeInterval` conversion must not truncate a fractional
+/// window. Token expires in 200.4s -- comfortably inside the 300s default
+/// `isExpired` skew, so once `prewarm`'s own window check lets the refresh
+/// attempt through, `resolveAccessTokenCore` always chooses to refresh
+/// regardless of the window's exact value. The window itself is 200.5s, so
+/// the ONLY thing gating whether `prewarm` even attempts the refresh is
+/// whether its `Duration` -> `TimeInterval` conversion preserves the 0.5s
+/// fractional remainder: 200.4 <= 200.5 (true, refresh attempted) vs a
+/// truncated 200.4 <= 200 (false, `prewarm` returns early with no refresh).
+///
+/// MUTATION CHECK: if the conversion truncated the window's fractional
+/// remainder (200.5s -> 200s), the boundary check becomes
+/// `200.4 <= 200` (false), so `refreshCallCount` would be 0 instead of 1 --
+/// this test would fail.
+@Test func prewarmHonoursFractionalExpiringWithinWindow() async throws {
+    let store = MockCredentialStore()
+    let issuing = MockTokenIssuing()
+    let fixedNow = Date()
+    // Built directly against `fixedNow` (rather than via `makeTokenSet`'s
+    // real-clock `receivedAt` default) so the 200.4s/200.5s boundary is
+    // exact, with no real-clock skew between construction and `fixedNow`.
+    let soonToExpire = TokenSet(
+        accessToken: "soon-to-expire",
+        refreshToken: "refresh-token",
+        expiresAt: fixedNow.addingTimeInterval(200.4),
+        tokenType: "bearer"
+    )
+    let refreshed = makeTokenSet(accessToken: "refreshed-token", expiresIn: 3600)
+    try store.saveCredentials(username: "alice", password: "s3cret")
+    try store.saveTokens(soonToExpire)
+    issuing.refreshResult = .success(refreshed)
+
+    let manager = TokenManager(api: issuing, credentialStore: store, now: { fixedNow })
+
+    await manager.prewarm(expiringWithin: .milliseconds(200_500))
+
+    #expect(issuing.refreshCallCount == 1)
+
+    let persisted = try store.loadTokens()
+    #expect(persisted?.accessToken == "refreshed-token")
 }
 
 // MARK: - setCredentialStore() tests
@@ -801,11 +854,149 @@ private func makeTokenSet(
     #expect(recorder.failed == ["invalidCredentials"])
 }
 
+// MARK: - Refresh succeeds but persistence fails (gateopener-efb)
+
+@Test func refreshSucceedsButSaveTokensFailsStillReturnsFreshTokenAndCachesInMemory() async throws {
+    let store = MockCredentialStore()
+    let issuing = MockTokenIssuing()
+    let expired = makeTokenSet(accessToken: "old-token", expiresIn: -10)
+    let refreshed = makeTokenSet(accessToken: "refreshed-token", expiresIn: 3600)
+    try store.saveCredentials(username: "alice", password: "s3cret")
+    try store.saveTokens(expired)
+    issuing.refreshResult = .success(refreshed)
+    store.saveTokensError = TestSaveError.keychainWriteFailed
+
+    let manager = TokenManager(api: issuing, credentialStore: store)
+
+    let token = try await manager.accessToken()
+
+    #expect(token == "refreshed-token")
+    #expect(issuing.refreshCallCount == 1)
+    #expect(issuing.loginCallCount == 0)
+
+    // The store itself never actually persisted the new token (the save
+    // threw), but a second call must still return it from the in-memory
+    // cache without attempting another refresh or login.
+    let secondToken = try await manager.accessToken()
+    #expect(secondToken == "refreshed-token")
+    #expect(issuing.refreshCallCount == 1)
+    #expect(issuing.loginCallCount == 0)
+}
+
+@Test func onResolvedFiresWithRefreshedWhenSaveTokensFails() async throws {
+    let store = MockCredentialStore()
+    let issuing = MockTokenIssuing()
+    let expired = makeTokenSet(accessToken: "old-token", expiresIn: -10)
+    let refreshed = makeTokenSet(accessToken: "refreshed-token", expiresIn: 3600)
+    try store.saveCredentials(username: "alice", password: "s3cret")
+    try store.saveTokens(expired)
+    issuing.refreshResult = .success(refreshed)
+    store.saveTokensError = TestSaveError.keychainWriteFailed
+
+    let manager = TokenManager(api: issuing, credentialStore: store)
+    let recorder = TokenResolutionRecorder()
+    await manager.setOnResolved(recorder.recordResolved)
+    await manager.setOnFailed(recorder.recordFailed)
+
+    _ = try await manager.accessToken()
+
+    #expect(recorder.resolved == [.refreshed])
+    #expect(recorder.failed.isEmpty)
+}
+
+enum TestSaveError: Error, Equatable {
+    case keychainWriteFailed
+}
+
+// MARK: - Non-ComelitError thrown by refresh() propagates (gateopener-efb)
+
+@Test func refreshThrowingNonComelitErrorPropagatesAndDoesNotLogIn() async throws {
+    let store = MockCredentialStore()
+    let issuing = MockTokenIssuing()
+    let expired = makeTokenSet(accessToken: "old-token", expiresIn: -10)
+    try store.saveCredentials(username: "alice", password: "s3cret")
+    try store.saveTokens(expired)
+    issuing.refreshResult = .failure(MockTokenIssuing.TestError.unconfigured)
+
+    let manager = TokenManager(api: issuing, credentialStore: store)
+
+    await #expect(throws: MockTokenIssuing.TestError.unconfigured) {
+        _ = try await manager.accessToken()
+    }
+
+    #expect(issuing.refreshCallCount == 1)
+    #expect(issuing.loginCallCount == 0)
+}
+
+@Test func refreshThrowingCancellationErrorPropagatesAndDoesNotLogIn() async throws {
+    let store = MockCredentialStore()
+    let issuing = MockTokenIssuing()
+    let expired = makeTokenSet(accessToken: "old-token", expiresIn: -10)
+    try store.saveCredentials(username: "alice", password: "s3cret")
+    try store.saveTokens(expired)
+    issuing.refreshResult = .failure(CancellationError())
+
+    let manager = TokenManager(api: issuing, credentialStore: store)
+
+    await #expect(throws: CancellationError.self) {
+        _ = try await manager.accessToken()
+    }
+
+    #expect(issuing.refreshCallCount == 1)
+    #expect(issuing.loginCallCount == 0)
+}
+
+// MARK: - Injected clock drives cached-token expiry decision (gateopener-efb)
+
+@Test func injectedNowTreatsTokenAsExpiredWhenClockSaysSo() async throws {
+    let store = MockCredentialStore()
+    let issuing = MockTokenIssuing()
+    // Expires in 3600s from real-Date()-now, so it would look fresh under
+    // the real clock -- but the injected `now()` is set far enough in the
+    // future that, combined with the 5-minute skew, the token is expired.
+    let token = makeTokenSet(accessToken: "existing-token", expiresIn: 3600)
+    let refreshed = makeTokenSet(accessToken: "refreshed-token", expiresIn: 3600)
+    try store.saveCredentials(username: "alice", password: "s3cret")
+    try store.saveTokens(token)
+    issuing.refreshResult = .success(refreshed)
+
+    let farFuture = Date().addingTimeInterval(4000)
+    let manager = TokenManager(api: issuing, credentialStore: store, now: { farFuture })
+
+    let result = try await manager.accessToken()
+
+    #expect(result == "refreshed-token")
+    #expect(issuing.refreshCallCount == 1)
+}
+
+@Test func injectedNowTreatsTokenAsNotExpiredWhenClockSaysSo() async throws {
+    let store = MockCredentialStore()
+    let issuing = MockTokenIssuing()
+    // Expires in -10s from real-Date()-now (i.e. already expired under the
+    // real clock), but the injected `now()` is set far enough in the PAST
+    // that, relative to it, the token is comfortably unexpired.
+    let token = makeTokenSet(accessToken: "existing-token", expiresIn: -10)
+    try store.saveCredentials(username: "alice", password: "s3cret")
+    try store.saveTokens(token)
+
+    let farPast = Date().addingTimeInterval(-4000)
+    let manager = TokenManager(api: issuing, credentialStore: store, now: { farPast })
+
+    let result = try await manager.accessToken()
+
+    #expect(result == "existing-token")
+    #expect(issuing.refreshCallCount == 0)
+    #expect(issuing.loginCallCount == 0)
+}
+
 @Test func concurrentPrewarmAndAccessTokenCoalesceToOneRefresh() async throws {
     let store = MockCredentialStore()
     let issuing = MockTokenIssuing()
     let fixedNow = Date()
-    let soonToExpire = makeTokenSet(accessToken: "soon-to-expire", expiresIn: 300)
+    // 290s, not 300s: see the comment in
+    // `prewarmSwallowsFailureAndLeavesOldTokensStored` -- avoids landing
+    // exactly on the 300s default `isExpired` skew boundary.
+    let soonToExpire = makeTokenSet(accessToken: "soon-to-expire", expiresIn: 290)
     let refreshed = makeTokenSet(accessToken: "refreshed-token", expiresIn: 3600)
     try store.saveCredentials(username: "alice", password: "s3cret")
     try store.saveTokens(soonToExpire)

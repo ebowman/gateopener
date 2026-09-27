@@ -29,6 +29,13 @@ final class MockCredentialStore: CredentialStoring, @unchecked Sendable {
     private(set) var loadTokensCallCount = 0
     private(set) var deleteTokensCallCount = 0
 
+    /// When set, `saveTokens(_:)` throws this error instead of persisting,
+    /// and does NOT increment `saveTokensCallCount` or update the stored
+    /// token -- used by tests that need a persistence failure AFTER a
+    /// successful network refresh/login (e.g. a simulated Keychain write
+    /// failure).
+    var saveTokensError: Error?
+
     func saveCredentials(username: String, password: String) throws {
         lock.lock()
         defer { lock.unlock() }
@@ -53,6 +60,9 @@ final class MockCredentialStore: CredentialStoring, @unchecked Sendable {
     func saveTokens(_ tokens: TokenSet) throws {
         lock.lock()
         defer { lock.unlock() }
+        if let saveTokensError {
+            throw saveTokensError
+        }
         saveTokensCallCount += 1
         _tokens = tokens
     }

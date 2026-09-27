@@ -335,6 +335,25 @@ struct OpenHistoryViewTests {
         #expect(group.resultBadge == "Unfinished")
     }
 
+    /// A press whose entries include BOTH a `.finished` phase and a
+    /// `.timedOut` phase (not expected in practice, but the badge precedence
+    /// is documented to prefer `.finished`) must badge from `.finished`, not
+    /// `.timedOut`.
+    ///
+    /// MUTATION CHECK: reordering `resultBadge(for:)` to scan for `.timedOut`
+    /// BEFORE `.finished` makes this fail (it would report "Timed out"
+    /// instead of "Opened") — verified by temporarily swapping the two scan
+    /// loops in `resultBadge(for:)` and confirming this test fails, then
+    /// restoring the original order.
+    @Test func resultBadgeFinishedTakesPrecedenceOverTimedOut() {
+        let pressId = UUID()
+        let started = makePress(pressId: pressId, timestamp: baseTime, phase: .started, elapsedMilliseconds: 0)
+        let timedOut = makePress(pressId: pressId, timestamp: baseTime.addingTimeInterval(1), phase: .timedOut, elapsedMilliseconds: 1_000)
+        let finished = makePress(pressId: pressId, timestamp: baseTime.addingTimeInterval(2), phase: .finished(outcome: "Gate opened"), elapsedMilliseconds: 2_000)
+        let group = OpenHistoryView.groups(from: [.press(started), .press(timedOut), .press(finished)])[0]
+        #expect(group.resultBadge == "Opened")
+    }
+
     @Test func resultBadgeLegacyAllFailedIsFailed() {
         let first = makeAttempt(attempt: 1, maxAttempts: 2, outcome: .httpFailure(status: 500), timestamp: baseTime, pressId: nil)
         let second = makeAttempt(attempt: 2, maxAttempts: 2, outcome: .httpFailure(status: 500), timestamp: baseTime.addingTimeInterval(1), pressId: nil)
@@ -511,7 +530,9 @@ struct OpenHistoryViewTests {
     }
 
     /// Two presses each produce their own header + indented lines, separated
-    /// by a blank line, with no trailing blank line at the very end.
+    /// by a blank line, with no trailing blank line at the very end. Both
+    /// presses here are Unfinished (only a `.started` phase), so each block
+    /// also gets the indented `unfinishedFootnote` line.
     @Test func shareTextMultiplePressesSeparatedByBlankLine() {
         let pressOne = UUID()
         let pressTwo = UUID()
@@ -521,8 +542,45 @@ struct OpenHistoryViewTests {
         let text = OpenHistoryView.shareText(for: [.press(startedOne), .press(startedTwo)], prefix: "prefix")
         let lines = text.components(separatedBy: "\n")
 
-        // prefix, blank, header(two), line(two), blank, header(one), line(one) — no trailing blank.
-        #expect(lines.count == 7)
+        // prefix, blank, header(two), line(two), footnote(two), blank,
+        // header(one), line(one), footnote(one) — no trailing blank.
+        #expect(lines.count == 9)
         #expect(lines.last != "")
+    }
+
+    /// An Unfinished group's share-text block includes the indented
+    /// `unfinishedFootnote` line after its timeline lines, so a shared report
+    /// explains the badge.
+    @Test func shareTextIncludesFootnoteForUnfinishedGroup() {
+        let pressId = UUID()
+        let started = makePress(pressId: pressId, timestamp: baseTime, phase: .started, elapsedMilliseconds: 0)
+
+        let text = OpenHistoryView.shareText(for: [.press(started)], prefix: "prefix")
+        let lines = text.components(separatedBy: "\n")
+
+        #expect(lines.contains("  \(OpenHistoryView.unfinishedFootnote)"))
+    }
+
+    /// MUTATION CHECK: a finished group's share-text block must NOT include
+    /// the unfinished footnote — omitting this guard (always appending the
+    /// footnote) would make this fail.
+    @Test func shareTextOmitsFootnoteForFinishedGroup() {
+        let pressId = UUID()
+        let started = makePress(pressId: pressId, timestamp: baseTime, phase: .started, elapsedMilliseconds: 0)
+        let finished = makePress(pressId: pressId, timestamp: baseTime.addingTimeInterval(1), phase: .finished(outcome: "Gate opened"), elapsedMilliseconds: 1_000)
+
+        let text = OpenHistoryView.shareText(for: [.press(started), .press(finished)], prefix: "prefix")
+        #expect(!text.contains(OpenHistoryView.unfinishedFootnote))
+    }
+
+    /// MUTATION CHECK: a timed-out group's share-text block must NOT include
+    /// the unfinished footnote either.
+    @Test func shareTextOmitsFootnoteForTimedOutGroup() {
+        let pressId = UUID()
+        let started = makePress(pressId: pressId, timestamp: baseTime, phase: .started, elapsedMilliseconds: 0)
+        let timedOut = makePress(pressId: pressId, timestamp: baseTime.addingTimeInterval(25), phase: .timedOut, elapsedMilliseconds: 25_000)
+
+        let text = OpenHistoryView.shareText(for: [.press(started), .press(timedOut)], prefix: "prefix")
+        #expect(!text.contains(OpenHistoryView.unfinishedFootnote))
     }
 }
