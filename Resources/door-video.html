@@ -38,6 +38,22 @@ const ICE_GATHERING_TIMEOUT_MS = 15000;
 const ICE_WAIT_COMPLETE = "complete";
 const ICE_WAIT_DEADLINE_CANDIDATE = "deadline-with-gathered-candidate";
 
+// QUIET-PERIOD rule (gateopener-4r7): on networks where 7 of our 8 STUN
+// servers never answer, iceGatheringState never reaches 'complete' and the
+// page used to burn the entire 15s ICE_GATHERING_TIMEOUT_MS before
+// publishing the offer (field evidence: session-start-to-first-frame
+// ~19s). Once a routable pair exists -- one host candidate AND one UDP
+// srflx/relay candidate -- there is no reason to keep waiting for every
+// remaining STUN server to time out. See iceWaitDecision() below and its
+// wiring into waitForBoundedIceSnapshot(). The 15s hard deadline above is
+// UNCHANGED and still the final fallback (gateopener-ndn).
+const ICE_WAIT_QUIET_PERIOD = "quiet-period";
+const ICE_WAIT_MAX_WAIT_CANDIDATE = "max-wait-with-candidate";
+const ICE_WAIT_WAIT = "wait";
+const ICE_QUIET_PERIOD_MS = 600;
+const ICE_MAX_WAIT_MS = 4000;
+const ICE_WAIT_TICK_MS = 100;
+
 function negotiationError(code, message) {
   const error = new Error(message);
   error.name = "DoorVideoNegotiationError";
@@ -163,22 +179,106 @@ function sdpHasQualifyingDeadlineCandidate(sdp) {
   );
 }
 
+// Pure decision function for the bounded ICE wait (gateopener-4r7). Takes
+// only counters/booleans about candidates gathered so far -- no pc, no
+// timers -- so it is exposed at the top level (becomes window.
+// iceWaitDecision, same as the other pure helpers above) purely so
+// Tests/door-video-negotiation.test.js can unit-test the full rule table
+// directly, without driving a whole RTCPeerConnection.
+//
+// Rule precedence (first match wins):
+//   1. "complete"                         -- gatheringComplete is true.
+//   2. "quiet-period"                     -- a host AND a UDP srflx/relay
+//                                             candidate have both been
+//                                             gathered, and quietMs has
+//                                             passed since the last one
+//                                             arrived.
+//   3. "max-wait-with-candidate"          -- same host+srflx/relay
+//                                             requirement, but gates on
+//                                             maxWaitMs since the wait
+//                                             STARTED instead -- this is
+//                                             what fires if a candidate
+//                                             keeps trickling in faster
+//                                             than quietMs forever.
+//   4. "deadline-with-gathered-candidate" -- hardDeadlineMs has elapsed.
+//                                             This is a SIGNAL ONLY: the
+//                                             caller must still run the
+//                                             existing
+//                                             sdpHasQualifyingDeadlineCandidate
+//                                             check against the real
+//                                             localDescription before
+//                                             treating it as success
+//                                             (gateopener-ndn, unchanged).
+//   5. "wait"                             -- none of the above yet.
+function iceWaitDecision(params) {
+  const {
+    hasHost,
+    hasSrflxOrRelay,
+    msSinceLastCandidate,
+    msSinceStart,
+    gatheringComplete,
+    quietMs = ICE_QUIET_PERIOD_MS,
+    maxWaitMs = ICE_MAX_WAIT_MS,
+    hardDeadlineMs = ICE_GATHERING_TIMEOUT_MS,
+  } = params;
+
+  if (gatheringComplete) return ICE_WAIT_COMPLETE;
+
+  // MUTATION CHECK: dropping the `hasSrflxOrRelay` requirement here (i.e.
+  // gating only on hasHost) would make a host-only candidate set fire
+  // "quiet-period"/"max-wait-with-candidate" once their time thresholds
+  // pass -- the host-only case in the rule table below asserts "wait" and
+  // would fail.
+  const hasQualifyingPair = hasHost && hasSrflxOrRelay;
+  if (hasQualifyingPair && msSinceLastCandidate >= quietMs) return ICE_WAIT_QUIET_PERIOD;
+  if (hasQualifyingPair && msSinceStart >= maxWaitMs) return ICE_WAIT_MAX_WAIT_CANDIDATE;
+  if (msSinceStart >= hardDeadlineMs) return ICE_WAIT_DEADLINE_CANDIDATE;
+  return ICE_WAIT_WAIT;
+}
+
+// Classifies one gathered LOCAL candidate line (as delivered by
+// pc.onicecandidate's event.candidate.candidate -- NOT SDP-prefixed) as
+// "host", "srflx-or-relay", or null (anything else: TCP, prflx, malformed
+// -- "count only UDP" per this bead). Reuses
+// isQualifyingDeadlineCandidateLine (which expects the "a=candidate:" SDP
+// form) for the srflx/relay test so the quiet-period/max-wait rule and the
+// existing 15s deadline rule can never disagree about what qualifies.
+function classifyGatheredIceCandidate(candidateLine) {
+  const summary = summarizeCandidateLine(candidateLine);
+  if (summary.protocol !== "udp") return null;
+  if (summary.type === "host") return "host";
+  const sdpLine = candidateLine.indexOf("a=candidate:") === 0
+    ? candidateLine
+    : "a=" + candidateLine;
+  return isQualifyingDeadlineCandidateLine(sdpLine) ? "srflx-or-relay" : null;
+}
+
+function createIceCandidateTracker() {
+  return { hasHost: false, hasSrflxOrRelay: false, lastCandidateAt: null, count: 0 };
+}
+
 function waitForBoundedIceSnapshot(pc) {
   if (pc.iceGatheringState === "complete") {
     return Promise.resolve(ICE_WAIT_COMPLETE);
   }
 
+  const waitStartedAt = Date.now();
+  const tracker = pc.__iceTracker || (pc.__iceTracker = createIceCandidateTracker());
+
   return new Promise((resolve, reject) => {
     let settled = false;
-    let timer = null;
+    let tickTimer = null;
 
     const cleanup = () => {
-      if (timer !== null) clearTimeout(timer);
+      if (tickTimer !== null) clearTimeout(tickTimer);
       pc.removeEventListener("icegatheringstatechange", checkComplete);
       pc.removeEventListener("connectionstatechange", checkClosed);
       pc.removeEventListener("signalingstatechange", checkClosed);
       if (window.__state.cancelGathering === cancel) {
         window.__state.cancelGathering = null;
+      }
+      if (pc.__iceWaitEvaluate === evaluate) {
+        pc.__iceWaitEvaluate = null;
       }
     };
     const finish = (action) => {
@@ -187,10 +287,16 @@ function waitForBoundedIceSnapshot(pc) {
       cleanup();
       action();
     };
+    // Resolves with `rule` and logs both the new diagnostic line (this
+    // bead) and, via negotiate()'s existing "ICE snapshot published: ..."
+    // line downstream, the same rule name.
+    const publish = (rule) => {
+      const elapsedMs = Date.now() - waitStartedAt;
+      diag("ICE wait result: " + rule + " after " + tracker.count + " candidates (" + elapsedMs + "ms)");
+      finish(() => resolve(rule));
+    };
     const checkComplete = () => {
-      if (pc.iceGatheringState === "complete") {
-        finish(() => resolve(ICE_WAIT_COMPLETE));
-      }
+      if (pc.iceGatheringState === "complete") publish(ICE_WAIT_COMPLETE);
     };
     const checkClosed = () => {
       if (pc.connectionState === "closed" || pc.signalingState === "closed") {
@@ -200,20 +306,46 @@ function waitForBoundedIceSnapshot(pc) {
     const cancel = () => {
       finish(() => reject(iceGatheringClosedError()));
     };
+    // Evaluated on every qualifying candidate event (via
+    // pc.__iceWaitEvaluate, wired up in negotiate()'s pc.onicecandidate)
+    // and on every ICE_WAIT_TICK_MS timer tick below -- whichever notices
+    // a rule match first resolves. Only the hard-deadline branch re-checks
+    // the real localDescription SDP (existing gateopener-ndn behaviour,
+    // unchanged); the quiet-period/max-wait branches trust the tracker.
+    const evaluate = () => {
+      if (settled) return;
+      const now = Date.now();
+      const decision = iceWaitDecision({
+        hasHost: tracker.hasHost,
+        hasSrflxOrRelay: tracker.hasSrflxOrRelay,
+        msSinceLastCandidate: tracker.lastCandidateAt === null ? Infinity : now - tracker.lastCandidateAt,
+        msSinceStart: now - waitStartedAt,
+        gatheringComplete: pc.iceGatheringState === "complete",
+      });
+      if (decision === ICE_WAIT_WAIT) return;
+      if (decision === ICE_WAIT_DEADLINE_CANDIDATE) {
+        const sdp = pc.localDescription && pc.localDescription.sdp;
+        if (sdpHasQualifyingDeadlineCandidate(sdp)) {
+          publish(ICE_WAIT_DEADLINE_CANDIDATE);
+        } else {
+          finish(() => reject(iceGatheringTimeoutError()));
+        }
+        return;
+      }
+      publish(decision); // "complete" | "quiet-period" | "max-wait-with-candidate"
+    };
+    const tick = () => {
+      if (settled) return;
+      evaluate();
+      if (!settled) tickTimer = setTimeout(tick, ICE_WAIT_TICK_MS);
+    };
 
     pc.addEventListener("icegatheringstatechange", checkComplete);
     pc.addEventListener("connectionstatechange", checkClosed);
     pc.addEventListener("signalingstatechange", checkClosed);
     window.__state.cancelGathering = cancel;
-    timer = setTimeout(() => {
-      const sdp = pc.localDescription && pc.localDescription.sdp;
-      if (sdpHasQualifyingDeadlineCandidate(sdp)) {
-        diag("ICE wait result: deadline with gathered UDP srflx/relay candidate");
-        finish(() => resolve(ICE_WAIT_DEADLINE_CANDIDATE));
-      } else {
-        finish(() => reject(iceGatheringTimeoutError()));
-      }
-    }, ICE_GATHERING_TIMEOUT_MS);
+    pc.__iceWaitEvaluate = evaluate;
+    tickTimer = setTimeout(tick, ICE_WAIT_TICK_MS);
 
     // Cover a close/complete transition that raced listener installation.
     checkClosed();
@@ -346,8 +478,24 @@ async function negotiate() {
   // this deliberately does not log as a "candidate" line.
   pc.onicecandidate = (event) => {
     if (!event.candidate || !event.candidate.candidate) return;
-    const summary = summarizeCandidateLine(event.candidate.candidate);
+    const candidateLine = event.candidate.candidate;
+    const summary = summarizeCandidateLine(candidateLine);
     diag("local candidate: type=" + summary.type + " proto=" + summary.protocol + " family=" + summary.family + " port=" + summary.port);
+
+    // Feeds the quiet-period/max-wait rule (gateopener-4r7). The tracker is
+    // created unconditionally (not just while a waitForBoundedIceSnapshot()
+    // watcher is attached) so a candidate arriving in the brief window
+    // before the watcher attaches is not lost; pc.__iceWaitEvaluate is only
+    // set while a watcher is actually waiting.
+    const tracker = pc.__iceTracker || (pc.__iceTracker = createIceCandidateTracker());
+    const kind = classifyGatheredIceCandidate(candidateLine);
+    if (kind === "host") tracker.hasHost = true;
+    if (kind === "srflx-or-relay") tracker.hasSrflxOrRelay = true;
+    if (kind !== null) {
+      tracker.count += 1;
+      tracker.lastCandidateAt = Date.now();
+    }
+    if (pc.__iceWaitEvaluate) pc.__iceWaitEvaluate();
   };
 
   pc.ontrack = (event) => {
@@ -417,13 +565,18 @@ async function negotiate() {
     throw iceGatheringTimeoutError();
   }
 
-  if (iceWaitResult === ICE_WAIT_COMPLETE) {
-    logMsg("ICE gathering complete, offer ready");
-    diag("ICE snapshot published: complete");
-  } else {
-    logMsg("ICE gathering deadline reached with gathered UDP srflx/relay candidate, offer ready");
-    diag("ICE snapshot published: deadline with gathered candidate");
-  }
+  // "ICE snapshot published: <rule label>" -- keeps the exact strings the
+  // ICE_WAIT_COMPLETE/ICE_WAIT_DEADLINE_CANDIDATE cases always used, and
+  // adds a label for the two new quiet-period/max-wait rules (gateopener-4r7).
+  const ICE_WAIT_RULE_LABELS = {
+    [ICE_WAIT_COMPLETE]: "complete",
+    [ICE_WAIT_QUIET_PERIOD]: "quiet period",
+    [ICE_WAIT_MAX_WAIT_CANDIDATE]: "max wait with candidate",
+    [ICE_WAIT_DEADLINE_CANDIDATE]: "deadline with gathered candidate",
+  };
+  const ruleLabel = ICE_WAIT_RULE_LABELS[iceWaitResult] || iceWaitResult;
+  logMsg("ICE snapshot published (" + ruleLabel + "), offer ready");
+  diag("ICE snapshot published: " + ruleLabel);
   window.__state.offerSdp = offerSdp;
   window.__state.offerReady = true;
 }
