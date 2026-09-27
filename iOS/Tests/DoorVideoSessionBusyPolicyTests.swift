@@ -311,6 +311,32 @@ struct DoorVideoSessionBusyPolicyTests {
             Issue.record("expected .ended after stop() raced the cooldown wait, got \(session.state)")
         }
     }
+
+    // MARK: - (c) rtc/offer PUT is bounded at 12s, not URLSession.shared's 60s
+
+    /// Bead gateopener-b7n: `DoorVideoSession.makeOfferRequest` (the pure
+    /// seam backing `putOfferOnce`'s request construction) must set
+    /// `timeoutInterval` to `DoorVideoSession.offerTimeout` (12s) on the
+    /// built `URLRequest`, mirroring macOS's `DoorVideoSession.
+    /// putOfferOnce`. Before this bead, the iOS PUT set no
+    /// `timeoutInterval` at all and inherited `URLSession.shared`'s 60s
+    /// default.
+    ///
+    /// MUTATION CHECK: deleting the `request.timeoutInterval =
+    /// Self.offerTimeout` line in `makeOfferRequest` (or changing
+    /// `offerTimeout` to some other value, e.g. 60) makes the first
+    /// `#expect` fail; changing it to any value other than exactly 12
+    /// makes the second `#expect` fail.
+    @Test func offerRequestTimeoutIsTwelveSeconds() {
+        let request = DoorVideoSession.makeOfferRequest(
+            endpointId: "VIP#EN#SB100001",
+            sessionId: "test-session-id",
+            offerSDP: "v=0\r\n",
+            token: "test-token"
+        )
+        #expect(request?.timeoutInterval == DoorVideoSession.offerTimeout)
+        #expect(request?.timeoutInterval == 12)
+    }
 }
 
 /// Thread-safe recorder of `Duration` values passed to a fake
