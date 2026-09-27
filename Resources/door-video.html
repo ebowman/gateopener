@@ -4,6 +4,10 @@
 <body style="margin:0;background:#000">
 <video id="v" autoplay playsinline muted style="width:100%;height:100%;object-fit:cover;background:#222"></video>
 <canvas id="c" style="display:none"></canvas>
+<!-- Call-mode inbound audio (bead gateopener-1pm.3): only ever given a
+     srcObject when window.__CALL_MODE__ === true (see pc.ontrack below).
+     View mode never touches this element; the <video> above stays muted. -->
+<audio id="a" autoplay playsinline style="display:none"></audio>
 <script>
 // Drives ONE WebRTC session against the Comelit door camera, via WKWebView.
 // This is a stripped-down copy of ../comelit/comelit/webrtc_page.html
@@ -428,6 +432,49 @@ function summarizeRemoteCandidates(answerSdp) {
   return lines.map((l) => summarizeCandidateLine(l.substring(2)));
 }
 
+// CALL MODE helpers (bead gateopener-1pm.3): all three below only ever get
+// called from call-mode-gated call sites, but are pure functions of an SDP
+// string so they impose no behavior on a view session either way.
+// Returns the lines belonging to the FIRST "m=<kind> ..." section of `sdp`
+// (there is exactly one audio section in both our offer and the door's
+// answer), stopping at the next m-line.
+function extractMSectionLines(sdp, kind) {
+  if (typeof sdp !== "string") return [];
+  const lines = sdp.split(/\r?\n/);
+  const prefix = "m=" + kind;
+  let inSection = false;
+  const result = [];
+  for (const line of lines) {
+    if (line.indexOf("m=") === 0) {
+      inSection = line.indexOf(prefix) === 0;
+      continue;
+    }
+    if (inSection) result.push(line);
+  }
+  return result;
+}
+
+// e.g. ["PCMA/8000", "opus/48000/2", ...] from "a=rtpmap:8 PCMA/8000" lines.
+function audioCodecsFromSdp(sdp) {
+  return extractMSectionLines(sdp, "audio")
+    .filter((line) => line.indexOf("a=rtpmap:") === 0)
+    .map((line) => line.substring("a=rtpmap:".length).trim().split(/\s+/)[1])
+    .filter(Boolean);
+}
+
+// "sendrecv" | "sendonly" | "recvonly" | "inactive" | "unknown".
+function audioDirectionFromSdp(sdp) {
+  const dirLine = extractMSectionLines(sdp, "audio")
+    .find((line) => /^a=(sendrecv|sendonly|recvonly|inactive)\s*$/.test(line.trim()));
+  return dirLine ? dirLine.trim().substring(2) : "unknown";
+}
+
+// Bare codec name (e.g. "PCMA") of the first negotiated audio rtpmap.
+function primaryAudioCodecName(sdp) {
+  const codecs = audioCodecsFromSdp(sdp);
+  return codecs.length ? codecs[0].split("/")[0] : "unknown";
+}
+
 // Builds the RTCPeerConnection, wires up ontrack and the recvonly
 // audio+video transceivers (audio first -- the door's answer generation is
 // m-line-order sensitive), creates the offer, and waits for a bounded
@@ -436,6 +483,36 @@ async function negotiate() {
   window.__state.offerReady = false;
   window.__state.offerSdp = null;
   window.__state.hasVideoFrame = false;
+
+  // CALL MODE (bead gateopener-1pm.3): acquire the phone's microphone BEFORE
+  // createOffer, single-round-trip signaling means there is no renegotiation
+  // to fix this up later. window.__CALL_MODE__ defaults to false/undefined,
+  // so every line in this block is skipped for a view session -- the view
+  // offer is byte-for-byte unchanged. On any getUserMedia failure this
+  // throws an error whose message starts with "mic:" (mapped by Swift,
+  // bead gateopener-1pm.4) and negotiate() returns BEFORE the
+  // RTCPeerConnection is even constructed, so no offer is produced.
+  const callMode = window.__CALL_MODE__ === true;
+  let micTrack = null;
+  if (callMode) {
+    let micStream = null;
+    try {
+      micStream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      });
+    } catch (err) {
+      const name = err && err.name ? err.name : (err && err.message) || String(err);
+      diag("mic: error:" + name);
+      throw negotiationError("mic-error", "mic: " + name);
+    }
+    micTrack = micStream.getAudioTracks()[0] || null;
+    if (!micTrack) {
+      diag("mic: error:no-track");
+      throw negotiationError("mic-error", "mic: error:no-track");
+    }
+    window.__state.micStream = micStream;
+    diag("mic: label=" + micTrack.label);
+  }
 
   // Comelit's own STUN server, pre-resolved to an IP and injected by Swift
   // as window.__ICE_SERVERS__ -- a bare mDNS-only host candidate is
@@ -536,18 +613,48 @@ async function negotiate() {
         window.__state.lastFramePostMs = 0;
         video.requestVideoFrameCallback(onFrame);
       }
+    } else if (event.track.kind === "audio" && callMode) {
+      // CALL MODE inbound audio (bead gateopener-1pm.3): the door's audio
+      // track is attached to the hidden #a element, never to the muted
+      // #v <video> (which stays exactly as it is for view mode).
+      const audioEl = document.getElementById("a");
+      if (audioEl) {
+        if (event.streams && event.streams[0]) {
+          audioEl.srcObject = event.streams[0];
+        } else {
+          audioEl.srcObject = new MediaStream([event.track]);
+        }
+        window.ensurePlaying("a");
+      }
     }
   };
 
   // audio first, then video, to match the real app's SDP m-line order (the
   // door station's answer generation is order-sensitive against the offer).
-  pc.addTransceiver('audio', { direction: 'recvonly' });
+  // CALL MODE (bead gateopener-1pm.3): the audio transceiver's POSITION never
+  // changes -- only its direction/track do, sendrecv with the mic track in
+  // place of recvonly with no track -- per the viewdoor-capture-2026-09-27
+  // analysis, this is the only structural difference vs. the official app's
+  // on-demand offer.
+  if (callMode) {
+    pc.addTransceiver(micTrack, { direction: 'sendrecv' });
+  } else {
+    pc.addTransceiver('audio', { direction: 'recvonly' });
+  }
   pc.addTransceiver('video', { direction: 'recvonly' });
   pc.createDataChannel('data');
 
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);
   logMsg("setLocalDescription done, waiting for bounded ICE snapshot...");
+
+  // CALL MODE diagnostic (bead gateopener-1pm.3): confirm PCMA (payload 8)
+  // is present on the offered audio m-line -- "Offer PCMA or you get
+  // nothing" per the August 2026 ring-capture README.
+  if (callMode) {
+    const localSdp = pc.localDescription && pc.localDescription.sdp;
+    diag("offer audio codecs: " + audioCodecsFromSdp(localSdp).join(","));
+  }
 
   const iceWaitResult = await waitForBoundedIceSnapshot(pc);
   if (window.__state.pc !== pc ||
@@ -590,6 +697,11 @@ window.applyAnswer = async function (answerSdp) {
   diag("remote answer candidates: " + JSON.stringify(remoteCandidates));
   await pc.setRemoteDescription({ type: 'answer', sdp: answerSdp });
   logMsg("setRemoteDescription(answer) done, signalingState=" + pc.signalingState);
+  // CALL MODE (bead gateopener-1pm.3): report the door's answered audio
+  // direction/codec so the operator bead (1pm.6) can verify without a proxy.
+  if (window.__CALL_MODE__ === true) {
+    diag("answer audio: " + audioDirectionFromSdp(answerSdp) + " " + primaryAudioCodecName(answerSdp));
+  }
   return true;
 };
 
@@ -867,8 +979,12 @@ function stopSelectedPairPolling() {
 // page variant without a #v element (there is none today, but future-proof
 // per this bead's brief) never throws. Returns a short status string Swift
 // records into diagnostics; never throws.
-window.ensurePlaying = async function () {
-  const video = document.getElementById("v");
+// `elementId` defaults to "v" (unchanged pre-gateopener-1pm.3 behavior, and
+// the only value Swift's existing view-mode call sites ever pass). Call mode
+// (bead gateopener-1pm.3) reuses this same retry pattern for the hidden #a
+// inbound-audio element by passing "a" explicitly (see pc.ontrack above).
+window.ensurePlaying = async function (elementId) {
+  const video = document.getElementById(elementId || "v");
   if (!video) return "no-video";
   if (!video.paused) return "playing";
   try {
@@ -928,6 +1044,14 @@ window.closeSession = function () {
   if (window.__state.cancelGathering) {
     window.__state.cancelGathering();
   }
+  // CALL MODE (bead gateopener-1pm.3): stop the mic track on every teardown
+  // path. window.__state.micStream is only ever set in call mode, so this is
+  // a no-op (view mode never sets it) without needing an explicit
+  // __CALL_MODE__ check here.
+  if (window.__state.micStream) {
+    window.__state.micStream.getTracks().forEach((track) => track.stop());
+    window.__state.micStream = null;
+  }
   const pc = window.__state.pc;
   if (pc) {
     try {
@@ -939,7 +1063,28 @@ window.closeSession = function () {
   window.__state.pc = null;
   const video = document.getElementById("v");
   video.srcObject = null;
+  const audioEl = document.getElementById("a");
+  if (audioEl) audioEl.srcObject = null;
   return true;
+};
+
+// CALL MODE (bead gateopener-1pm.3): mutes/unmutes the outbound mic track
+// without renegotiating. No-op (returns false) if there is no mic track,
+// i.e. any view session.
+window.setMicEnabled = function (enabled) {
+  if (!window.__state.micStream) return false;
+  window.__state.micStream.getTracks().forEach((track) => { track.enabled = !!enabled; });
+  return true;
+};
+
+// CALL MODE (bead gateopener-1pm.3): explicitly stops the mic track (closeSession
+// above also stops it, but hangUp does so directly too per this bead's brief)
+// and then tears down the session exactly like closeSession().
+window.hangUp = function () {
+  if (window.__state.micStream) {
+    window.__state.micStream.getTracks().forEach((track) => track.stop());
+  }
+  return window.closeSession();
 };
 </script>
 </body>
