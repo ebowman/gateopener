@@ -85,12 +85,10 @@ struct DoorVideoView: View {
             }
         }
         .animation(.easeOut(duration: 0.25), value: Self.overlay(for: state))
-        // 4:3, matching the door camera's native 320x240 frame (see the
-        // comelit memories) and MainView's 4:3 slot. With 16:9 here the view
-        // was letterboxed inside the slot AND the 4:3 stream was pillarboxed
-        // inside the view, so the picture filled only ~75% of the slot.
-        .aspectRatio(4.0 / 3.0, contentMode: .fit)
-        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        // No aspect ratio or clip of its own: this view fills whatever its
+        // host gives it. MainView's slot owns the 4:3 sizing (the door
+        // camera's native 320x240 ratio) and the single rounded clip, so
+        // there is exactly one shape and no inner border/corner mismatch.
         .onAppear {
             session.ensurePlayingFromHost()
         }

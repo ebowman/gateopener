@@ -348,6 +348,9 @@ struct MainView: View {
     /// ONLY that overlay, not the whole slot — re-evaluating the
     /// WKWebView-hosting subtree every second would be an avoidable risk to
     /// the live video (reviewer finding on this bead's FIX PASS).
+    /// Height cap for the video slot; the width cap is derived from it at 4:3.
+    static let slotMaxHeight: CGFloat = 280
+
     @ViewBuilder
     private var videoSlot: some View {
         let content = DoorVideoSlotContent.content(
@@ -385,11 +388,15 @@ struct MainView: View {
                 placeholder(icon: "exclamationmark.triangle", message: message, retry: true)
             }
         }
+        // Size, background and clip are applied to the SAME 4:3-fitted view
+        // (background/clip before the outer frames) so the black slot is
+        // exactly the picture's rectangle: no side bars when the height cap
+        // wins on wide phones, no inner border, one rounded shape.
         .aspectRatio(4.0 / 3.0, contentMode: .fit)
-        .frame(maxWidth: .infinity)
-        .frame(maxHeight: 280)
         .background(Color.black)
         .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .frame(maxWidth: Self.slotMaxHeight * 4.0 / 3.0)
+        .frame(maxWidth: .infinity)
         .animation(.easeInOut(duration: 0.25), value: content)
     }
 
