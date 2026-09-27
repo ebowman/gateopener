@@ -107,5 +107,23 @@ struct DebugLaunchOptionsParsingTests {
         let result = DebugLaunchOptions.parseMockVideoTimeline(in: ["app", "--mock-gate", "ok"])
         #expect(result == nil)
     }
+
+    // MARK: - isMicProbeRequested (--mic-probe, bead gateopener-1pm.1)
+
+    /// MUTATION CHECK: replacing `contains("--mic-probe")` with `contains`
+    /// of any other/wrong literal would fail this assertion.
+    @Test func isMicProbeRequestedTrueWhenFlagPresent() {
+        #expect(DebugLaunchOptions.isMicProbeRequested(in: ["app", "--mic-probe"]) == true)
+    }
+
+    /// MUTATION CHECK: a hardcoded `true` return would fail this assertion.
+    @Test func isMicProbeRequestedFalseWhenFlagAbsent() {
+        #expect(DebugLaunchOptions.isMicProbeRequested(in: ["app", "--mock-gate", "ok"]) == false)
+    }
+
+    /// Present alongside unrelated flags — order/position must not matter.
+    @Test func isMicProbeRequestedTrueAlongsideOtherFlags() {
+        #expect(DebugLaunchOptions.isMicProbeRequested(in: ["app", "--mock-gate", "ok", "--mic-probe"]) == true)
+    }
 }
 #endif

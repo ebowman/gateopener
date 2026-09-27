@@ -33,6 +33,7 @@ import os
 ///   - `--mock-video [<connectingSeconds> <streamingSeconds>]`: see
 ///     `mockVideoOnLaunch`/`mockVideoTimeline`.
 ///   - `--auto-pin-after <seconds>`: see `autoPinAfterSeconds`.
+///   - `--mic-probe`: see `micProbeOnLaunch`.
 enum DebugLaunchOptions {
     /// The fake `GateOpening` mode requested by `--mock-gate`, or `nil` if
     /// that argument was not passed (production `GateClient` is used).
@@ -146,6 +147,31 @@ enum DebugLaunchOptions {
     /// so the door-video panel itself can be screenshotted.
     static var mockVideoOnLaunch: Bool {
         ProcessInfo.processInfo.arguments.contains("--mock-video")
+    }
+
+    /// True if `--mic-probe` was passed on the launch command line (bead
+    /// gateopener-1pm.1 SPIKE): after launch, `GateOpenerIOSApp` runs
+    /// `MicProbe.run()` — a standalone, `DoorVideoSession`-free WKWebView
+    /// loading `door-video.html` exactly as a real session does, calling
+    /// `getUserMedia` and then (per that bead's NOTES) probing for a
+    /// non-mDNS host ICE candidate — and logs/persists the one-line result.
+    /// The SAME probe is also reachable without a launch argument via
+    /// Settings' DEBUG-only "Run mic probe" row (`SettingsView
+    /// .diagnosticsSection`), which is the practical path on a real,
+    /// installed-from-Xcode device where launch arguments are awkward to
+    /// pass.
+    static var micProbeOnLaunch: Bool {
+        isMicProbeRequested(in: ProcessInfo.processInfo.arguments)
+    }
+
+    /// Pure parsing logic behind `micProbeOnLaunch`, factored out (mirroring
+    /// `parseSecondsFlag`/`parseMockVideoTimeline` above) so
+    /// `DebugLaunchOptionsParsingTests` can exercise it directly against a
+    /// literal `[String]` array — `ProcessInfo.processInfo.arguments` itself
+    /// is fixed for the life of the test process and cannot be swapped
+    /// per-test.
+    static func isMicProbeRequested(in arguments: [String]) -> Bool {
+        arguments.contains("--mic-probe")
     }
 
     /// Optional `<connectingSeconds> <streamingSeconds>` timeline overrides

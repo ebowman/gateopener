@@ -338,6 +338,17 @@ struct GateOpenerIOSApp: App {
                 logger.notice("--video-harness: starting session")
                 await session.start()
             }
+            // `--mic-probe` (bead gateopener-1pm.1 SPIKE): runs `MicProbe
+            // .run()` — a standalone, `DoorVideoSession`-free WKWebView —
+            // and logs/persists its one-line result. Independent of
+            // `videoHarnessSession`'s guard above: this touches no shared
+            // state and never constructs a real `DoorVideoSession`, so it
+            // is safe to also pass `--video-harness`/`--mock-video` in the
+            // same launch, though there is normally no reason to.
+            .task {
+                guard DebugLaunchOptions.micProbeOnLaunch else { return }
+                await MicProbe.run()
+            }
             #endif
     }
 }

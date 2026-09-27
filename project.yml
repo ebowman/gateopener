@@ -44,6 +44,13 @@ targets:
       # path here rather than copied into iOS/Resources.
       - path: Resources/door-video.html
         buildPhase: resources
+      # DEBUG-only mic-probe script body (bead gateopener-1pm.1) -- see
+      # `MicProbe.swift` (iOS/App/Video) and this file's own doc comment.
+      # Bundled unconditionally (xcodegen's `resources` build phase has no
+      # per-configuration filter here), same as door-video.html; the SWIFT
+      # code that reads it is what is `#if DEBUG`-gated.
+      - path: Resources/mic-probe.js
+        buildPhase: resources
       # Sources/GateOpener/GateControllerObservable.swift is deliberately NOT
       # included here: despite its "Foundation+Observation only" doc comment,
       # it references `GlobalHotkey` (Sources/GateOpener/GlobalHotkey.swift),

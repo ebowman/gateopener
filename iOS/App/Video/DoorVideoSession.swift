@@ -293,6 +293,33 @@ public final class DoorVideoSession: NSObject {
     private var debugStubTimeline: (connectingDelay: TimeInterval, streamingDuration: TimeInterval, failAfter: String?)?
     #endif
 
+    /// Builds the `WKWebViewConfiguration` used to load `door-video.html`.
+    /// Factored out (bead gateopener-1pm.1) so `MicProbe`'s standalone,
+    /// session-free web view (built by the DEBUG-only `--mic-probe` launch
+    /// flag / Settings' "Run mic probe" row) is GUARANTEED to run under the
+    /// exact same inline-playback/autoplay/PiP configuration a real session
+    /// does, rather than a hand-copied duplicate liable to drift out of
+    /// sync. Deliberately does NOT attach a `WKUserContentController`'s
+    /// message handlers ("frame"/"diag") — those forward to a
+    /// `DoorVideoSession` instance (see `init`'s weak-forwarder rationale
+    /// below) and are irrelevant to `MicProbe`, which reads its result
+    /// directly from `callAsyncJavaScript`'s return value.
+    static func makeWebViewConfiguration() -> WKWebViewConfiguration {
+        let config = WKWebViewConfiguration()
+        // Without these two, iOS refuses to autoplay the <video> element
+        // inline and the view stays permanently black: WKWebView defaults
+        // to requiring an explicit user gesture before ANY media plays, and
+        // to allowing playback only fullscreen unless inline playback is
+        // explicitly opted into.
+        config.allowsInlineMediaPlayback = true
+        config.mediaTypesRequiringUserActionForPlayback = []
+        // The stream is recvonly/muted (v1 has no door audio) and shown
+        // inline in the app's own UI; Picture in Picture would only ever
+        // be a confusing, unwanted affordance here.
+        config.allowsPictureInPictureMediaPlayback = false
+        return config
+    }
+
     /// - Parameter appSettings: Supplies `cachedGates` — the last
     ///   locally-persisted discovery result (`GateController.discover()`
     ///   writes it; see that type and `AppSettings.cachedGates`'s doc
@@ -317,18 +344,7 @@ public final class DoorVideoSession: NSObject {
         self.registry = registry
         self.cooldownSleep = cooldownSleep
 
-        let config = WKWebViewConfiguration()
-        // Without these two, iOS refuses to autoplay the <video> element
-        // inline and the view stays permanently black: WKWebView defaults
-        // to requiring an explicit user gesture before ANY media plays, and
-        // to allowing playback only fullscreen unless inline playback is
-        // explicitly opted into.
-        config.allowsInlineMediaPlayback = true
-        config.mediaTypesRequiringUserActionForPlayback = []
-        // The stream is recvonly/muted (v1 has no door audio) and shown
-        // inline in the app's own UI; Picture in Picture would only ever
-        // be a confusing, unwanted affordance here.
-        config.allowsPictureInPictureMediaPlayback = false
+        let config = Self.makeWebViewConfiguration()
 
         let contentController = WKUserContentController()
         config.userContentController = contentController
@@ -345,6 +361,13 @@ public final class DoorVideoSession: NSObject {
         super.init()
 
         webView.navigationDelegate = self
+        // Bead gateopener-1pm.1: required for `requestMediaCapturePermissionFor
+        // :initiatedByFrame:type:decisionHandler:` (below) to ever be
+        // called at all -- without a `uiDelegate`, WKWebView silently
+        // denies every `getUserMedia` call rather than consulting one.
+        // View-only sessions never call `getUserMedia`, so this is a no-op
+        // in practice until call mode (bead 1pm.4/1pm.5) lands.
+        webView.uiDelegate = self
         // Registered via a weak-referencing shim (`ScriptMessageForwarder`
         // below), NOT `self` directly: `WKUserContentController.add(_:
         // name:)` retains its handler strongly, and the content controller
@@ -1426,6 +1449,75 @@ extension DoorVideoSession: WKNavigationDelegate {
             self.pageLoadContinuation?.resume()
             self.pageLoadContinuation = nil
         }
+    }
+}
+
+// MARK: - WKUIDelegate (mic permission grant, bead gateopener-1pm.1)
+
+extension DoorVideoSession: WKUIDelegate {
+    /// Answers WKWebView's mic/camera permission prompt for `door-
+    /// video.html`'s page. Kept as a thin wrapper around the two pure
+    /// statics below (`mediaCaptureDecision`/`isOurOrigin`) so the actual
+    /// decision logic is unit-testable without a real `WKSecurityOrigin`/
+    /// `WKUIDelegate` call.
+    ///
+    /// Deliberately NOT `nonisolated` (unlike `WKNavigationDelegate` above):
+    /// `WKSecurityOrigin.protocol`/`.host` are themselves `@MainActor`-
+    /// isolated in the SDK's overlay, so reading them requires this method
+    /// to run on the main actor too — which it already does, since
+    /// `DoorVideoSession` itself is `@MainActor` and this delegate is only
+    /// ever installed on `webView` (also main-actor-confined). `type` and
+    /// `mediaCaptureDecision`/`isOurOrigin` are pure/`nonisolated`, so no
+    /// hop is otherwise needed; `decisionHandler` is invoked synchronously.
+    public func webView(
+        _ webView: WKWebView,
+        requestMediaCapturePermissionFor origin: WKSecurityOrigin,
+        initiatedByFrame frame: WKFrameInfo,
+        type: WKMediaCaptureType,
+        decisionHandler: @escaping @MainActor (WKPermissionDecision) -> Void
+    ) {
+        let originIsOurs = Self.isOurOrigin(protocol: origin.protocol, host: origin.host)
+        decisionHandler(Self.mediaCaptureDecision(type: type, originIsOurs: originIsOurs))
+    }
+
+    /// Pure decision behind the delegate method above: grants ONLY a
+    /// microphone request from our own page's origin. A VIEW-only session
+    /// (the only kind that exists today) never calls `getUserMedia` at
+    /// all, so in practice this only ever fires once bead 1pm.4/1pm.5's
+    /// CALL mode lands (or the DEBUG-only mic probe, bead 1pm.1, runs).
+    /// Camera is never requested by this app and is denied unconditionally
+    /// (`.cameraAndMicrophone` is also denied — it is not "microphone
+    /// only", so it fails the `type == .microphone` check below). A
+    /// microphone request from any origin OTHER than our own page is
+    /// denied too — `door-video.html` never loads third-party content, so
+    /// there should never legitimately be one — per this bead's HARD RULE
+    /// that view-only sessions must never request the mic and no
+    /// cross-origin content may ever acquire it.
+    nonisolated static func mediaCaptureDecision(type: WKMediaCaptureType, originIsOurs: Bool) -> WKPermissionDecision {
+        guard originIsOurs, type == .microphone else { return .deny }
+        return .grant
+    }
+
+    /// Pure origin check behind `mediaCaptureDecision`'s `originIsOurs`
+    /// argument, taking plain strings (rather than a real
+    /// `WKSecurityOrigin`, which cannot be constructed directly in a test)
+    /// so it is independently testable.
+    ///
+    /// `door-video.html` is loaded via `loadFileURL` today, i.e. a
+    /// `file://` origin — `WKSecurityOrigin` reports `protocol == "file"`
+    /// and an EMPTY `host` for that scheme, so `host` is deliberately
+    /// unchecked here (any host, including empty, is accepted for the
+    /// `file` protocol).
+    ///
+    /// Bead gateopener-1pm.2 may move `door-video.html` to a secure-context
+    /// origin (an https baseURL or a `localhost` origin) for
+    /// `getUserMedia` to be reliably exposed at all. NOT implemented here
+    /// — this bead is scoped to the file:// spike only — but if/when 1pm.2
+    /// lands, this function must be widened to also accept that specific
+    /// new origin BY EXACT HOST (never "any https host"), or a malicious
+    /// page loaded some other way could otherwise pass this check.
+    nonisolated static func isOurOrigin(protocol originProtocol: String, host: String) -> Bool {
+        originProtocol == "file"
     }
 }
 

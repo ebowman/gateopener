@@ -34,6 +34,14 @@
 	<false/>
 	<key>NSAccentColorName</key>
 	<string>AccentColor</string>
+	<!-- Bead gateopener-1pm.1: only ever presented if `door-video.html`
+	     (loaded via `loadFileURL`, see `DoorVideoSession`) calls
+	     `navigator.mediaDevices.getUserMedia({audio:true})` -- which today
+	     only happens for a call-mode session (bead 1pm.4/1pm.5, not yet
+	     landed) or the DEBUG-only `--mic-probe`/"Run mic probe" spike
+	     (bead 1pm.1). A view-only session never requests the mic. -->
+	<key>NSMicrophoneUsageDescription</key>
+	<string>GateOpener uses the microphone so you can talk to visitors at the gate.</string>
 	<key>UILaunchScreen</key>
 	<dict/>
 	<key>UISupportedInterfaceOrientations</key>

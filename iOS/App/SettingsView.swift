@@ -444,6 +444,20 @@ struct SettingsView: View {
             NavigationLink("Open history") {
                 OpenHistoryView(journal: environment.openAttemptJournal)
             }
+            #if DEBUG
+            // Bead gateopener-1pm.1 SPIKE: the practical way to run
+            // `MicProbe` on an already-installed real device, where
+            // passing `--mic-probe` as a launch argument is impractical
+            // (no Xcode/simctl attached). Compiled out of Release/App
+            // Store builds entirely — matches every other DEBUG-only
+            // affordance in this file. Result is logged via os.Logger AND
+            // appended to the same video diagnostics history the "Share
+            // log"/"Copy" buttons above already expose, so no separate UI
+            // is needed to retrieve it.
+            Button("Run mic probe") {
+                Task { await MicProbe.run() }
+            }
+            #endif
         } header: {
             Text("Diagnostics")
         }
