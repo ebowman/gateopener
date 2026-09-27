@@ -687,27 +687,56 @@ private func waitUntil(_ predicate: () -> Bool, maxYields: Int = 500) async {
     }
 }
 
+/// Polls `predicate` against a 2s wall-clock deadline rather than a fixed
+/// `Task.yield()` iteration count (mirrors
+/// `GateControllerObservableTests.waitUntilDeadline`, added for the same
+/// reason in bead gateopener-41m.23). Used together with a latched
+/// `onStateChange` recorder -- see `requestOpenWhenReachableOpensImmediatelyAndSucceeds`
+/// and `requestOpenWhileOpeningIsANoOp` (gateopener-966) -- so the predicate
+/// checks the recorded sequence for a state that has already been
+/// delivered, rather than re-reading `controller.state`, which can bounce
+/// back to `.idle` via the no-op-sleep auto-reset before a late poll
+/// observes the terminal state it raced past.
+@MainActor
+private func waitUntilDeadline(_ predicate: () -> Bool) async {
+    let deadline = Date().addingTimeInterval(2)
+    while !predicate(), Date() < deadline {
+        await Task.yield()
+    }
+}
+
 // MARK: - (a) reachable -> requestOpen leads to .opening then .succeeded, exactly ONE open call
 
 @Test @MainActor func requestOpenWhenReachableOpensImmediatelyAndSucceeds() async throws {
     let (controller, gateOpening, _, _, _) = makeController(reachability: FakeReachability(isReachable: true))
 
+    // Latch every observed state via `onStateChange` and assert against the
+    // recorded sequence, rather than polling `controller.state` for a
+    // terminal `.succeeded`. This controller is built with the default
+    // no-op `RecordingSleep`, so the auto-reset `.succeeded` -> `.idle`
+    // (`transition(to:)`, GateController.swift ~408) fires as soon as the
+    // fire-and-forget reset `Task` gets scheduled -- there is no real delay
+    // to rely on. Polling `controller.state` for `.succeeded` is therefore a
+    // scheduler race against that reset: `waitUntil` can observe `.idle`
+    // (the post-reset state) before it ever observes `.succeeded`, or land
+    // on `.succeeded` only by luck. Recording every transition via
+    // `onStateChange` sidesteps the race entirely: `.succeeded` WILL be
+    // delivered to the handler synchronously on the state-owning actor
+    // before any reset can run, so it is always present in the recorded
+    // sequence regardless of how the reset task happens to interleave.
+    // (gateopener-966)
     var observedStates: [GateState] = []
     controller.onStateChange = { observedStates.append($0) }
 
     controller.requestOpen()
 
-    await waitUntil {
-        if case .succeeded = controller.state { return true }
-        return false
+    await waitUntilDeadline {
+        observedStates.contains { if case .succeeded = $0 { return true }; return false }
     }
 
     #expect(gateOpening.openCallCount == 1)
     #expect(observedStates.contains(.opening))
-    guard case .succeeded = controller.state else {
-        Issue.record("expected .succeeded, got \(controller.state)")
-        return
-    }
+    #expect(observedStates.contains { if case .succeeded = $0 { return true }; return false })
 }
 
 // MARK: - (b) unreachable -> .queued, ZERO open calls; flip(true) -> exactly one open call, terminal .succeeded
@@ -862,6 +891,16 @@ private func waitUntil(_ predicate: () -> Bool, maxYields: Int = 500) async {
     let (controller, gateOpening, _, _, _) = makeController(reachability: reachability)
     gateOpening.gateOpenCalls = true
 
+    // Latch every observed state via `onStateChange` rather than polling
+    // `controller.state` for the eventual `.succeeded`: this controller
+    // uses the default no-op `RecordingSleep`, so the auto-reset
+    // `.succeeded` -> `.idle` fires as soon as the reset `Task` is
+    // scheduled, making a poll of `controller.state` alone racy (same
+    // failure mode as `requestOpenWhenReachableOpensImmediatelyAndSucceeds`,
+    // gateopener-966).
+    var observedStates: [GateState] = []
+    controller.onStateChange = { observedStates.append($0) }
+
     controller.requestOpen()
 
     while gateOpening.waitingCount() < 1 {
@@ -884,10 +923,10 @@ private func waitUntil(_ predicate: () -> Bool, maxYields: Int = 500) async {
 
     gateOpening.releaseOpen()
 
-    await waitUntil {
-        if case .succeeded = controller.state { return true }
-        return false
+    await waitUntilDeadline {
+        observedStates.contains { if case .succeeded = $0 { return true }; return false }
     }
 
     #expect(gateOpening.openCallCount == 1)
+    #expect(observedStates.contains { if case .succeeded = $0 { return true }; return false })
 }
