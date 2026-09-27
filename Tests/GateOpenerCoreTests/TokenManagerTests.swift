@@ -632,6 +632,49 @@ private func makeTokenSet(
     #expect(persisted?.accessToken == "soon-to-expire")
 }
 
+/// Acceptance test for gateopener-69h: `prewarm(expiringWithin:)`'s
+/// `Duration` -> `TimeInterval` conversion must not truncate a fractional
+/// window. Token expires in 200.4s -- comfortably inside the 300s default
+/// `isExpired` skew, so once `prewarm`'s own window check lets the refresh
+/// attempt through, `resolveAccessTokenCore` always chooses to refresh
+/// regardless of the window's exact value. The window itself is 200.5s, so
+/// the ONLY thing gating whether `prewarm` even attempts the refresh is
+/// whether its `Duration` -> `TimeInterval` conversion preserves the 0.5s
+/// fractional remainder: 200.4 <= 200.5 (true, refresh attempted) vs a
+/// truncated 200.4 <= 200 (false, `prewarm` returns early with no refresh).
+///
+/// MUTATION CHECK: if the conversion truncated the window's fractional
+/// remainder (200.5s -> 200s), the boundary check becomes
+/// `200.4 <= 200` (false), so `refreshCallCount` would be 0 instead of 1 --
+/// this test would fail.
+@Test func prewarmHonoursFractionalExpiringWithinWindow() async throws {
+    let store = MockCredentialStore()
+    let issuing = MockTokenIssuing()
+    let fixedNow = Date()
+    // Built directly against `fixedNow` (rather than via `makeTokenSet`'s
+    // real-clock `receivedAt` default) so the 200.4s/200.5s boundary is
+    // exact, with no real-clock skew between construction and `fixedNow`.
+    let soonToExpire = TokenSet(
+        accessToken: "soon-to-expire",
+        refreshToken: "refresh-token",
+        expiresAt: fixedNow.addingTimeInterval(200.4),
+        tokenType: "bearer"
+    )
+    let refreshed = makeTokenSet(accessToken: "refreshed-token", expiresIn: 3600)
+    try store.saveCredentials(username: "alice", password: "s3cret")
+    try store.saveTokens(soonToExpire)
+    issuing.refreshResult = .success(refreshed)
+
+    let manager = TokenManager(api: issuing, credentialStore: store, now: { fixedNow })
+
+    await manager.prewarm(expiringWithin: .milliseconds(200_500))
+
+    #expect(issuing.refreshCallCount == 1)
+
+    let persisted = try store.loadTokens()
+    #expect(persisted?.accessToken == "refreshed-token")
+}
+
 // MARK: - setCredentialStore() tests
 
 /// Covers bead gateopener-672.25: after `AppEnvironment

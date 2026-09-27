@@ -424,6 +424,24 @@ final class RecordingURLProtocol: URLProtocol, @unchecked Sendable {
     #expect(script.timeoutIntervals == [4])
 }
 
+/// Acceptance test for gateopener-69h: a fractional-second `requestTimeout`
+/// (2500ms) is honoured EXACTLY as 2.5, not truncated to 2.0 by the
+/// `Duration` -> `TimeInterval` conversion.
+///
+/// MUTATION CHECK: reverting `ComelitAPI`'s conversion of `requestTimeout` to
+/// `TimeInterval(requestTimeout.components.seconds)` (dropping the
+/// `attoseconds` remainder) makes this assertion fail: 2.0 != 2.5.
+@Test func refreshHonoursCustomRequestTimeoutWithFractionalSeconds() async throws {
+    let script = RequestScript(statuses: [200])
+    let session = makeSequencedSession(script: script)
+    let api = ComelitAPI(session: session, requestTimeout: .milliseconds(2500))
+
+    let original = TokenSet(accessToken: "old", refreshToken: "old-refresh", expiresIn: 10, tokenType: "bearer")
+    _ = try? await api.refresh(original)
+
+    #expect(script.timeoutIntervals == [2.5])
+}
+
 // MARK: - gateopener-41m.4: single retry on refresh_token / authorization_code
 
 /// Acceptance test for step 2: refresh returns 500 then 200 -> succeeds

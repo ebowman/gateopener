@@ -805,6 +805,33 @@ final class SleepRecorder: @unchecked Sendable {
     #expect(script.timeoutIntervals == [5, 5, 5])
 }
 
+/// Acceptance test for gateopener-69h: a fractional-second entry in
+/// `requestTimeouts` (2500ms) is honoured EXACTLY as 2.5, not truncated to
+/// 2.0 by the `Duration` -> `TimeInterval` conversion.
+///
+/// MUTATION CHECK: reverting `GateClient`'s conversion of
+/// `timeoutForAttempt` to `TimeInterval(timeoutForAttempt.components.seconds)`
+/// (dropping the `attoseconds` remainder) makes this assertion fail:
+/// 2.0 != 2.5.
+@Test func openHonoursFractionalRequestTimeout() async throws {
+    let script = RequestScript(statuses: [500])
+    let session = makeSequencedSession(script: script)
+
+    let (tokenManager, _) = makeTokenManager()
+    let retryPolicy = RetryPolicy(
+        maxAttempts: 1,
+        requestTimeouts: [.milliseconds(2500)],
+        sleep: { _ in }
+    )
+    let client = GateClient(session: session, tokenManager: tokenManager, retryPolicy: retryPolicy)
+
+    await #expect(throws: Error.self) {
+        try await client.open(endpointId: "VIP#OD#SB100001.1")
+    }
+
+    #expect(script.timeoutIntervals == [2.5])
+}
+
 // MARK: - open: .invalidCredentials is never retried (safety: retrying a
 // wrong password against the live service is pointless and could contribute
 // to account lockout)

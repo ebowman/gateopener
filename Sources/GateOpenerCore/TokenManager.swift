@@ -160,8 +160,7 @@ public actor TokenManager {
         }
 
         let referenceNow = now()
-        let windowSeconds = TimeInterval(window.components.seconds)
-            + TimeInterval(window.components.attoseconds) / 1e18
+        let windowSeconds = window.timeInterval
         guard stored.expiresAt <= referenceNow.addingTimeInterval(windowSeconds) else {
             return
         }
