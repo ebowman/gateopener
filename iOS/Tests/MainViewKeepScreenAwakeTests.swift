@@ -34,4 +34,28 @@ struct MainViewKeepScreenAwakeTests {
     @Test func neitherReasonAllowsScreenToSleep() {
         #expect(MainView.shouldKeepScreenAwake(isPinned: false, openFlowNeedsAwake: false) == false)
     }
+
+    // MARK: - isCallActive (bead gateopener-1pm.5)
+
+    /// A live call alone (not pinned, no open in flight) must still keep
+    /// the screen awake.
+    ///
+    /// MUTATION CHECK: dropping `isCallActive` from the `||` chain (or
+    /// defaulting it away) would fail this specific case while every case
+    /// above still passes.
+    @Test func callActiveAloneKeepsScreenAwake() {
+        #expect(MainView.shouldKeepScreenAwake(isPinned: false, openFlowNeedsAwake: false, isCallActive: true) == true)
+    }
+
+    /// All three reasons at once still keeps the screen awake.
+    @Test func allThreeReasonsKeepsScreenAwake() {
+        #expect(MainView.shouldKeepScreenAwake(isPinned: true, openFlowNeedsAwake: true, isCallActive: true) == true)
+    }
+
+    /// All three false (the explicit form of `neitherReasonAllowsScreenToSleep`
+    /// above, now naming `isCallActive` explicitly) allows the screen to
+    /// sleep.
+    @Test func allThreeReasonsFalseAllowsScreenToSleep() {
+        #expect(MainView.shouldKeepScreenAwake(isPinned: false, openFlowNeedsAwake: false, isCallActive: false) == false)
+    }
 }

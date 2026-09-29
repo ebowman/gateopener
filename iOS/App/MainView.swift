@@ -53,6 +53,13 @@ struct MainView: View {
     /// `doorVideoCoordinator.setPinned(true)` call instead. See
     /// `DebugLaunchOptions.autoPinAfterSeconds`.
     @State private var didScheduleDebugAutoPin = false
+
+    /// Debug-only, `--auto-call-after <seconds>` verification hook (bead
+    /// gateopener-1pm.5): the "Talk" button itself needs a real tap, which
+    /// `simctl launch` cannot perform, so this schedules a single
+    /// `doorVideoCoordinator.startCall()` call instead. See
+    /// `DebugLaunchOptions.autoCallAfterSeconds`.
+    @State private var didScheduleDebugAutoCall = false
     #endif
 
     private var gateDisplayName: String {
@@ -101,8 +108,14 @@ struct MainView: View {
     /// at once to keep the screen awake (e.g. a pinned session while idle
     /// would incorrectly let the screen sleep) — `MainViewKeepScreenAwakeTests`
     /// covers every combination with a distinct expectation.
-    static func shouldKeepScreenAwake(isPinned: Bool, openFlowNeedsAwake: Bool) -> Bool {
-        isPinned || openFlowNeedsAwake
+    ///
+    /// - Parameter isCallActive: Bead gateopener-1pm.5:
+    ///     `doorVideoCoordinator.isCallActive` — a third, independent reason
+    ///     to stay awake (a live call, regardless of pin/open-flow state).
+    ///     Defaults to `false` so every pre-existing call site/test that
+    ///     predates this bead keeps compiling and passing unchanged.
+    static func shouldKeepScreenAwake(isPinned: Bool, openFlowNeedsAwake: Bool, isCallActive: Bool = false) -> Bool {
+        isPinned || openFlowNeedsAwake || isCallActive
     }
 
     private var statusText: String {
@@ -216,6 +229,7 @@ struct MainView: View {
             #if DEBUG
             scheduleDebugAutoOpenIfNeeded()
             scheduleDebugAutoPinIfNeeded()
+            scheduleDebugAutoCallIfNeeded()
             if DebugLaunchOptions.openSettingsOnLaunch {
                 settingsPresented = true
             }
@@ -240,8 +254,32 @@ struct MainView: View {
             // gateopener-41m.15 STEP 5 requires.
             UIApplication.shared.isIdleTimerDisabled = Self.shouldKeepScreenAwake(
                 isPinned: isPinned,
-                openFlowNeedsAwake: Self.openFlowNeedsAwake(for: observable.state)
+                openFlowNeedsAwake: Self.openFlowNeedsAwake(for: observable.state),
+                isCallActive: doorVideoCoordinator.isCallActive
             )
+        }
+        .onChange(of: doorVideoCoordinator.isCallActive) { _, isCallActive in
+            // Bead gateopener-1pm.5: mirrors the `isPinned` handler above —
+            // a call starting/ending must also re-evaluate the combined
+            // idle-timer flag on its own, not only when `isPinned` happens to
+            // change at the same moment.
+            UIApplication.shared.isIdleTimerDisabled = Self.shouldKeepScreenAwake(
+                isPinned: doorVideoCoordinator.isPinned,
+                openFlowNeedsAwake: Self.openFlowNeedsAwake(for: observable.state),
+                isCallActive: isCallActive
+            )
+        }
+        .onChange(of: doorVideoCoordinator.sessionState) { _, newState in
+            // Bead gateopener-1pm.5: VoiceOver announcement once the call's
+            // audio direction is confirmed sendrecv (`.streaming` first
+            // reached for a `.call` session) — `DoorVideoCoordinator`
+            // guards its OWN "call connected" event the same way
+            // (`pendingCall`), but this announcement only needs `activeMode
+            // == .call` here since re-announcing on a later pinned renewal's
+            // reconnection is desirable (the operator genuinely reconnected).
+            if case .streaming = newState, doorVideoCoordinator.activeMode == .call {
+                UIAccessibility.post(notification: .announcement, argument: "Call connected")
+            }
         }
     }
 
@@ -361,6 +399,8 @@ struct MainView: View {
             isPinned: doorVideoCoordinator.isPinned,
             isRenewal: doorVideoCoordinator.isRenewing,
             pinStopMessage: doorVideoCoordinator.pinStopMessage,
+            isCall: doorVideoCoordinator.isCallActive,
+            pendingCall: doorVideoCoordinator.pendingCall,
             now: Date()
         )
 
@@ -375,17 +415,18 @@ struct MainView: View {
                     // only sets alongside a non-nil `session`. Falls back to
                     // the neutral placeholder rather than crashing if that
                     // invariant is ever violated.
-                    placeholder(icon: "video.fill", message: "Tap to view door", retry: false)
+                    placeholder(icon: "video.fill", message: "Tap to view door", retry: false, showTalk: true)
                 }
             case .tapToView(let message):
                 // `message` is `pinStopMessage` when the pin most recently
                 // auto-stopped itself (bead gateopener-41m.15 STEP 5), else
                 // `nil` for the plain neutral placeholder — either way the
                 // tap-to-view affordance/action (`viewDoor()`, UNPINNED) is
-                // identical.
-                placeholder(icon: "video.fill", message: message ?? "Tap to view door", retry: false)
+                // identical. `showTalk: true` (bead gateopener-1pm.5) adds the
+                // "Talk" action beside it.
+                placeholder(icon: "video.fill", message: message ?? "Tap to view door", retry: false, showTalk: true)
             case .failed(let message):
-                placeholder(icon: "exclamationmark.triangle", message: message, retry: true)
+                placeholder(icon: "exclamationmark.triangle", message: message, retry: true, showTalk: false)
             }
         }
         // Size, background and clip are applied to the SAME 4:3-fitted view
@@ -453,10 +494,14 @@ struct MainView: View {
                             isPinned: doorVideoCoordinator.isPinned,
                             isRenewal: doorVideoCoordinator.isRenewing,
                             pinStopMessage: doorVideoCoordinator.pinStopMessage,
+                            isCall: doorVideoCoordinator.isCallActive,
+                            pendingCall: doorVideoCoordinator.pendingCall,
                             now: timelineContext.date
                         )
                         if case .session(.busyRetry(let liveSecondsRemaining)) = liveContent {
                             busyRetryOverlay(secondsRemaining: liveSecondsRemaining)
+                        } else if case .session(.connectingCall(let liveSecondsRemaining)) = liveContent {
+                            connectingCallOverlay(secondsRemaining: liveSecondsRemaining)
                         } else if case .session(.reconnecting) = liveContent {
                             // The cooldown elapsed since the outer `content`
                             // was computed, and a pinned renewal is now
@@ -472,6 +517,30 @@ struct MainView: View {
                             busyRetryOverlay(secondsRemaining: secondsRemaining)
                         }
                     }
+                case .connectingCall(let secondsRemaining):
+                    if let secondsRemaining {
+                        TimelineView(.periodic(from: .now, by: 1)) { timelineContext in
+                            let liveContent = DoorVideoSlotContent.content(
+                                hasVisibleSession: doorVideoCoordinator.isPanelVisible,
+                                sessionState: doorVideoCoordinator.sessionState,
+                                lastTerminal: doorVideoCoordinator.lastTerminal,
+                                cooldownUntil: doorVideoCoordinator.cooldownUntil,
+                                isPinned: doorVideoCoordinator.isPinned,
+                                isRenewal: doorVideoCoordinator.isRenewing,
+                                pinStopMessage: doorVideoCoordinator.pinStopMessage,
+                                isCall: doorVideoCoordinator.isCallActive,
+                                pendingCall: doorVideoCoordinator.pendingCall,
+                                now: timelineContext.date
+                            )
+                            if case .session(.connectingCall(let liveSecondsRemaining)) = liveContent {
+                                connectingCallOverlay(secondsRemaining: liveSecondsRemaining)
+                            } else {
+                                connectingCallOverlay(secondsRemaining: secondsRemaining)
+                            }
+                        }
+                    } else {
+                        connectingCallOverlay(secondsRemaining: nil)
+                    }
                 case .reconnecting:
                     reconnectingOverlay()
                 case .none:
@@ -479,18 +548,41 @@ struct MainView: View {
                 }
             }
             .overlay(alignment: .topTrailing) {
-                Button {
-                    doorVideoCoordinator.dismiss()
-                } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .font(.title2)
-                        .foregroundStyle(.white, .black.opacity(0.4))
+                // Bead gateopener-1pm.5: the close (X) button is the panel's
+                // only ordinary exit, but a call has its own dedicated exit
+                // (Hang up) — hiding this while a call is active or
+                // connecting avoids a second, conflicting way to leave a call
+                // that does not go through `hangUp()`'s call-specific
+                // teardown/state reset.
+                if !(doorVideoCoordinator.isCallActive || doorVideoCoordinator.pendingCall) {
+                    Button {
+                        doorVideoCoordinator.dismiss()
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.title2)
+                            .foregroundStyle(.white, .black.opacity(0.4))
+                    }
+                    .padding(8)
+                    .accessibilityLabel("Close door camera")
                 }
-                .padding(8)
-                .accessibilityLabel("Close door camera")
             }
             .overlay(alignment: .topLeading) {
                 pinButton
+            }
+            .overlay(alignment: .bottomLeading) {
+                // Bead gateopener-1pm.5: lets the operator start talking
+                // directly from an already-live VIEW session, without first
+                // closing it — hidden once a call is active/connecting,
+                // since `callControls`' Hang up is the only exit at that
+                // point.
+                if !(doorVideoCoordinator.isCallActive || doorVideoCoordinator.pendingCall) {
+                    talkButton
+                }
+            }
+            .overlay(alignment: .bottom) {
+                if doorVideoCoordinator.isCallActive || doorVideoCoordinator.pendingCall {
+                    callControls
+                }
             }
             .overlay(alignment: .bottomTrailing) {
                 if doorVideoCoordinator.isPinned {
@@ -517,6 +609,89 @@ struct MainView: View {
         .padding(8)
         .accessibilityLabel(doorVideoCoordinator.isPinned ? "Unpin video" : "Pin video")
         .accessibilityValue("Keeps the camera on for up to 5 minutes")
+    }
+
+    /// The "Talk" button (bead gateopener-1pm.5): bottom-leading on a live
+    /// VIEW session, 44x44 material-circle hit target (mirrors `pinButton`'s
+    /// style), mic.fill glyph. Starts a call via `doorVideoCoordinator
+    /// .startCall()` and fires a light haptic.
+    private var talkButton: some View {
+        Button {
+            lightImpactGenerator.impactOccurred()
+            doorVideoCoordinator.startCall()
+        } label: {
+            Image(systemName: "mic.fill")
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(Color.white)
+                .frame(width: 44, height: 44)
+                .background(.ultraThinMaterial, in: Circle())
+        }
+        .padding(8)
+        .accessibilityLabel("Talk to visitor")
+    }
+
+    /// The live-call chrome (bead gateopener-1pm.5): bottom-center Mute
+    /// toggle + Hang up, shown in place of the close (X) button/Talk button
+    /// while `isCallActive`/`pendingCall`. Hang up is the ONLY exit from a
+    /// call — there is no separate close button during one.
+    private var callControls: some View {
+        HStack(spacing: 20) {
+            Button {
+                lightImpactGenerator.impactOccurred()
+                doorVideoCoordinator.setMicMuted(!doorVideoCoordinator.isMicMuted)
+            } label: {
+                Image(systemName: doorVideoCoordinator.isMicMuted ? "mic.slash.fill" : "mic.fill")
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(Color.white)
+                    .frame(width: 44, height: 44)
+                    .background(.ultraThinMaterial, in: Circle())
+            }
+            .accessibilityLabel(doorVideoCoordinator.isMicMuted ? "Unmute" : "Mute")
+
+            Button {
+                lightImpactGenerator.impactOccurred()
+                doorVideoCoordinator.hangUp()
+            } label: {
+                Image(systemName: "phone.down.fill")
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundStyle(Color.white)
+                    .frame(width: 44, height: 44)
+                    .background(Color.red, in: Circle())
+            }
+            .accessibilityLabel("Hang up")
+        }
+        .padding(.bottom, 8)
+    }
+
+    /// The "Connecting call…"/"Connecting call - Ns" scrim (bead
+    /// gateopener-1pm.5): same opaque style as `busyRetryOverlay`/
+    /// `reconnectingOverlay` so it fully covers `DoorVideoView`'s own
+    /// "Connecting…"/"Camera unavailable" text underneath. `secondsRemaining
+    /// == nil` reads "Connecting call…"; non-`nil` reads "Connecting call -
+    /// Ns", narrating the SAME door-busy-cooldown wait a view session would
+    /// show as "Door camera busy — retrying in Ns".
+    private func connectingCallOverlay(secondsRemaining: Int?) -> some View {
+        ZStack {
+            Color.black.opacity(0.92)
+            VStack(spacing: 8) {
+                ProgressView()
+                    .progressViewStyle(.circular)
+                    .tint(.white)
+                if let secondsRemaining {
+                    Text("Connecting call - \(secondsRemaining)s")
+                        .font(.footnote)
+                        .foregroundStyle(.white)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 12)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else {
+                    Text("Connecting call…")
+                        .font(.footnote)
+                        .foregroundStyle(.white)
+                }
+            }
+        }
+        .accessibilityElement(children: .combine)
     }
 
     /// The pinned countdown capsule (bead gateopener-41m.15 STEP 2):
@@ -595,8 +770,15 @@ struct MainView: View {
     /// Button calling viewDoor()"); `.failed` shows a plain icon/text with a
     /// separate, smaller "Retry" button instead, so a stray tap on the
     /// failure message itself is not misread as "retry".
+    ///
+    /// - Parameter showTalk: Bead gateopener-1pm.5: adds a second, smaller
+    ///   "Talk" pill (mirroring `.failed`'s "Retry" pill's style) below the
+    ///   tap-to-view area, calling `doorVideoCoordinator.startCall()`
+    ///   directly — a second, independent tap target from the tap-to-view
+    ///   area, not nested inside its `Button`. `false` for the `.failed`
+    ///   case (a failed session offers Retry, not Talk).
     @ViewBuilder
-    private func placeholder(icon: String, message: String, retry: Bool) -> some View {
+    private func placeholder(icon: String, message: String, retry: Bool, showTalk: Bool) -> some View {
         if retry {
             VStack(spacing: 8) {
                 Image(systemName: icon)
@@ -622,24 +804,42 @@ struct MainView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .accessibilityElement(children: .combine)
         } else {
-            Button {
-                lightImpactGenerator.impactOccurred()
-                doorVideoCoordinator.viewDoor()
-            } label: {
-                VStack(spacing: 8) {
-                    Image(systemName: icon)
-                        .font(.largeTitle)
-                        .foregroundStyle(.white.opacity(0.85))
-                    Text(message)
-                        .font(.footnote)
-                        .foregroundStyle(.white)
-                        .fixedSize(horizontal: false, vertical: true)
+            VStack(spacing: 8) {
+                Button {
+                    lightImpactGenerator.impactOccurred()
+                    doorVideoCoordinator.viewDoor()
+                } label: {
+                    VStack(spacing: 8) {
+                        Image(systemName: icon)
+                            .font(.largeTitle)
+                            .foregroundStyle(.white.opacity(0.85))
+                        Text(message)
+                            .font(.footnote)
+                            .foregroundStyle(.white)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(message)
+                .accessibilityHint("Double tap to view the door camera")
+
+                if showTalk {
+                    Button {
+                        lightImpactGenerator.impactOccurred()
+                        doorVideoCoordinator.startCall()
+                    } label: {
+                        Label("Talk", systemImage: "mic.fill")
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(Color.white)
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 6)
+                            .background(Color.white.opacity(0.2), in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Talk to visitor")
                 }
             }
-            .buttonStyle(.plain)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .accessibilityLabel(message)
-            .accessibilityHint("Double tap to view the door camera")
         }
     }
 
@@ -678,7 +878,8 @@ struct MainView: View {
         impactGenerator.impactOccurred()
         UIApplication.shared.isIdleTimerDisabled = Self.shouldKeepScreenAwake(
             isPinned: doorVideoCoordinator.isPinned,
-            openFlowNeedsAwake: true
+            openFlowNeedsAwake: true,
+            isCallActive: doorVideoCoordinator.isCallActive
         )
         observable.requestOpen()
         doorVideoCoordinator.startForOpen()
@@ -703,7 +904,8 @@ struct MainView: View {
         }
         UIApplication.shared.isIdleTimerDisabled = Self.shouldKeepScreenAwake(
             isPinned: doorVideoCoordinator.isPinned,
-            openFlowNeedsAwake: Self.openFlowNeedsAwake(for: newState)
+            openFlowNeedsAwake: Self.openFlowNeedsAwake(for: newState),
+            isCallActive: doorVideoCoordinator.isCallActive
         )
     }
 
@@ -735,6 +937,20 @@ struct MainView: View {
             try? await Task.sleep(for: .seconds(delaySeconds))
             lightImpactGenerator.impactOccurred()
             doorVideoCoordinator.setPinned(true)
+        }
+    }
+
+    /// `--auto-call-after <seconds>`: calls `doorVideoCoordinator
+    /// .startCall()` once, after the given delay, from `onAppear`. See
+    /// `DebugLaunchOptions.autoCallAfterSeconds`.
+    private func scheduleDebugAutoCallIfNeeded() {
+        guard !didScheduleDebugAutoCall,
+              let delaySeconds = DebugLaunchOptions.autoCallAfterSeconds else { return }
+        didScheduleDebugAutoCall = true
+        Task {
+            try? await Task.sleep(for: .seconds(delaySeconds))
+            lightImpactGenerator.impactOccurred()
+            doorVideoCoordinator.startCall()
         }
     }
     #endif

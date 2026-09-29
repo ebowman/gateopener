@@ -56,6 +56,16 @@ struct DebugLaunchOptionsParsingTests {
         #expect(DebugLaunchOptions.parseSecondsFlag("--auto-pin-after", in: arguments) == 9)
     }
 
+    /// `--auto-call-after <seconds>` (bead gateopener-1pm.5) parses through
+    /// the exact same shared `parseSecondsFlag` helper, distinct from
+    /// `--auto-pin-after`/`--auto-open-after` also present on the command
+    /// line.
+    @Test func parseSecondsFlagParsesAutoCallAfterDistinctFromOtherFlags() {
+        let arguments = ["app", "--auto-pin-after", "9", "--auto-call-after", "4"]
+        #expect(DebugLaunchOptions.parseSecondsFlag("--auto-call-after", in: arguments) == 4)
+        #expect(DebugLaunchOptions.parseSecondsFlag("--auto-pin-after", in: arguments) == 9)
+    }
+
     // MARK: - parseMockVideoTimeline (--mock-video [<connecting> <streaming>])
 
     /// MUTATION CHECK: swapping which of `flagIndex + 1`/`flagIndex + 2` maps
@@ -106,6 +116,24 @@ struct DebugLaunchOptionsParsingTests {
     @Test func parseMockVideoTimelineReturnsNilWhenFlagAbsent() {
         let result = DebugLaunchOptions.parseMockVideoTimeline(in: ["app", "--mock-gate", "ok"])
         #expect(result == nil)
+    }
+
+    // MARK: - isMicProbeRequested (--mic-probe, bead gateopener-1pm.1)
+
+    /// MUTATION CHECK: replacing `contains("--mic-probe")` with `contains`
+    /// of any other/wrong literal would fail this assertion.
+    @Test func isMicProbeRequestedTrueWhenFlagPresent() {
+        #expect(DebugLaunchOptions.isMicProbeRequested(in: ["app", "--mic-probe"]) == true)
+    }
+
+    /// MUTATION CHECK: a hardcoded `true` return would fail this assertion.
+    @Test func isMicProbeRequestedFalseWhenFlagAbsent() {
+        #expect(DebugLaunchOptions.isMicProbeRequested(in: ["app", "--mock-gate", "ok"]) == false)
+    }
+
+    /// Present alongside unrelated flags — order/position must not matter.
+    @Test func isMicProbeRequestedTrueAlongsideOtherFlags() {
+        #expect(DebugLaunchOptions.isMicProbeRequested(in: ["app", "--mock-gate", "ok", "--mic-probe"]) == true)
     }
 }
 #endif

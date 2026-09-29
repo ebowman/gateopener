@@ -49,6 +49,25 @@ extension DoorVideoSession.State {
     }
 }
 
+/// Bead gateopener-1pm.4: which kind of session `start(mode:)` should
+/// establish.
+extension DoorVideoSession {
+    public enum Mode: Equatable, Sendable {
+        /// The only mode that existed before this bead. Recvonly audio,
+        /// muted `<video>`, no mic prompt, no recording indicator. EVERY
+        /// existing call site (`start()`, no argument) gets this — this
+        /// bead changes NOTHING about their behavior.
+        case view
+        /// Bead gateopener-1pm.1/1pm.3's spike + `door-video.html` work,
+        /// wired to a UI by bead 1pm.5: acquires the phone's microphone
+        /// before negotiating, offers audio sendrecv, plays the door's
+        /// audio through a separate `<audio>` element, and runs the phone's
+        /// `AVAudioSession` in `.playAndRecord`/`.voiceChat` for the
+        /// session's duration — see `audioSessionPlan(for:)` below.
+        case call
+    }
+}
+
 /// Establishes and owns exactly ONE live WebRTC session against the Comelit
 /// door camera on iOS, driven by WKWebView's own WebRTC stack (NOT
 /// libwebrtc — see bd memory `gateopener-yjn-spike-result-wkwebview-webkit-
@@ -166,6 +185,34 @@ public final class DoorVideoSession: NSObject {
             diagnostics.append("[\(Self.diagTimestamp())] state: \(oldValue) -> \(state)")
             switch state {
             case .ended, .failed:
+                // Bead gateopener-1pm.4: for a `.call` session, log "hang up
+                // (user)"/"hang up (ended)" at this SAME choke point, BEFORE
+                // persisting, so the line is captured in the persisted log
+                // below — `terminatedByUser` is set only by `stop()`, so
+                // every other terminal transition (liveness watchdog,
+                // negotiation/offer/answer failure, mic preflight) logs
+                // "ended". A no-op for `.view` (unchanged from before this
+                // bead).
+                //
+                // FIX (reviewer-flagged gap): also gated on
+                // `didActivateCallAudio` — a `.call` session that fails
+                // BEFORE `activateCallAudioSession()` ever ran (denied mic
+                // preflight, "No camera"/"Sign-in required", an
+                // `injectIceServers` failure, `stop()` before activation)
+                // never activated any audio session, so it has nothing to
+                // "hang up" from. This is checked here (before the flag is
+                // cleared by `restoreAmbientAudioSessionIfNeeded()` below,
+                // in the same `didSet` invocation) rather than inside that
+                // method, so the line still lands BEFORE `persistDiagnostics
+                // ()` as documented above. A SECOND terminal transition on
+                // the same attempt (e.g. `stop()` racing `startNegotiation()`
+                // and then a pending-await failure both firing `state =`)
+                // sees the flag already cleared by the first transition's
+                // restore, so it does not log "hang up" twice either.
+                if mode == .call, didActivateCallAudio {
+                    diagnostics.append("[\(Self.diagTimestamp())] hang up (\(terminatedByUser ? "user" : "ended"))")
+                }
+
                 // Covers early-return failure paths inside `start()` that
                 // set `state` directly rather than going through
                 // `stop()`/`endDueToLiveness(reason:)` (e.g. "No camera",
@@ -190,6 +237,15 @@ public final class DoorVideoSession: NSObject {
                 if DoorVideoSessionRegistry.shouldRecordEnd(offerAccepted: offerAccepted) {
                     registry.recordSessionEnded()
                 }
+
+                // Bead gateopener-1pm.4: restores a `.call` session's
+                // AVAudioSession to `.ambient`/inactive at this SAME choke
+                // point — see that method's doc comment for why living here
+                // guarantees "exactly once, on every terminal transition"
+                // for free. A no-op for `.view` (that mode's audio session
+                // is never touched by anything but the one-time `.ambient`
+                // apply on a SUCCESSFUL connection, in `start()`).
+                restoreAmbientAudioSessionIfNeeded()
             case .streaming:
                 // Bead gateopener-672.30: iOS pauses/refuses inline media
                 // playback in a hidden (opacity-0) web view, and by the
@@ -251,6 +307,66 @@ public final class DoorVideoSession: NSObject {
     /// offerAccepted` exactly.
     private var offerAccepted = false
 
+    /// Bead gateopener-1pm.4: which mode THIS session attempt is running as
+    /// — `.view` (the default) or `.call`. Set at the top of `start(mode:)`
+    /// (after the `#if DEBUG` stub early-return, so a `debugStub(mode:)`
+    /// session's pre-set value is never clobbered by whatever argument a
+    /// caller happens to pass to `start()` — see `debugStub`'s doc comment)
+    /// and read by every call-mode-specific decision in this file: the
+    /// `state.didSet` terminal-transition choke point (hang-up diagnostics,
+    /// `restoreAmbientAudioSessionIfNeeded()`), `hangUpPageIfNeeded()`, and
+    /// `activateCallAudioSession()`.
+    private var mode: Mode = .view
+
+    /// Bead gateopener-1pm.4: `true` only when `stop()` itself is the cause
+    /// of the CURRENT terminal transition (as opposed to the liveness
+    /// watchdog, a negotiation/offer/answer failure, or any other
+    /// early-return `.failed(...)` inside `start()`) — consulted by the
+    /// `state.didSet` choke point to log "hang up (user)" vs. "hang up
+    /// (ended)" for a `.call` session. Reset to `false` at the top of
+    /// `start(mode:)`'s per-session reset, mirroring `hasStopped`.
+    private var terminatedByUser = false
+
+    /// Bead gateopener-1pm.4 FIX (reviewer-flagged gap): `true` only after
+    /// `activateCallAudioSession()` has actually attempted to activate a
+    /// `.call` session's `AVAudioSession` — set `true` at the end of that
+    /// method, regardless of whether the underlying `apply`/`setActive`
+    /// calls threw (both are `try?`). `restoreAmbientAudioSessionIfNeeded()`
+    /// consults (and clears) this flag so it only undoes an activation that
+    /// actually happened, and only ONCE: a `.call` session that fails BEFORE
+    /// `activateCallAudioSession()` runs (denied mic preflight, "No
+    /// camera"/"Sign-in required", an `injectIceServers` failure, or
+    /// `stop()` landing before `start()` reaches that call) never sets this
+    /// `true`, so its single terminal transition is a correct no-op instead
+    /// of an unbalanced `.ambient`/`setActive(false)` pair. And because
+    /// `restoreAmbientAudioSessionIfNeeded()` clears the flag back to
+    /// `false` after doing its work, a SECOND terminal transition on the
+    /// same attempt (e.g. `stop()` landing mid-`startNegotiation()`, whose
+    /// pending `await` then throws into the `.failed(...)` catch — a second
+    /// `state.didSet` firing after the first already restored) is also a
+    /// no-op, guaranteeing the restore (and the "hang up (…)" diagnostics
+    /// line, gated on this same flag at its call site) runs AT MOST once
+    /// per activation. Reset to `false` at the top of `start(mode:)`'s
+    /// per-session reset, mirroring `hasStopped`/`terminatedByUser` —
+    /// defensive, since every terminal transition already clears it, but
+    /// keeps a reused instance's invariant explicit.
+    private var didActivateCallAudio = false
+
+    /// Bead gateopener-1pm.4: performs the actual `AVAudioSession`
+    /// category/active-state changes `activateCallAudioSession()`/
+    /// `restoreAmbientAudioSessionIfNeeded()` below decide on, behind a
+    /// seam (`AudioSessionControlling`) so a DEBUG-only test double can
+    /// prove those decisions fire on the right transitions WITHOUT ever
+    /// touching the process's real audio session — a `.call` debug stub
+    /// driven from a test target must never actually activate
+    /// `.playAndRecord` on whatever machine/simulator is running the test
+    /// suite. Defaults to the real `AVAudioSession.sharedInstance()`
+    /// wrapper for every production call site; `debugStub` below overrides
+    /// this default to a no-op fake, the same divergence-from-production-
+    /// default pattern already used for `registry` there (see that
+    /// factory's doc comment).
+    private let audioSessionController: AudioSessionControlling
+
     /// Non-`nil` while `start()` is sleeping out a door-busy cooldown before
     /// issuing the `rtc/offer` PUT (bead gateopener-41m.9); the deadline the
     /// wait is sleeping until. `nil` at every other time (before the wait
@@ -283,15 +399,57 @@ public final class DoorVideoSession: NSObject {
     private var livenessTask: Task<Void, Never>?
 
     #if DEBUG
-    /// Set only by `debugStub(connectingDelay:streamingDuration:failAfter:)`
-    /// below. When non-`nil`, `start()` skips ALL real work (no network, no
-    /// WKWebView page load, no token resolution) and instead runs this
-    /// canned timeline — see that factory's doc comment. `failAfter == nil`
-    /// runs the normal `.connecting` -> `.streaming` -> `.ended` timeline;
-    /// `failAfter == message` instead finishes as `.failed(message)` after
-    /// `connectingDelay` (never reaching `.streaming`).
-    private var debugStubTimeline: (connectingDelay: TimeInterval, streamingDuration: TimeInterval, failAfter: String?)?
+    /// Set only by `debugStub(connectingDelay:streamingDuration:failAfter:
+    /// failBeforeActivation:)` below. When non-`nil`, `start()` skips ALL
+    /// real work (no network, no WKWebView page load, no token resolution)
+    /// and instead runs this canned timeline — see that factory's doc
+    /// comment. `failAfter == nil` runs the normal `.connecting` ->
+    /// `.streaming` -> `.ended` timeline; `failAfter == message` instead
+    /// finishes as `.failed(message)` after `connectingDelay` (never
+    /// reaching `.streaming`).
+    ///
+    /// `failBeforeActivation` (bead gateopener-1pm.4 FIX, reviewer-flagged
+    /// gap): when non-`nil`, mimics a `.call` session that fails BEFORE
+    /// `activateCallAudioSession()` ever runs (e.g. the real `start(mode:)`
+    /// denied-mic-preflight path) — `.idle` transitions straight to
+    /// `.failed(failBeforeActivation)`, never through `.connecting`, and
+    /// `activateCallAudioSession()` is never called. Takes priority over
+    /// `failAfter` if both are somehow set (they never are in practice —
+    /// `debugStub` only ever sets one).
+    private var debugStubTimeline: (
+        connectingDelay: TimeInterval,
+        streamingDuration: TimeInterval,
+        failAfter: String?,
+        failBeforeActivation: String?
+    )?
     #endif
+
+    /// Builds the `WKWebViewConfiguration` used to load `door-video.html`.
+    /// Factored out (bead gateopener-1pm.1) so `MicProbe`'s standalone,
+    /// session-free web view (built by the DEBUG-only `--mic-probe` launch
+    /// flag / Settings' "Run mic probe" row) is GUARANTEED to run under the
+    /// exact same inline-playback/autoplay/PiP configuration a real session
+    /// does, rather than a hand-copied duplicate liable to drift out of
+    /// sync. Deliberately does NOT attach a `WKUserContentController`'s
+    /// message handlers ("frame"/"diag") — those forward to a
+    /// `DoorVideoSession` instance (see `init`'s weak-forwarder rationale
+    /// below) and are irrelevant to `MicProbe`, which reads its result
+    /// directly from `callAsyncJavaScript`'s return value.
+    static func makeWebViewConfiguration() -> WKWebViewConfiguration {
+        let config = WKWebViewConfiguration()
+        // Without these two, iOS refuses to autoplay the <video> element
+        // inline and the view stays permanently black: WKWebView defaults
+        // to requiring an explicit user gesture before ANY media plays, and
+        // to allowing playback only fullscreen unless inline playback is
+        // explicitly opted into.
+        config.allowsInlineMediaPlayback = true
+        config.mediaTypesRequiringUserActionForPlayback = []
+        // The stream is recvonly/muted (v1 has no door audio) and shown
+        // inline in the app's own UI; Picture in Picture would only ever
+        // be a confusing, unwanted affordance here.
+        config.allowsPictureInPictureMediaPlayback = false
+        return config
+    }
 
     /// - Parameter appSettings: Supplies `cachedGates` — the last
     ///   locally-persisted discovery result (`GateController.discover()`
@@ -307,7 +465,8 @@ public final class DoorVideoSession: NSObject {
         urlSession: URLSession = .shared,
         firstFrameTimeout: TimeInterval = 10,
         registry: DoorVideoSessionRegistry = .shared,
-        cooldownSleep: @escaping (Duration) async throws -> Void = { try await Task.sleep(for: $0) }
+        cooldownSleep: @escaping (Duration) async throws -> Void = { try await Task.sleep(for: $0) },
+        audioSessionController: AudioSessionControlling = RealAudioSessionController()
     ) {
         self.tokenManager = tokenManager
         self.gateClient = gateClient
@@ -316,19 +475,9 @@ public final class DoorVideoSession: NSObject {
         self.firstFrameTimeout = firstFrameTimeout
         self.registry = registry
         self.cooldownSleep = cooldownSleep
+        self.audioSessionController = audioSessionController
 
-        let config = WKWebViewConfiguration()
-        // Without these two, iOS refuses to autoplay the <video> element
-        // inline and the view stays permanently black: WKWebView defaults
-        // to requiring an explicit user gesture before ANY media plays, and
-        // to allowing playback only fullscreen unless inline playback is
-        // explicitly opted into.
-        config.allowsInlineMediaPlayback = true
-        config.mediaTypesRequiringUserActionForPlayback = []
-        // The stream is recvonly/muted (v1 has no door audio) and shown
-        // inline in the app's own UI; Picture in Picture would only ever
-        // be a confusing, unwanted affordance here.
-        config.allowsPictureInPictureMediaPlayback = false
+        let config = Self.makeWebViewConfiguration()
 
         let contentController = WKUserContentController()
         config.userContentController = contentController
@@ -345,6 +494,13 @@ public final class DoorVideoSession: NSObject {
         super.init()
 
         webView.navigationDelegate = self
+        // Bead gateopener-1pm.1: required for `requestMediaCapturePermissionFor
+        // :initiatedByFrame:type:decisionHandler:` (below) to ever be
+        // called at all -- without a `uiDelegate`, WKWebView silently
+        // denies every `getUserMedia` call rather than consulting one.
+        // View-only sessions never call `getUserMedia`, so this is a no-op
+        // in practice until call mode (bead 1pm.4/1pm.5) lands.
+        webView.uiDelegate = self
         // Registered via a weak-referencing shim (`ScriptMessageForwarder`
         // below), NOT `self` directly: `WKUserContentController.add(_:
         // name:)` retains its handler strongly, and the content controller
@@ -387,7 +543,17 @@ public final class DoorVideoSession: NSObject {
     /// `.replace`, i.e. run a fresh session.
     ///
     /// Never throws: all failure paths are reported via `state`.
-    public func start() async {
+    ///
+    /// - Parameter mode: `.view` (the default — every call site before bead
+    ///   gateopener-1pm.4 gets IDENTICAL behavior to before this bead) or
+    ///   `.call` (bead 1pm.5's Talk/Mute/Hang up UI). Assigned to `self.
+    ///   mode` AFTER the `#if DEBUG` stub early-return below, specifically
+    ///   so a `debugStub(mode:)` session's pre-set `mode` is never
+    ///   clobbered by whatever argument a caller happens to pass here (a
+    ///   caller driving a stub generally just calls `session.start()`,
+    ///   same as it would for a real session) — see `debugStub`'s doc
+    ///   comment.
+    public func start(mode: Mode = .view) async {
         switch DoorVideoSessionRetention.decision(forExistingPhase: state.phase) {
         case .retain:
             Self.logger.notice("start() called while \(String(describing: self.state), privacy: .public); retaining existing session")
@@ -399,6 +565,8 @@ public final class DoorVideoSession: NSObject {
         // Reset per-session instance state so a second start() (after
         // .ended/.failed) behaves like a fresh instance would.
         hasStopped = false
+        terminatedByUser = false
+        didActivateCallAudio = false
         lastFrameAt = nil
         livenessTask?.cancel()
         livenessTask = nil
@@ -411,13 +579,47 @@ public final class DoorVideoSession: NSObject {
         offerAccepted = false
 
         #if DEBUG
+        // Bead gateopener-1pm.5: an EXPLICIT `.call` argument (as opposed to
+        // the default `.view` every pre-existing call site still passes)
+        // must flip a debug stub's `mode` BEFORE the early-return below runs
+        // its canned timeline — this is what lets `DoorVideoCoordinator
+        // .startCall()` request `.call` on a stub the app's `makeSession`
+        // factory built with no knowledge of which mode the coordinator
+        // would eventually ask for (see `GateOpenerIOSApp`'s `makeSession`
+        // closure). Guarded on `mode == .call` specifically (not "always
+        // assign") so every `DoorVideoSessionCallModeTests` call site that
+        // pre-configures a `.call` stub via `debugStub(mode: .call)` and
+        // then calls plain `start()` (argument defaults to `.view`) is
+        // UNAFFECTED — that omitted argument must never clobber the stub's
+        // pre-set mode back to `.view`.
+        if mode == .call {
+            self.mode = mode
+        }
         if let timeline = debugStubTimeline {
             await runDebugStubTimeline(timeline)
             return
         }
         #endif
 
+        self.mode = mode
+
         diagnostics.append("[\(Self.diagTimestamp())] session start, network path: \(await Self.currentNetworkPathDescription())")
+
+        if mode == .call {
+            // Bead gateopener-1pm.4: mic permission preflight. Checked
+            // BEFORE anything else (camera discovery, page load) — a
+            // `.denied` permission means WKWebView's own mic prompt would
+            // be refused anyway (see `mediaCaptureDecision(type:
+            // originIsOurs:)` above), so there is no reason to pay for a
+            // camera-discovery round trip or a page load first.
+            diagnostics.append("[\(Self.diagTimestamp())] call start")
+            let permission = Self.currentRecordPermission()
+            diagnostics.append("[\(Self.diagTimestamp())] mic: \(Self.recordPermissionLabel(permission))")
+            if let message = Self.callPreflightMessage(for: permission) {
+                state = .failed(message)
+                return
+            }
+        }
 
         state = .connecting
 
@@ -490,18 +692,37 @@ public final class DoorVideoSession: NSObject {
         diagnostics.append("[\(Self.diagTimestamp())] injecting ICE servers: \(iceServerURLs)")
 
         do {
-            try await injectIceServers(iceServerURLs)
+            try await injectIceServers(iceServerURLs, mode: mode)
         } catch {
+            hangUpPageIfNeeded()
             state = .failed("Video page failed to load")
             return
         }
 
         guard !hasStopped else { return }
 
+        if mode == .call {
+            // Bead gateopener-1pm.4: activate the call's AVAudioSession
+            // BEFORE negotiation — `startNegotiation()` is what triggers
+            // `getUserMedia`/mic acquisition inside the page.
+            activateCallAudioSession()
+        }
+
         let offerSDP: String
         do {
             offerSDP = try await startNegotiation()
         } catch {
+            hangUpPageIfNeeded()
+            if let micMessage = Self.failureMessage(forNegotiationError: error) {
+                // Bead gateopener-1pm.4: a "mic:" rejection means door-
+                // video.html's negotiate() failed to acquire the microphone
+                // and returned BEFORE any RTCPeerConnection/rtc-offer
+                // existed — never fall through to
+                // DoorVideoNegotiationFailure.userMessage(for:), which
+                // would misreport this as an ICE/network failure.
+                state = .failed(micMessage)
+                return
+            }
             let message = DoorVideoNegotiationFailure.userMessage(for: error)
             diagnostics.append("[\(Self.diagTimestamp())] gathering failed: \(message)")
             state = .failed(message)
@@ -536,10 +757,12 @@ public final class DoorVideoSession: NSObject {
                 appSettings.cachedCameraEndpointId = nil
             }
             let message = DoorVideoBusyPolicy.failureMessage(for: outcome)
+            hangUpPageIfNeeded()
             state = .failed(message)
             return
         } catch {
             Self.logger.error("rtc/offer failed after retry: \(String(describing: error), privacy: .public)")
+            hangUpPageIfNeeded()
             state = .failed("Could not reach door camera")
             return
         }
@@ -549,17 +772,27 @@ public final class DoorVideoSession: NSObject {
         do {
             try await applyAnswer(answerSDP)
         } catch {
+            hangUpPageIfNeeded()
             state = .failed("Could not apply video answer")
             return
         }
 
         guard !hasStopped else { return }
 
-        // .ambient: recvonly + muted <video> never plays audible sound, but
+        // Bead gateopener-1pm.4: `.view` -- BYTE-FOR-BYTE the existing
+        // behavior (recvonly + muted <video> never plays audible sound, but
         // the session categorizes itself as ambient anyway so it can NEVER
         // interrupt the operator's own music/podcast — the audio session
-        // route is otherwise left entirely alone.
-        try? AVAudioSession.sharedInstance().setCategory(.ambient)
+        // route is otherwise left entirely alone). `.call`'s audio session
+        // was already activated (`.playAndRecord`/`.voiceChat`) above,
+        // BEFORE negotiation — re-applying `.view`'s `.ambient` plan here
+        // would wrongly revert an in-progress call's audio route the
+        // instant it connects, so this is skipped for `.call` entirely;
+        // that session's audio session is restored to `.ambient` only at
+        // its terminal transition (`restoreAmbientAudioSessionIfNeeded()`).
+        if mode == .view {
+            try? audioSessionController.apply(Self.audioSessionPlan(for: .view))
+        }
 
         sessionStartedAt = Date()
         startLivenessWatchdog()
@@ -573,6 +806,11 @@ public final class DoorVideoSession: NSObject {
     public func stop() {
         guard !hasStopped else { return }
         hasStopped = true
+        // Bead gateopener-1pm.4: recorded BEFORE `state` is assigned below,
+        // so the `state.didSet` terminal-transition choke point's "hang up
+        // (user)" diagnostic line reflects THIS call as the cause — see
+        // that `case`'s doc comment.
+        terminatedByUser = true
         cooldownUntil = nil
 
         diagnostics.append("[\(Self.diagTimestamp())] terminal reason: stopped")
@@ -598,10 +836,11 @@ public final class DoorVideoSession: NSObject {
                 "if (window.markClosing) { window.markClosing(); }",
                 contentWorld: .page
             )
-            _ = try? await webView.callAsyncJavaScript(
-                "return window.closeSession ? window.closeSession() : null;",
-                contentWorld: .page
-            )
+            // Bead gateopener-1pm.4: prefers `window.hangUp()` (stops the
+            // mic track, then does everything `closeSession()` does) so a
+            // `.call` session's recording indicator clears here too — see
+            // `Self.teardownJS`'s doc comment.
+            _ = try? await webView.callAsyncJavaScript(Self.teardownJS, contentWorld: .page)
         }
 
         webView.stopLoading()
@@ -616,6 +855,38 @@ public final class DoorVideoSession: NSObject {
             return
         }
         state = .ended
+    }
+
+    // MARK: - Call-mode page bridging (bead gateopener-1pm.5)
+
+    /// Thin bridge to `door-video.html`'s `window.setMicEnabled(enabled)`
+    /// (bead gateopener-1pm.3): toggles the acquired mic track's `.enabled`
+    /// flag without touching the peer connection or renegotiating. Called by
+    /// `DoorVideoCoordinator.setMicMuted(_:)`. A no-op for `.view` sessions
+    /// (no mic was ever acquired) and effectively a no-op for a DEBUG
+    /// `debugStub` session too (no real page was ever loaded, so this fires
+    /// a harmless `callAsyncJavaScript` against a blank `WKWebView`, caught
+    /// by `try?`).
+    public func setMicEnabled(_ enabled: Bool) {
+        guard mode == .call else { return }
+        Task { [weak webView] in
+            guard let webView else { return }
+            _ = try? await webView.callAsyncJavaScript(
+                "if (window.setMicEnabled) { window.setMicEnabled(\(enabled)); }",
+                contentWorld: .page
+            )
+        }
+    }
+
+    /// Thin, semantically-named alias for `stop()` (bead gateopener-1pm.5),
+    /// used by `DoorVideoCoordinator.hangUp()` — identical behavior (tears
+    /// down the peer connection via `window.hangUp()`/`Self.teardownJS`,
+    /// stopping any acquired mic track, and transitions to `.ended`, or
+    /// preserves an already-reported `.failed`), just named for the explicit
+    /// call-hang-up call site rather than the generic "stop this session"
+    /// one every other teardown path already uses.
+    public func hangUp() {
+        stop()
     }
 
     // MARK: - Camera endpoint selection
@@ -745,12 +1016,42 @@ public final class DoorVideoSession: NSObject {
     // MARK: - Page bridging (all async calls MUST use callAsyncJavaScript,
     // never evaluateJavaScript — see the GOTCHA in the type doc comment)
 
-    private func injectIceServers(_ iceServerURLs: [String]) async throws {
+    /// Injects `window.__ICE_SERVERS__` and, for a `.call` session,
+    /// `window.__CALL_MODE__ = true` — in the SAME script, before
+    /// `startNegotiation()` is ever called (bead gateopener-1pm.4's STEP 1:
+    /// `door-video.html`'s `negotiate()` reads `window.__CALL_MODE__` at
+    /// the very top, so it must be set before that function runs).
+    /// `window.__CALL_MODE__` is left UNSET (not even `false`) for `.view`,
+    /// matching `negotiate()`'s own `window.__CALL_MODE__ === true` check
+    /// — `undefined === true` is `false`, so this is behaviorally identical
+    /// to the pre-1pm.4 injection for every existing `.view` call site.
+    private func injectIceServers(_ iceServerURLs: [String], mode: Mode) async throws {
         let jsArray = iceServerURLs.map { "\"\($0)\"" }.joined(separator: ",")
-        let js = "window.__ICE_SERVERS__ = [\(jsArray)];"
+        var js = "window.__ICE_SERVERS__ = [\(jsArray)];"
+        if mode == .call {
+            js += " window.__CALL_MODE__ = true;"
+        }
         _ = try await webView.callAsyncJavaScript(js, contentWorld: .page)
     }
 
+    /// Calls `door-video.html`'s `window.startNegotiation()` exactly ONCE
+    /// per session attempt — CARRY-OVER item 1 from the 1pm.3 review:
+    /// `negotiate()` (the page's own function this calls into) is NOT
+    /// safe to invoke twice against the same loaded page (a second call
+    /// would overwrite `window.__state.micStream`/`.pc` without stopping
+    /// the first attempt's mic track/peer connection). This is guaranteed
+    /// here by TWO independent things, not by any guard inside this
+    /// function itself: (1) `start(mode:)` calls this AT MOST once per
+    /// invocation — there is only one call site, and no retry loop wraps
+    /// it; (2) `DoorVideoSessionRetention.decision(forExistingPhase:)` at
+    /// the top of `start(mode:)` makes a second, overlapping `start()`
+    /// call on the SAME instance a no-op `.retain` while `.connecting`/
+    /// `.streaming`, so this function can never be re-entered concurrently
+    /// either. A LATER `start()` call (after `.ended`/`.failed`) is safe
+    /// because it always `loadFileURL`s `door-video.html` again FIRST — a
+    /// fresh page load resets ALL of the page's JS globals, so the next
+    /// `startNegotiation()` call runs against a brand-new, unused page,
+    /// never the one a previous attempt already called this on.
     private func startNegotiation() async throws -> String {
         let raw = try await webView.callAsyncJavaScript(
             "return await window.startNegotiation();",
@@ -837,6 +1138,219 @@ public final class DoorVideoSession: NSObject {
     public func ensurePlayingFromHost() {
         guard state == .streaming else { return }
         callEnsurePlaying()
+    }
+
+    // MARK: - Call mode (bead gateopener-1pm.4)
+
+    /// The `AVAudioSession` category/mode/options a session of the given
+    /// `Mode` should be running under. Pure (no `AVAudioSession` call, no
+    /// side effect) so it is directly unit-testable; `activateCallAudioSession()`/
+    /// `restoreAmbientAudioSessionIfNeeded()` below are the only two call
+    /// sites that actually APPLY a plan, via `audioSessionController`.
+    public struct AudioSessionPlan: Equatable {
+        let category: AVAudioSession.Category
+        let mode: AVAudioSession.Mode
+        let options: AVAudioSession.CategoryOptions
+    }
+
+    /// - `.view`: `.ambient` / `.default` / no options — BYTE-FOR-BYTE the
+    ///   category this type has always set on a successful view session
+    ///   (recvonly + muted `<video>` never plays audible sound, but the
+    ///   session categorizes itself as ambient anyway so it can NEVER
+    ///   interrupt the operator's own music/podcast).
+    /// - `.call`: `.playAndRecord` / `.voiceChat` / `[.defaultToSpeaker,
+    ///   .allowBluetoothHFP]` — a call is a genuine two-way voice call and
+    ///   DELIBERATELY interrupts/ducks whatever the operator was playing,
+    ///   the same way a phone call would. `.voiceChat` biases the system's
+    ///   echo cancellation/gain for a voice conversation over a small
+    ///   speaker; `.defaultToSpeaker` keeps output on the phone's speaker
+    ///   rather than the earpiece unless a headset/Bluetooth device is
+    ///   attached; `.allowBluetoothHFP` lets a paired Bluetooth headset
+    ///   carry both directions.
+    static func audioSessionPlan(for mode: Mode) -> AudioSessionPlan {
+        switch mode {
+        case .view:
+            return AudioSessionPlan(category: .ambient, mode: .default, options: [])
+        case .call:
+            return AudioSessionPlan(category: .playAndRecord, mode: .voiceChat, options: [.defaultToSpeaker, .allowBluetoothHFP])
+        }
+    }
+
+    /// Applies `.call`'s `AudioSessionPlan` and activates the audio session
+    /// — called from `start(mode:)` BEFORE `startNegotiation()` (which is
+    /// what triggers `getUserMedia`/mic acquisition inside the page). A
+    /// no-op for `.view`. Errors are swallowed (`try?`), matching the
+    /// pre-1pm.4 `.ambient` line's own style — an `AVAudioSession` failure
+    /// here is rare and not worth failing the whole call over; the mic
+    /// permission preflight already ran, so `getUserMedia` itself is what
+    /// would actually surface a real problem.
+    ///
+    /// FIX (reviewer-flagged gap): sets `didActivateCallAudio = true` after
+    /// the (swallowed) activation attempt, regardless of whether it
+    /// actually succeeded — this flag, not `mode == .call` alone, is what
+    /// `restoreAmbientAudioSessionIfNeeded()` now consults, so a `.call`
+    /// session that never reaches this method (a denied mic preflight,
+    /// "No camera"/"Sign-in required", an `injectIceServers` failure, or
+    /// `stop()` landing before this call) never has its (nonexistent)
+    /// activation "restored".
+    private func activateCallAudioSession() {
+        guard mode == .call else { return }
+        try? audioSessionController.apply(Self.audioSessionPlan(for: .call))
+        try? audioSessionController.setActive(true, options: [])
+        didActivateCallAudio = true
+    }
+
+    /// Restores `.ambient`/inactive — called from the `state.didSet`
+    /// terminal-transition choke point (see that `case`'s doc comment),
+    /// which is what guarantees this runs on EVERY terminal transition of a
+    /// `.call` session (`stop()`, the liveness watchdog, a first-frame
+    /// failure, an offer failure, an `applyAnswer` failure, or the mic
+    /// preflight itself). A no-op for `.view` (that mode's audio session is
+    /// never activated in the first place, so there is nothing to restore).
+    ///
+    /// FIX (reviewer-flagged gap): also a no-op unless `didActivateCallAudio`
+    /// is `true` — a `.call` session that never reached
+    /// `activateCallAudioSession()` (denied mic preflight, "No camera"/
+    /// "Sign-in required", an `injectIceServers` failure, `stop()` before
+    /// activation) must not apply/deactivate an audio session it never
+    /// activated. The flag is cleared to `false` right after doing the
+    /// restore, which is what guarantees this (and the "hang up (…)" diag
+    /// line, gated on the same flag at its own call site above) runs AT
+    /// MOST once per activation even if a SECOND terminal transition fires
+    /// later on the same attempt (e.g. `stop()` racing `startNegotiation()`,
+    /// whose pending `await` then throws into a `.failed(...)` catch —
+    /// `state.didSet` firing twice for what is really one hang-up).
+    private func restoreAmbientAudioSessionIfNeeded() {
+        guard mode == .call, didActivateCallAudio else { return }
+        try? audioSessionController.apply(Self.audioSessionPlan(for: .view))
+        try? audioSessionController.setActive(false, options: [.notifyOthersOnDeactivation])
+        didActivateCallAudio = false
+    }
+
+    /// Whether a `.call` session should even attempt to load `door-
+    /// video.html` given the CURRENT microphone permission state.
+    ///
+    /// - `.denied`: `"Microphone access is off in Settings"` — the ONLY
+    ///   case `start(mode:)` fails BEFORE loading the page at all.
+    /// - `.undetermined`: `nil` — let the system's own prompt (surfaced via
+    ///   `WKUIDelegate.requestMediaCapturePermissionFor:` once the page
+    ///   calls `getUserMedia`) ask the user.
+    /// - `.granted`: `nil` — proceed normally.
+    ///
+    /// Pure: takes the permission value as a plain argument (rather than
+    /// reading `AVAudioApplication.shared` itself) so it is directly
+    /// unit-testable without a real audio session.
+    static func callPreflightMessage(for permission: AVAudioApplication.recordPermission) -> String? {
+        switch permission {
+        case .denied:
+            return "Microphone access is off in Settings"
+        case .undetermined, .granted:
+            return nil
+        @unknown default:
+            return nil
+        }
+    }
+
+    /// The CURRENT microphone permission, preferring
+    /// `AVAudioApplication.shared.recordPermission` (iOS 17+; this app's
+    /// deployment target is iOS 18 per `Package.swift`, so this is always
+    /// the branch taken in practice) and falling back to the deprecated
+    /// `AVAudioSession.sharedInstance().recordPermission` only for a
+    /// hypothetical lower deployment target — kept per this bead's brief
+    /// for documentation/forward-compatibility, though unreachable under
+    /// this package's actual minimum.
+    static func currentRecordPermission() -> AVAudioApplication.recordPermission {
+        if #available(iOS 17.0, *) {
+            return AVAudioApplication.shared.recordPermission
+        }
+        switch AVAudioSession.sharedInstance().recordPermission {
+        case .granted: return .granted
+        case .denied: return .denied
+        case .undetermined: return .undetermined
+        @unknown default: return .undetermined
+        }
+    }
+
+    /// The exact diagnostics-line label for a
+    /// `AVAudioApplication.recordPermission` value: `"granted"`/`"denied"`/
+    /// `"undetermined"`.
+    static func recordPermissionLabel(_ permission: AVAudioApplication.recordPermission) -> String {
+        switch permission {
+        case .granted: return "granted"
+        case .denied: return "denied"
+        case .undetermined: return "undetermined"
+        @unknown default: return "undetermined"
+        }
+    }
+
+    /// Does `error` (a `startNegotiation()` JS-throw surfaced through
+    /// WKWebView's async-JS bridging) indicate `door-video.html`'s
+    /// mic-acquisition failure (`throw negotiationError("mic-error", "mic:
+    /// " + name)` — see that file's `negotiate()`) rather than a network/
+    /// ICE failure? Checked FIRST in `start(mode:)`'s `startNegotiation()`
+    /// catch block, before falling through to `DoorVideoNegotiationFailure.
+    /// userMessage(for:)` — a mic failure happens BEFORE any
+    /// `RTCPeerConnection`/`rtc/offer` exists, so it must never be
+    /// misreported as an ICE/network message.
+    ///
+    /// Uses the SAME description-join technique as
+    /// `DoorVideoNegotiationFailure.userMessage(for:)` (mirrored here, not
+    /// shared, since this decision is iOS-call-mode-specific and out of
+    /// scope for the macOS-shared `GateOpenerCore` type).
+    ///
+    /// - Returns: `"Microphone not available"` if `error`'s details contain
+    ///   `"mic:"` (case-insensitive); `nil` otherwise, in which case the
+    ///   caller falls through to `DoorVideoNegotiationFailure.userMessage
+    ///   (for:)`.
+    static func failureMessage(forNegotiationError error: Error) -> String? {
+        let nsError = error as NSError
+        let details = ([nsError.localizedDescription, String(describing: error)]
+            + nsError.userInfo.values.map(String.init(describing:)))
+            .joined(separator: " ")
+            .lowercased()
+        guard details.contains("mic:") else { return nil }
+        return "Microphone not available"
+    }
+
+    /// The JS invoked on every terminal transition (`stop()`,
+    /// `performLivenessTeardown(reason:)`, `hangUpPageIfNeeded()`):
+    /// prefers `window.hangUp()` (stops the mic track, then does everything
+    /// `closeSession()` does) over `window.closeSession()` directly, so a
+    /// `.call` session's recording indicator clears on EVERY terminal
+    /// path — not just `stop()`, which is all `closeSession()`-only
+    /// teardown covered before this bead. `window.hangUp` is
+    /// unconditionally defined once `door-video.html` has loaded (bead
+    /// gateopener-1pm.3), so the `closeSession`/`null` fallbacks only
+    /// matter defensively. BEHAVIORALLY IDENTICAL to the pre-existing
+    /// `closeSession()`-only line for a `.view` session (no mic track was
+    /// ever acquired, so `hangUp()`'s extra track-stop step is a no-op
+    /// there).
+    private static let teardownJS = "return window.hangUp ? window.hangUp() : (window.closeSession ? window.closeSession() : null);"
+
+    /// Bead gateopener-1pm.4, CARRY-OVER item 1 from the 1pm.3 review:
+    /// fire-and-forget best-effort teardown (mirroring `stop()`'s/
+    /// `performLivenessTeardown`'s own Task: `markClosing()` then
+    /// `Self.teardownJS`), called from a `.call` session's early-return
+    /// `.failed(...)` paths inside `start(mode:)` that otherwise never tore
+    /// down the page at all before this bead (`injectIceServers` failure,
+    /// a `startNegotiation()` rejection — mic-prefixed or not, an
+    /// `rtc/offer` failure, an `applyAnswer` failure). Without this, a mic
+    /// track acquired earlier in THIS attempt (or a peer connection opened
+    /// by `startNegotiation()`) keeps running/open until a LATER `stop()`/
+    /// new `start()` call, leaving the recording indicator lit. A no-op for
+    /// `.view`, and harmless even when nothing was actually acquired yet
+    /// (`window.hangUp()`/`window.closeSession()` are both idempotent
+    /// no-ops against a `null` `pc`/`micStream`).
+    private func hangUpPageIfNeeded() {
+        guard mode == .call else { return }
+        Task { [weak webView] in
+            guard let webView else { return }
+            _ = try? await webView.callAsyncJavaScript(
+                "if (window.markClosing) { window.markClosing(); }",
+                contentWorld: .page
+            )
+            _ = try? await webView.callAsyncJavaScript(Self.teardownJS, contentWorld: .page)
+        }
     }
 
     // MARK: - Liveness watchdog
@@ -990,10 +1504,9 @@ public final class DoorVideoSession: NSObject {
                 "if (window.markClosing) { window.markClosing(); }",
                 contentWorld: .page
             )
-            _ = try? await webView.callAsyncJavaScript(
-                "return window.closeSession ? window.closeSession() : null;",
-                contentWorld: .page
-            )
+            // Bead gateopener-1pm.4: see `stop()`'s identical comment on
+            // `Self.teardownJS`.
+            _ = try? await webView.callAsyncJavaScript(Self.teardownJS, contentWorld: .page)
         }
 
         webView.stopLoading()
@@ -1289,6 +1802,34 @@ public final class DoorVideoSession: NSObject {
     }
 }
 
+// MARK: - AudioSessionControlling (bead gateopener-1pm.4)
+
+/// Seam behind every real `AVAudioSession` category/active-state mutation
+/// `DoorVideoSession` makes, so a test can verify the DECISION (which plan,
+/// when, how many times) without ever touching the real audio session. Not
+/// `@MainActor`-isolated: `DoorVideoSession` itself is `@MainActor` and
+/// every conformer is only ever driven from that isolation, so no
+/// cross-actor call ever occurs in practice.
+public protocol AudioSessionControlling {
+    func apply(_ plan: DoorVideoSession.AudioSessionPlan) throws
+    func setActive(_ active: Bool, options: AVAudioSession.SetActiveOptions) throws
+}
+
+/// The real, production `AudioSessionControlling` — a thin wrapper around
+/// `AVAudioSession.sharedInstance()`. The default for every real
+/// `DoorVideoSession.init` call site.
+public struct RealAudioSessionController: AudioSessionControlling {
+    public init() {}
+
+    public func apply(_ plan: DoorVideoSession.AudioSessionPlan) throws {
+        try AVAudioSession.sharedInstance().setCategory(plan.category, mode: plan.mode, options: plan.options)
+    }
+
+    public func setActive(_ active: Bool, options: AVAudioSession.SetActiveOptions) throws {
+        try AVAudioSession.sharedInstance().setActive(active, options: options)
+    }
+}
+
 #if DEBUG
 extension DoorVideoSession {
     /// Builds a `DoorVideoSession` that never touches the network or loads
@@ -1318,6 +1859,14 @@ extension DoorVideoSession {
     ///     stub finishes as `.failed(failAfter)` after `connectingDelay`
     ///     instead of ever reaching `.streaming`. `nil` (the default) runs
     ///     the normal `.connecting` -> `.streaming` -> `.ended` timeline.
+    ///   - failBeforeActivation: When non-`nil` (bead gateopener-1pm.4 FIX,
+    ///     reviewer-flagged gap), simulates a `.call` session failing
+    ///     BEFORE `activateCallAudioSession()` ever runs — e.g. the real
+    ///     `start(mode:)` denied-mic-preflight path, which fails before
+    ///     `.connecting` is even entered. Takes priority over `failAfter`/
+    ///     `connectingDelay`/`streamingDuration` (none of which apply once
+    ///     this is set). `nil` (the default) leaves this behavior out
+    ///     entirely.
     ///   - registry: The `DoorVideoSessionRegistry` this stub is constructed
     ///     with. Defaults to a FRESH, isolated instance (NOT `.shared`) —
     ///     bead gateopener-41m.9's edge case: `debugStub` must not consult
@@ -1331,20 +1880,56 @@ extension DoorVideoSession {
     ///     `offerAccepted` check, which is always `false` here) — the fresh
     ///     instance is defensive/documentation-of-intent rather than
     ///     load-bearing today.
+    ///   - mode: Bead gateopener-1pm.4: pre-sets `session.mode` (bypassing
+    ///     `start(mode:)`'s own argument-based assignment — see that
+    ///     method's doc comment on why the debug-stub early-return happens
+    ///     BEFORE `self.mode = mode` is assigned there) so a coordinator
+    ///     test can drive a `.call` stub via a plain `session.start()`, the
+    ///     same call a real `.call` session's caller would make. Defaults
+    ///     to `.view`, matching every stub call site before this bead.
+    ///   - audioSessionController: Defaults to a FRESH `NoOpAudioSessionController`
+    ///     (NOT the production `RealAudioSessionController`) — the same
+    ///     divergence-from-production-default pattern as `registry` above:
+    ///     a `.call` stub run inside a test target must NEVER actually
+    ///     activate `.playAndRecord` on whatever machine/simulator is
+    ///     running the test suite.
     public static func debugStub(
         connectingDelay: TimeInterval = 2,
         streamingDuration: TimeInterval = 8,
         failAfter: String? = nil,
-        registry: DoorVideoSessionRegistry = DoorVideoSessionRegistry()
+        failBeforeActivation: String? = nil,
+        registry: DoorVideoSessionRegistry = DoorVideoSessionRegistry(),
+        mode: Mode = .view,
+        audioSessionController: AudioSessionControlling = NoOpAudioSessionController()
     ) -> DoorVideoSession {
         let session = DoorVideoSession(
             tokenManager: TokenManager(api: ComelitAPI(), credentialStore: DebugStubNullCredentialStore()),
             gateClient: DebugStubNullGateOpening(),
             appSettings: AppSettings(defaults: UserDefaults(suiteName: "ie.boboco.GateOpener.debugStub") ?? .standard),
-            registry: registry
+            registry: registry,
+            audioSessionController: audioSessionController
         )
-        session.debugStubTimeline = (connectingDelay: connectingDelay, streamingDuration: streamingDuration, failAfter: failAfter)
+        session.mode = mode
+        session.debugStubTimeline = (
+            connectingDelay: connectingDelay,
+            streamingDuration: streamingDuration,
+            failAfter: failAfter,
+            failBeforeActivation: failBeforeActivation
+        )
         return session
+    }
+
+    /// TEST-ONLY hook (bead gateopener-1pm.4 FIX, reviewer-flagged gap): lets
+    /// a test force a SECOND terminal `state` transition directly (e.g.
+    /// `.ended` -> `.failed(...)`), reproducing the race where `stop()`
+    /// lands during `startNegotiation()`'s pending `await` and that await's
+    /// eventual throw then lands in a `.failed(...)` catch — without
+    /// needing a real WKWebView/negotiation pipeline to drive that race.
+    /// `internal` (not `private`) so `@testable import GateOpener` test
+    /// targets can call it; `#if DEBUG`-gated like the rest of this
+    /// extension, so it never ships in a release build.
+    func forceStateForTesting(_ newState: State) {
+        state = newState
     }
 
     /// Runs the canned timeline installed by `debugStub`. Never touches
@@ -1352,8 +1937,36 @@ extension DoorVideoSession {
     /// observable effect, matching what `DoorVideoView` needs to render the
     /// "Connecting…" overlay and then the (blank, since no real page is
     /// loaded) streaming state.
-    fileprivate func runDebugStubTimeline(_ timeline: (connectingDelay: TimeInterval, streamingDuration: TimeInterval, failAfter: String?)) async {
+    ///
+    /// Bead gateopener-1pm.4: `activateCallAudioSession()` is called right
+    /// after entering `.connecting`, mirroring where a REAL `.call` session
+    /// activates its audio session (before negotiation, which the stub has
+    /// no equivalent of) — a no-op for `.view` per that method's own guard.
+    /// `restoreAmbientAudioSessionIfNeeded()` needs NO explicit call here:
+    /// every terminal `state =` assignment below runs through `state.
+    /// didSet`, which already calls it (see that `case`'s doc comment).
+    ///
+    /// FIX (reviewer-flagged gap): `timeline.failBeforeActivation`, when
+    /// set, fails straight from `.idle` to `.failed(...)` and returns
+    /// BEFORE `state = .connecting`/`activateCallAudioSession()` ever run
+    /// — mirroring the real `start(mode:)` denied-mic-preflight path,
+    /// which fails before entering `.connecting` too.
+    fileprivate func runDebugStubTimeline(
+        _ timeline: (
+            connectingDelay: TimeInterval,
+            streamingDuration: TimeInterval,
+            failAfter: String?,
+            failBeforeActivation: String?
+        )
+    ) async {
+        if let failureMessage = timeline.failBeforeActivation {
+            hasStopped = true
+            state = .failed(failureMessage)
+            return
+        }
+
         state = .connecting
+        activateCallAudioSession()
         try? await Task.sleep(for: .seconds(timeline.connectingDelay))
         guard !hasStopped else { return }
 
@@ -1369,6 +1982,26 @@ extension DoorVideoSession {
 
         hasStopped = true
         state = .ended
+    }
+}
+
+/// Bead gateopener-1pm.4: records every `AudioSessionControlling` call
+/// without ever touching the real `AVAudioSession` — the default
+/// `audioSessionController` for `debugStub` above (never the production
+/// `RealAudioSessionController`), and directly constructible by a test
+/// that wants to assert on `appliedPlans`/`activeCalls` itself.
+public final class NoOpAudioSessionController: AudioSessionControlling {
+    public private(set) var appliedPlans: [DoorVideoSession.AudioSessionPlan] = []
+    public private(set) var activeCalls: [(active: Bool, options: AVAudioSession.SetActiveOptions)] = []
+
+    public init() {}
+
+    public func apply(_ plan: DoorVideoSession.AudioSessionPlan) throws {
+        appliedPlans.append(plan)
+    }
+
+    public func setActive(_ active: Bool, options: AVAudioSession.SetActiveOptions) throws {
+        activeCalls.append((active, options))
     }
 }
 
@@ -1426,6 +2059,75 @@ extension DoorVideoSession: WKNavigationDelegate {
             self.pageLoadContinuation?.resume()
             self.pageLoadContinuation = nil
         }
+    }
+}
+
+// MARK: - WKUIDelegate (mic permission grant, bead gateopener-1pm.1)
+
+extension DoorVideoSession: WKUIDelegate {
+    /// Answers WKWebView's mic/camera permission prompt for `door-
+    /// video.html`'s page. Kept as a thin wrapper around the two pure
+    /// statics below (`mediaCaptureDecision`/`isOurOrigin`) so the actual
+    /// decision logic is unit-testable without a real `WKSecurityOrigin`/
+    /// `WKUIDelegate` call.
+    ///
+    /// Deliberately NOT `nonisolated` (unlike `WKNavigationDelegate` above):
+    /// `WKSecurityOrigin.protocol`/`.host` are themselves `@MainActor`-
+    /// isolated in the SDK's overlay, so reading them requires this method
+    /// to run on the main actor too — which it already does, since
+    /// `DoorVideoSession` itself is `@MainActor` and this delegate is only
+    /// ever installed on `webView` (also main-actor-confined). `type` and
+    /// `mediaCaptureDecision`/`isOurOrigin` are pure/`nonisolated`, so no
+    /// hop is otherwise needed; `decisionHandler` is invoked synchronously.
+    public func webView(
+        _ webView: WKWebView,
+        requestMediaCapturePermissionFor origin: WKSecurityOrigin,
+        initiatedByFrame frame: WKFrameInfo,
+        type: WKMediaCaptureType,
+        decisionHandler: @escaping @MainActor (WKPermissionDecision) -> Void
+    ) {
+        let originIsOurs = Self.isOurOrigin(protocol: origin.protocol, host: origin.host)
+        decisionHandler(Self.mediaCaptureDecision(type: type, originIsOurs: originIsOurs))
+    }
+
+    /// Pure decision behind the delegate method above: grants ONLY a
+    /// microphone request from our own page's origin. A VIEW-only session
+    /// (the only kind that exists today) never calls `getUserMedia` at
+    /// all, so in practice this only ever fires once bead 1pm.4/1pm.5's
+    /// CALL mode lands (or the DEBUG-only mic probe, bead 1pm.1, runs).
+    /// Camera is never requested by this app and is denied unconditionally
+    /// (`.cameraAndMicrophone` is also denied — it is not "microphone
+    /// only", so it fails the `type == .microphone` check below). A
+    /// microphone request from any origin OTHER than our own page is
+    /// denied too — `door-video.html` never loads third-party content, so
+    /// there should never legitimately be one — per this bead's HARD RULE
+    /// that view-only sessions must never request the mic and no
+    /// cross-origin content may ever acquire it.
+    nonisolated static func mediaCaptureDecision(type: WKMediaCaptureType, originIsOurs: Bool) -> WKPermissionDecision {
+        guard originIsOurs, type == .microphone else { return .deny }
+        return .grant
+    }
+
+    /// Pure origin check behind `mediaCaptureDecision`'s `originIsOurs`
+    /// argument, taking plain strings (rather than a real
+    /// `WKSecurityOrigin`, which cannot be constructed directly in a test)
+    /// so it is independently testable.
+    ///
+    /// `door-video.html` is loaded via `loadFileURL` today, i.e. a
+    /// `file://` origin — `WKSecurityOrigin` reports `protocol == "file"`
+    /// and an EMPTY `host` for that scheme, so `host` is deliberately
+    /// unchecked here (any host, including empty, is accepted for the
+    /// `file` protocol).
+    ///
+    /// Bead gateopener-1pm.2 may move `door-video.html` to a secure-context
+    /// origin (an https baseURL or a `localhost` origin) for
+    /// `getUserMedia` to be reliably exposed at all. NOT implemented here
+    /// — this bead is scoped to the file:// spike only — but if/when 1pm.2
+    /// lands, this function must be widened to also accept that specific
+    /// new origin BY EXACT HOST (never "any https host"), or a malicious
+    /// page loaded some other way could otherwise pass this check.
+    nonisolated static func isOurOrigin(protocol originProtocol: String, host: String) -> Bool {
+        originProtocol == "file"
     }
 }
 

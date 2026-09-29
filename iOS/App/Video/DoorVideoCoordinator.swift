@@ -248,6 +248,55 @@ final class DoorVideoCoordinator {
     /// so it still shows the ordinary text.
     var isRenewing: Bool { pinRenewalCount > 0 }
 
+    /// Which mode the CURRENTLY mounted (or most recently started) session
+    /// is running as (bead gateopener-1pm.5) — `.view` for every entry point
+    /// that existed before this bead (`startForOpen()`/`viewDoor()`/
+    /// `startForForeground()`, and any pinned renewal of one of those), and
+    /// `.call` for a session started via `startCall()`, including its own
+    /// pinned renewals (see `handlePinnableTermination`'s `startSession(mode:
+    /// activeMode, ...)` calls). Set unconditionally at the top of
+    /// `startSession(mode:resetPanelVisible:)`, so it always reflects
+    /// whatever mode the CURRENT `session` was actually started with, even
+    /// across a renewal.
+    private(set) var activeMode: DoorVideoSession.Mode = .view
+
+    /// `true` from the moment `startCall()` kicks off a `.call` session
+    /// until that session reaches `.streaming` (a normal "connected") or a
+    /// terminal state (`.ended`/`.failed`, an aborted attempt) — bead
+    /// gateopener-1pm.5's signal for `DoorVideoSlotContent.content(...)` to
+    /// show "Connecting call…"/"Connecting call - Ns" instead of the plain
+    /// view-session connecting/busy-retry text while the FIRST call attempt
+    /// is still resolving (including waiting out a door-busy cooldown, e.g.
+    /// switching away from an in-progress view session). Never set back to
+    /// `true` by a pinned call renewal — `activeMode == .call` alone already
+    /// drives the "Connecting call…" text for a renewal (see
+    /// `DoorVideoSlotContent.content(isCall:)`'s doc comment), so this flag
+    /// only needs to cover the WINDOW where `activeMode` might not yet equal
+    /// `.call` (this exact window never actually occurs, since `startCall()`
+    /// sets `activeMode` to `.call` synchronously before returning — this
+    /// flag exists for parity with the bead's brief and as a belt-and-
+    /// suspenders signal independent of `activeMode`).
+    private(set) var pendingCall = false
+
+    /// `true` while `isMicMuted` has been toggled `true` via
+    /// `setMicMuted(_:)` for the CURRENT call. Reset to `false` at the start
+    /// of every new `startCall()` (a fresh call always starts unmuted) and
+    /// by `hangUp()`. NOT reset by a pinned call renewal — a renewal
+    /// re-acquires the mic track fresh (`DoorVideoSession.start(mode: .call)`
+    /// always builds a brand-new mic stream), so a muted renewal would
+    /// silently un-mute audio the operator explicitly muted; `setMicMuted`
+    /// is instead re-applied to the FRESH session right after it starts (see
+    /// `handlePinnableTermination`'s renewal call sites).
+    private(set) var isMicMuted = false
+
+    /// `true` while the CURRENTLY mounted session is a `.call` that is
+    /// `.connecting` or `.streaming` (bead gateopener-1pm.5) — the signal
+    /// `MainView` uses to show call chrome (Hang up/Mute, hide the close (X)
+    /// button) instead of the plain view-session chrome.
+    var isCallActive: Bool {
+        activeMode == .call && isPanelVisible
+    }
+
     /// - Parameters:
     ///   - makeSession: Builds a fresh `DoorVideoSession` per replace. See
     ///     `makeSession`'s doc comment.
@@ -362,6 +411,114 @@ final class DoorVideoCoordinator {
         startOrRetain()
     }
 
+    /// Starts (or retains) a `.call` session (bead gateopener-1pm.5),
+    /// triggered by `MainView`'s "Talk" button.
+    ///
+    /// Three cases, matching this bead's STEPS:
+    ///  - No session, or the current one is not connecting/streaming:
+    ///    start a fresh `.call` session directly (same as `startOrRetain()`
+    ///    starting a fresh `.view` one, just with `mode: .call`).
+    ///  - The current session IS connecting/streaming and is already a
+    ///    `.call` (`activeMode == .call`): a repeat "Talk" tap — retain,
+    ///    exactly like `viewDoor()` retains an in-flight view session.
+    ///  - The current session IS connecting/streaming but is a `.view`:
+    ///    stop it and start a fresh `.call` session. The old session's
+    ///    `onStateChange`/`onCooldownChange` routing is severed FIRST (by
+    ///    nil-ing `session` before calling `stop()`) so its `stop()`-induced
+    ///    terminal transition is silently ignored by `handleStateChange`'s
+    ///    identity guard (`guard session === changedSession else { return
+    ///    }`) instead of running through `handlePinnableTermination` — a
+    ///    pinned view session must NOT auto-renew itself as a `.view` session
+    ///    the instant this deliberately replaces it with a `.call` one,
+    ///    which would otherwise race this method's own `startSession(mode:
+    ///    .call, ...)` call into starting TWO new sessions instead of one.
+    ///    The new `.call` session's own pinned renewals correctly renew as
+    ///    `.call` (`activeMode` is already `.call` by the time any renewal
+    ///    logic runs) — only this one, deliberate, mode-switching stop is
+    ///    special-cased.
+    ///
+    /// The switched-away-from-view case keeps `isPanelVisible` `true`
+    /// throughout (`resetPanelVisible: false`) so there is no flash — the
+    /// slot was already showing a mounted `DoorVideoView`, and stays showing
+    /// one (via the fresh `.call` session) with no visible gap; starting
+    /// fresh from no session resets it normally (`resetPanelVisible: true`),
+    /// matching every other fresh start.
+    ///
+    /// The door-busy cooldown this may have to wait out (a fresh `rtc/offer`
+    /// is required to switch modes, so the registry's busy window applies
+    /// same as any other new session) surfaces through the usual
+    /// `cooldownUntil` plumbing; `pendingCall` additionally tells
+    /// `DoorVideoSlotContent.content(...)` to read that wait as "Connecting
+    /// call…"/"Connecting call - Ns" rather than the generic busy-retry text.
+    func startCall() {
+        let phase = session?.state.phase
+        let isActiveSession = (phase == .connecting || phase == .streaming)
+
+        if isActiveSession, activeMode == .call {
+            // Already calling or connecting a call: retain, don't restart.
+            return
+        }
+
+        let wasViewing = isActiveSession
+        if wasViewing {
+            let oldSession = session
+            session = nil
+            oldSession?.stop()
+        }
+
+        renewTask?.cancel()
+        renewTask = nil
+        pinStopMessage = nil
+
+        pendingCall = true
+        isMicMuted = false
+        eventSink("call start")
+        startSession(mode: .call, resetPanelVisible: !wasViewing)
+    }
+
+    /// Ends the current call (bead gateopener-1pm.5), triggered by
+    /// `MainView`'s Hang up button. Mirrors `dismiss()`'s field-by-field
+    /// reset (never routes through `handlePinnableTermination`/the pin's
+    /// auto-renew policy — a user-initiated hang-up ends the pin outright,
+    /// same as `dismiss()`), but calls `session.hangUp()` (mirrors
+    /// `DoorVideoSession.stop()`'s teardown, semantically named for this
+    /// call site) and additionally resets the call-specific state
+    /// (`activeMode`, `pendingCall`, `isMicMuted`). Does NOT auto-restart a
+    /// view session — the user just explicitly hung up, so the slot goes
+    /// back to the neutral "Tap to view door" placeholder, exactly like
+    /// `dismiss()`.
+    func hangUp() {
+        autoClearTask?.cancel()
+        autoClearTask = nil
+        renewTask?.cancel()
+        renewTask = nil
+        isPinned = false
+        pinnedSince = nil
+        pinRenewalCount = 0
+        lastFailureMessage = nil
+        session?.hangUp()
+        session = nil
+        isPanelVisible = false
+        sessionState = .idle
+        cooldownUntil = nil
+        lastTerminal = .none
+        activeMode = .view
+        pendingCall = false
+        isMicMuted = false
+        eventSink("hang up (user)")
+    }
+
+    /// Mutes/unmutes the CURRENT call's mic track (bead gateopener-1pm.5),
+    /// triggered by `MainView`'s Mute toggle. Publishes `isMicMuted`
+    /// immediately (so the button's icon flips even if `session` is `nil` or
+    /// mid-renewal) and forwards to `session?.setMicEnabled(_:)`, which itself
+    /// no-ops for a `.view` session or once `session` is `nil`.
+    func setMicMuted(_ muted: Bool) {
+        isMicMuted = muted
+        session?.setMicEnabled(!muted)
+        eventSink(muted ? "mic muted" : "mic unmuted")
+    }
+
     /// Stops and discards the current session immediately (no animation
     /// delay) — used for the panel's explicit dismiss (X) button and for
     /// backgrounding (`scenePhase == .background`). Always unpins (bead
@@ -392,6 +549,14 @@ final class DoorVideoCoordinator {
         sessionState = .idle
         cooldownUntil = nil
         lastTerminal = .none
+        // Bead gateopener-1pm.5: backgrounding (`GateOpenerIOSApp`'s
+        // `scenePhase` handler, the other caller of `dismiss()` besides the
+        // close (X) button — which is itself hidden while a call is active,
+        // so this in practice only matters for the backgrounding path) must
+        // also fully end an in-progress call's state, same as `hangUp()`.
+        activeMode = .view
+        pendingCall = false
+        isMicMuted = false
         eventSink("dismiss (\(reason))")
     }
 
@@ -427,6 +592,14 @@ final class DoorVideoCoordinator {
     /// instance (its script message handlers/navigation delegate are torn
     /// down by `stop()`/`endDueToLiveness`, so a reused instance is silently
     /// broken).
+    /// - Parameter mode: Bead gateopener-1pm.5: which mode the fresh session
+    ///     should run as — `.view` (the default, used by `startOrRetain()`
+    ///     and every pre-existing call site) or `.call` (`startCall()`, and
+    ///     `handlePinnableTermination`'s renewal calls once `activeMode ==
+    ///     .call`). Published to `activeMode` unconditionally, BEFORE
+    ///     `makeSession()` is called, so a `#if DEBUG` stub's `start(mode:)`
+    ///     early-return (see that method's doc comment) and every other
+    ///     reader of `activeMode` see the new value immediately.
     /// - Parameter resetPanelVisible: `true` (the default, used by
     ///     `startOrRetain()`) resets `isPanelVisible` to `false` before the
     ///     new session's own `.connecting` transition sets it back to `true`
@@ -435,11 +608,14 @@ final class DoorVideoCoordinator {
     ///     is already `true` from the session that just ended (it was
     ///     `.connecting`/`.streaming` a moment ago), and this bead's design
     ///     explicitly requires the panel to stay visible with no flash
-    ///     across that renew seam.
-    private func startSession(resetPanelVisible: Bool = true) {
+    ///     across that renew seam. `startCall()` also passes `false` when
+    ///     switching away from an in-progress `.view` session, for the same
+    ///     no-flash reason.
+    private func startSession(mode: DoorVideoSession.Mode = .view, resetPanelVisible: Bool = true) {
         autoClearTask?.cancel()
         autoClearTask = nil
 
+        activeMode = mode
         let newSession = makeSession()
         sessionStartCount += 1
         reachedStreamingThisSession = false
@@ -458,7 +634,7 @@ final class DoorVideoCoordinator {
         }
 
         Task {
-            await newSession.start()
+            await newSession.start(mode: mode)
         }
     }
 
@@ -494,7 +670,20 @@ final class DoorVideoCoordinator {
         case .streaming:
             isPanelVisible = true
             reachedStreamingThisSession = true
+            // Bead gateopener-1pm.5: the call's mic/audio-direction leg is
+            // confirmed sendrecv exactly when `.streaming` is first reached
+            // for a `.call` session — `pendingCall` clears here (its "still
+            // resolving the FIRST attempt" window is over) and `eventSink`
+            // records the connect. Guarded on `pendingCall` (not just
+            // `activeMode == .call`) so a pinned call's LATER renewals,
+            // which never set `pendingCall` back to `true`, do not log a
+            // second, redundant "call connected" for the same ongoing call.
+            if activeMode == .call, pendingCall {
+                pendingCall = false
+                eventSink("call connected")
+            }
         case .ended:
+            pendingCall = false
             if reachedStreamingThisSession {
                 consecutiveFailures = 0
             }
@@ -507,6 +696,7 @@ final class DoorVideoCoordinator {
                 self.scheduleAutoClear(for: changedSession)
             }
         case .failed(let message):
+            pendingCall = false
             if reachedStreamingThisSession {
                 consecutiveFailures = 0
             }
@@ -599,7 +789,12 @@ final class DoorVideoCoordinator {
                 isPanelVisible = true
                 pinRenewalCount += 1
                 eventSink("pin renew #\(pinRenewalCount) (after \(afterDescription))")
-                startSession(resetPanelVisible: false)
+                // Bead gateopener-1pm.5: renew in whatever mode the just-
+                // ended session was running as (`activeMode`, unchanged
+                // since `startSession(mode:...)` set it for THIS session) —
+                // a pinned CALL renews as a call (mic re-acquired), a pinned
+                // view renews as a view, exactly as before this bead.
+                startSession(mode: activeMode, resetPanelVisible: false)
             } else {
                 // Failure backoff: leave the just-failed `changedSession`
                 // mounted as `session` and `isPanelVisible` as it already
@@ -624,7 +819,9 @@ final class DoorVideoCoordinator {
                     self.isPanelVisible = true
                     self.pinRenewalCount += 1
                     self.eventSink("pin renew #\(self.pinRenewalCount) (after \(afterDescription))")
-                    self.startSession(resetPanelVisible: false)
+                    // See the immediate (`after <= 0`) branch's comment above
+                    // for why this renews in `self.activeMode`.
+                    self.startSession(mode: self.activeMode, resetPanelVisible: false)
                 }
             }
         case .stop(let reason):

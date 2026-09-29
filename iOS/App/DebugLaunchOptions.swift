@@ -33,6 +33,8 @@ import os
 ///   - `--mock-video [<connectingSeconds> <streamingSeconds>]`: see
 ///     `mockVideoOnLaunch`/`mockVideoTimeline`.
 ///   - `--auto-pin-after <seconds>`: see `autoPinAfterSeconds`.
+///   - `--auto-call-after <seconds>`: see `autoCallAfterSeconds`.
+///   - `--mic-probe`: see `micProbeOnLaunch`.
 enum DebugLaunchOptions {
     /// The fake `GateOpening` mode requested by `--mock-gate`, or `nil` if
     /// that argument was not passed (production `GateClient` is used).
@@ -73,6 +75,21 @@ enum DebugLaunchOptions {
     /// reconnecting/countdown states without UI automation.
     static var autoPinAfterSeconds: Double? {
         parseSecondsFlag("--auto-pin-after", in: ProcessInfo.processInfo.arguments)
+    }
+
+    /// Parses `--auto-call-after <seconds>` from the process's launch
+    /// arguments, mirroring `autoPinAfterSeconds`'s parsing exactly. Returns
+    /// `nil` if the argument is absent or malformed.
+    ///
+    /// DEBUG-only verification hook for bead gateopener-1pm.5's Talk/Mute/
+    /// Hang up UI: `MainView` schedules a single `doorVideoCoordinator
+    /// .startCall()` call after this delay, since the "Talk" button itself
+    /// needs a real tap, which `simctl launch` cannot perform — combined with
+    /// `--mock-gate ok --mock-video <connecting> <streaming>`, this lets a
+    /// screenshot script capture the placeholder-with-Talk, connecting-call,
+    /// and live-call (Hang up/Mute) states without UI automation.
+    static var autoCallAfterSeconds: Double? {
+        parseSecondsFlag("--auto-call-after", in: ProcessInfo.processInfo.arguments)
     }
 
     /// Shared single-`Double`-argument flag parser for `--auto-open-after`/
@@ -146,6 +163,31 @@ enum DebugLaunchOptions {
     /// so the door-video panel itself can be screenshotted.
     static var mockVideoOnLaunch: Bool {
         ProcessInfo.processInfo.arguments.contains("--mock-video")
+    }
+
+    /// True if `--mic-probe` was passed on the launch command line (bead
+    /// gateopener-1pm.1 SPIKE): after launch, `GateOpenerIOSApp` runs
+    /// `MicProbe.run()` — a standalone, `DoorVideoSession`-free WKWebView
+    /// loading `door-video.html` exactly as a real session does, calling
+    /// `getUserMedia` and then (per that bead's NOTES) probing for a
+    /// non-mDNS host ICE candidate — and logs/persists the one-line result.
+    /// The SAME probe is also reachable without a launch argument via
+    /// Settings' DEBUG-only "Run mic probe" row (`SettingsView
+    /// .diagnosticsSection`), which is the practical path on a real,
+    /// installed-from-Xcode device where launch arguments are awkward to
+    /// pass.
+    static var micProbeOnLaunch: Bool {
+        isMicProbeRequested(in: ProcessInfo.processInfo.arguments)
+    }
+
+    /// Pure parsing logic behind `micProbeOnLaunch`, factored out (mirroring
+    /// `parseSecondsFlag`/`parseMockVideoTimeline` above) so
+    /// `DebugLaunchOptionsParsingTests` can exercise it directly against a
+    /// literal `[String]` array — `ProcessInfo.processInfo.arguments` itself
+    /// is fixed for the life of the test process and cannot be swapped
+    /// per-test.
+    static func isMicProbeRequested(in arguments: [String]) -> Bool {
+        arguments.contains("--mic-probe")
     }
 
     /// Optional `<connectingSeconds> <streamingSeconds>` timeline overrides
