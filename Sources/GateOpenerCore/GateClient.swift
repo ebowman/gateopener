@@ -164,7 +164,7 @@ public struct RetryPolicy: Sendable {
     /// `requestTimeouts == [3s, 5s, 8s]`, `maxTotalDelay == 2s`): `3 + 5 + 8
     /// = 16s` of requests, plus at most `2s` of bounded backoff sleep between
     /// attempts, for a `<= 18s` total -- comfortably under
-    /// `OpenGateFlow`'s 25s extension-lifetime deadline.
+    /// `OpenGateFlow`'s 27s extension-lifetime deadline.
     public let requestTimeouts: [Duration]
     /// Injectable sleep function so tests never actually sleep.
     public let sleep: @Sendable (Duration) async throws -> Void

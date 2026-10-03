@@ -99,13 +99,19 @@ struct OpenGateFlowTests {
         defer { cleanup() }
         let store = WidgetSnapshotStore(defaults: defaults)
 
+        // "x" is a retryable failure, so the loop keeps trying until the
+        // deadline; a fake clock + instant sleep makes that instantaneous.
+        let clock = FakeClock()
         let outcome = await OpenGateFlow().run(
             currentState: .idle,
             gateName: "Front Gate",
             isReachable: true,
             open: { .failed(message: "x") },
             snapshot: store,
-            reloadTimelines: {}
+            reloadTimelines: {},
+            sleep: clock.sleep,
+            now: clock.now,
+            pressStartedAt: clock.start
         )
 
         #expect(outcome == .failed(message: "x"))
@@ -114,17 +120,20 @@ struct OpenGateFlowTests {
         #expect(store.read()?.message == "x")
     }
 
-    // MARK: - Unreachable fail-fast
+    // MARK: - Unreachable and never recovering: "No network" without any open() call
+    // (Behaviour note: the loop calls `waitForReachability`, whose default
+    // `{ _ in false }` means the network never comes back, so it gives up
+    // with "No network". A .waitingForNetwork phase is additionally journaled.)
 
-    /// Zero `open()` calls when unreachable — the extension must not queue
-    /// or wait 45s.
+    /// Zero `open()` calls when the network never recovers — the extension
+    /// must not queue an open or wait out the full deadline.
     ///
-    /// MUTATION CHECK: removing the `guard isReachable else { ... }`
-    /// short-circuit (so this always falls through to the `open()` call)
-    /// makes `openCallCount` go from 0 to 1 and the outcome flip from
-    /// `.failed("No network")` to `.opened` (the injected `open` here
-    /// returns `.succeeded`), so both assertions would fail — not vacuous.
-    @Test func unreachableFailsFastWithZeroOpenCalls() async {
+    /// MUTATION CHECK: if the loop skipped the reachability wait/give-up and
+    /// fell through to the `open()` call anyway, `openCallCount` would go from
+    /// 0 to 1 and the outcome would flip from `.failed("No network")` to
+    /// `.opened` (the injected `open` here returns `.succeeded`), so both
+    /// assertions would fail — not vacuous.
+    @Test func unreachableNeverRecoveringFailsWithZeroOpenCalls() async {
         let (defaults, cleanup) = makeSuite()
         defer { cleanup() }
         let store = WidgetSnapshotStore(defaults: defaults)
@@ -149,14 +158,15 @@ struct OpenGateFlowTests {
         #expect(calls == 0)
         #expect(store.read()?.phase == .failed)
         #expect(store.read()?.message == "No network")
-        // No `.opening` snapshot should ever have been written on this path.
+        // The loop publishes `.opening` once at start, then the terminal
+        // `.failed` (asserted above) once the reachability wait gives up.
     }
 
     // MARK: - Timeout
 
     /// `open()` never returns (awaits a `Task.sleep` far longer than the
     /// test's timeout, with cancellation handled so the Task doesn't leak
-    /// past the test). With `timeout: .milliseconds(50)`, the flow must
+    /// past the test). With a 50ms deadline, the flow must
     /// give up and report `.timedOut`.
     ///
     /// MUTATION CHECK: removing the timeout race in `raceAgainstTimeout`
@@ -186,7 +196,8 @@ struct OpenGateFlowTests {
             },
             snapshot: store,
             reloadTimelines: {},
-            timeout: .milliseconds(50)
+            deadline: .milliseconds(50),
+            minimumAttemptWindow: .zero
         )
 
         #expect(outcome == .timedOut)
@@ -261,6 +272,7 @@ struct OpenGateFlowTests {
         let phases = recorder.records.map(\.phase)
         #expect(phases == [
             .reachability(isReachable: false, detail: ""),
+            .waitingForNetwork,
             .finished(outcome: "No network"),
         ])
     }
@@ -286,6 +298,7 @@ struct OpenGateFlowTests {
         #expect(phases == [
             .reachability(isReachable: true, detail: ""),
             .openStarted,
+            .attempt(number: 1),
             .finished(outcome: "Gate opened"),
         ])
     }
@@ -295,23 +308,24 @@ struct OpenGateFlowTests {
         defer { cleanup() }
         let store = WidgetSnapshotStore(defaults: defaults)
         let recorder = PressRecorder()
-
+        // Non-retryable message => exactly one attempt phase.
         let outcome = await OpenGateFlow().run(
             currentState: .idle,
             gateName: "Front Gate",
             isReachable: true,
-            open: { .failed(message: "x") },
+            open: { .failed(message: "Wrong username or password") },
             snapshot: store,
             reloadTimelines: {},
             journal: { recorder.record($0) }
         )
 
-        #expect(outcome == .failed(message: "x"))
+        #expect(outcome == .failed(message: "Wrong username or password"))
         let phases = recorder.records.map(\.phase)
         #expect(phases == [
             .reachability(isReachable: true, detail: ""),
             .openStarted,
-            .finished(outcome: "x"),
+            .attempt(number: 1),
+            .finished(outcome: "Wrong username or password"),
         ])
     }
 
@@ -335,7 +349,8 @@ struct OpenGateFlowTests {
             },
             snapshot: store,
             reloadTimelines: {},
-            timeout: .milliseconds(50),
+            deadline: .milliseconds(50),
+            minimumAttemptWindow: .zero,
             journal: { recorder.record($0) }
         )
 
@@ -344,8 +359,328 @@ struct OpenGateFlowTests {
         #expect(phases == [
             .reachability(isReachable: true, detail: ""),
             .openStarted,
+            .attempt(number: 1),
             .timedOut,
         ])
+    }
+
+
+    // MARK: - Persistent retry loop (gateopener-6qa.1)
+
+    /// Fake clock: `now` reads a locked date, `sleep` advances it instantly.
+    private final class FakeClock: @unchecked Sendable {
+        let start = Date(timeIntervalSince1970: 1_000_000)
+        private let lock = NSLock()
+        private var offset: TimeInterval = 0
+
+        var now: @Sendable () -> Date {
+            { [self] in
+                lock.lock(); defer { lock.unlock() }
+                return start.addingTimeInterval(offset)
+            }
+        }
+        var sleep: @Sendable (Duration) async throws -> Void {
+            { [self] duration in advance(duration.timeInterval) }
+        }
+        func advance(_ seconds: TimeInterval) {
+            lock.lock(); offset += seconds; lock.unlock()
+        }
+        var elapsed: TimeInterval {
+            lock.lock(); defer { lock.unlock() }
+            return offset
+        }
+    }
+
+    /// Records, per open() call, how much time remained before the 27s deadline.
+    private final class AttemptLog: @unchecked Sendable {
+        private let lock = NSLock()
+        private var _remaining: [TimeInterval] = []
+        func record(_ r: TimeInterval) { lock.lock(); _remaining.append(r); lock.unlock() }
+        var remaining: [TimeInterval] { lock.lock(); defer { lock.unlock() }; return _remaining }
+        var count: Int { remaining.count }
+    }
+
+    private func attemptNumbers(_ recorder: PressRecorder) -> [Int] {
+        recorder.records.compactMap {
+            if case .attempt(let n) = $0.phase { return n }
+            return nil
+        }
+    }
+
+    @Test func succeedsOnFirstAttempt() async {
+        let (defaults, cleanup) = makeSuite()
+        defer { cleanup() }
+        let store = WidgetSnapshotStore(defaults: defaults)
+        let clock = FakeClock()
+        let recorder = PressRecorder()
+        let log = AttemptLog()
+
+        let outcome = await OpenGateFlow().run(
+            currentState: .idle, gateName: nil, isReachable: true,
+            open: { log.record(0); return .succeeded(at: Date()) },
+            snapshot: store, reloadTimelines: {},
+            sleep: clock.sleep, now: clock.now,
+            journal: { recorder.record($0) }, pressStartedAt: clock.start
+        )
+        #expect(outcome == .opened)
+        #expect(log.count == 1)
+        #expect(attemptNumbers(recorder) == [1])
+    }
+
+    @Test func failFailSucceedOpensWithThreeAttemptPhases() async {
+        let (defaults, cleanup) = makeSuite()
+        defer { cleanup() }
+        let store = WidgetSnapshotStore(defaults: defaults)
+        let clock = FakeClock()
+        let recorder = PressRecorder()
+        let calls = LockedCounter()
+        let reloads = LockedCounter()
+
+        let outcome = await OpenGateFlow().run(
+            currentState: .idle, gateName: nil, isReachable: true,
+            open: {
+                calls.increment()
+                clock.advance(3)
+                return calls.value < 3 ? .failed(message: "Network too slow - try again") : .succeeded(at: Date())
+            },
+            snapshot: store, reloadTimelines: { reloads.increment() },
+            sleep: clock.sleep, now: clock.now,
+            journal: { recorder.record($0) }, pressStartedAt: clock.start
+        )
+        #expect(outcome == .opened)
+        #expect(calls.value == 3)
+        #expect(attemptNumbers(recorder) == [1, 2, 3])
+        // Snapshot writes: .opening once + terminal once, no per-attempt spam.
+        #expect(reloads.value == 2)
+        #expect(store.read()?.phase == .succeeded)
+    }
+
+    @Test func alwaysFailStopsBeforeDeadlineAndNeverStartsLateAttempt() async {
+        let (defaults, cleanup) = makeSuite()
+        defer { cleanup() }
+        let store = WidgetSnapshotStore(defaults: defaults)
+        let clock = FakeClock()
+        let log = AttemptLog()
+        let deadline: TimeInterval = 27
+
+        let outcome = await OpenGateFlow().run(
+            currentState: .idle, gateName: nil, isReachable: true,
+            open: {
+                log.record(deadline - clock.elapsed)
+                clock.advance(4)
+                return .failed(message: "Gate service error (503)")
+            },
+            snapshot: store, reloadTimelines: {},
+            sleep: clock.sleep, now: clock.now, pressStartedAt: clock.start
+        )
+        #expect(outcome == .failed(message: "Gate service error (503)"))
+        #expect(log.count > 1)
+        // MUTATION CHECK: dropping the minimumAttemptWindow check makes an
+        // attempt start with < 3.5s remaining and this assertion fail.
+        #expect(log.remaining.allSatisfy { $0 >= 3.5 })
+        #expect(clock.elapsed <= deadline)
+        #expect(store.read()?.message == "Gate service error (503)")
+    }
+
+    @Test func nonRetryableFailuresMakeExactlyOneAttempt() async {
+        for message in [
+            "Wrong username or password", "No gate found", "Unlock iPhone to open the gate",
+        ] {
+            let (defaults, cleanup) = makeSuite()
+            defer { cleanup() }
+            let store = WidgetSnapshotStore(defaults: defaults)
+            let clock = FakeClock()
+            let log = AttemptLog()
+            let outcome = await OpenGateFlow().run(
+                currentState: .idle, gateName: nil, isReachable: true,
+                open: { log.record(0); return .failed(message: message) },
+                snapshot: store, reloadTimelines: {},
+                sleep: clock.sleep, now: clock.now, pressStartedAt: clock.start
+            )
+            #expect(outcome == .failed(message: message))
+            #expect(log.count == 1)
+        }
+    }
+
+    @Test func retryabilityClassifier() {
+        #expect(!OpenGateFlow.isRetryable(message: "Wrong username or password"))
+        #expect(!OpenGateFlow.isRetryable(message: "No gate found"))
+        #expect(!OpenGateFlow.isRetryable(message: "Unlock iPhone to open the gate"))
+        #expect(OpenGateFlow.isRetryable(message: "Could not reach the gate"))
+        #expect(OpenGateFlow.isRetryable(message: "Network too slow - try again"))
+        #expect(OpenGateFlow.isRetryable(message: "No internet connection"))
+        #expect(OpenGateFlow.isRetryable(message: "Gate service busy - try again"))
+        #expect(OpenGateFlow.isRetryable(message: "Gate service error (500)"))
+        #expect(OpenGateFlow.isRetryable(message: "Could not open the gate"))
+    }
+
+    @Test func needsSetupStateMidLoopStopsWithNeedsSetup() async {
+        let (defaults, cleanup) = makeSuite()
+        defer { cleanup() }
+        let store = WidgetSnapshotStore(defaults: defaults)
+        let clock = FakeClock()
+        let calls = LockedCounter()
+        let outcome = await OpenGateFlow().run(
+            currentState: .idle, gateName: nil, isReachable: true,
+            open: {
+                calls.increment()
+                return calls.value == 1 ? .failed(message: "Could not reach the gate") : .needsSetup
+            },
+            snapshot: store, reloadTimelines: {},
+            sleep: clock.sleep, now: clock.now, pressStartedAt: clock.start
+        )
+        #expect(outcome == .needsSetup)
+        #expect(calls.value == 2)
+        #expect(store.read()?.phase == .needsSetup)
+    }
+
+    @Test func offlineThenReachabilityReturnsSucceeds() async {
+        let (defaults, cleanup) = makeSuite()
+        defer { cleanup() }
+        let store = WidgetSnapshotStore(defaults: defaults)
+        let clock = FakeClock()
+        let recorder = PressRecorder()
+        let calls = LockedCounter()
+        let waits = LockedCounter()
+
+        let outcome = await OpenGateFlow().run(
+            currentState: .idle, gateName: nil, isReachable: false,
+            open: { calls.increment(); return .succeeded(at: Date()) },
+            snapshot: store, reloadTimelines: {},
+            waitForReachability: { _ in
+                waits.increment()
+                clock.advance(5)
+                return true
+            },
+            now: clock.now, journal: { recorder.record($0) }, pressStartedAt: clock.start
+        )
+        #expect(outcome == .opened)
+        #expect(waits.value == 1)
+        #expect(calls.value == 1)
+        let phases = recorder.records.map(\.phase)
+        #expect(phases == [
+            .reachability(isReachable: false, detail: ""),
+            .waitingForNetwork,
+            .openStarted,
+            .attempt(number: 1),
+            .finished(outcome: "Gate opened"),
+        ])
+    }
+
+    @Test func offlineAndNeverReturnsFailsNoNetworkWithoutOpenCall() async {
+        let (defaults, cleanup) = makeSuite()
+        defer { cleanup() }
+        let store = WidgetSnapshotStore(defaults: defaults)
+        let clock = FakeClock()
+        let calls = LockedCounter()
+        let outcome = await OpenGateFlow().run(
+            currentState: .idle, gateName: nil, isReachable: false,
+            open: { calls.increment(); return .succeeded(at: Date()) },
+            snapshot: store, reloadTimelines: {},
+            waitForReachability: { _ in false },
+            now: clock.now, pressStartedAt: clock.start
+        )
+        #expect(outcome == .failed(message: "No network"))
+        #expect(calls.value == 0)
+        #expect(store.read()?.message == "No network")
+    }
+
+    @Test func connectivityLostBetweenAttemptsWaitsThenRetries() async {
+        let (defaults, cleanup) = makeSuite()
+        defer { cleanup() }
+        let store = WidgetSnapshotStore(defaults: defaults)
+        let clock = FakeClock()
+        let calls = LockedCounter()
+        let waits = LockedCounter()
+        let outcome = await OpenGateFlow().run(
+            currentState: .idle, gateName: nil, isReachable: true,
+            open: {
+                calls.increment()
+                clock.advance(2)
+                return calls.value == 1 ? .failed(message: "No internet connection") : .succeeded(at: Date())
+            },
+            snapshot: store, reloadTimelines: {},
+            sleep: clock.sleep,
+            isReachableNow: { false },
+            waitForReachability: { _ in waits.increment(); clock.advance(3); return true },
+            now: clock.now, pressStartedAt: clock.start
+        )
+        #expect(outcome == .opened)
+        #expect(waits.value == 1)
+        #expect(calls.value == 2)
+    }
+
+    @Test func hangingAttemptIsCutAtDeadlineAsTimedOut() async {
+        let (defaults, cleanup) = makeSuite()
+        defer { cleanup() }
+        let store = WidgetSnapshotStore(defaults: defaults)
+        let calls = LockedCounter()
+        let started = Date()
+        let outcome = await OpenGateFlow().run(
+            currentState: .idle, gateName: nil, isReachable: true,
+            open: {
+                calls.increment()
+                try? await Task.sleep(for: .seconds(60))
+                return .succeeded(at: Date())
+            },
+            snapshot: store, reloadTimelines: {},
+            deadline: .milliseconds(100), minimumAttemptWindow: .zero,
+            pressStartedAt: started
+        )
+        #expect(outcome == .timedOut)
+        #expect(calls.value == 1)
+        #expect(Date().timeIntervalSince(started) < 20)
+        #expect(store.read()?.message == "Timed out")
+    }
+
+    /// `open()` that IGNORES cancellation (like production `GateController
+    /// .openGate()`): run() must still return at the deadline, not when the
+    /// open finishes, and must not start a second open().
+    @Test func cancellationIgnoringOpenDoesNotDelayRunPastDeadline() async {
+        let (defaults, cleanup) = makeSuite()
+        defer { cleanup() }
+        let store = WidgetSnapshotStore(defaults: defaults)
+        let calls = LockedCounter()
+        let release = DispatchSemaphore(value: 0)
+        let started = Date()
+
+        let outcome = await OpenGateFlow().run(
+            currentState: .idle, gateName: nil, isReachable: true,
+            open: {
+                calls.increment()
+                // Non-cancellable wait: blocks on a semaphore for up to 10s.
+                await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+                    DispatchQueue.global().async {
+                        _ = release.wait(timeout: .now() + 10)
+                        c.resume()
+                    }
+                }
+                return .succeeded(at: Date())
+            },
+            snapshot: store, reloadTimelines: {},
+            deadline: .milliseconds(500), minimumAttemptWindow: .zero,
+            pressStartedAt: started
+        )
+        let elapsed = Date().timeIntervalSince(started)
+        #expect(outcome == .timedOut)
+        #expect(elapsed < 5.0)
+        #expect(elapsed >= 0.4)
+        // No second open() while the first may still be in flight.
+        #expect(calls.value == 1)
+        release.signal()
+    }
+
+    @Test func legacyJournalLinesStillDecodeAndNewPhasesRoundTrip() throws {
+        let legacy = #"{"kind":"openStarted"}"#.data(using: .utf8)!
+        #expect(try JSONDecoder().decode(OpenPressPhase.self, from: legacy) == .openStarted)
+        let legacyReach = #"{"kind":"reachability","isReachable":true,"detail":"satisfied"}"#.data(using: .utf8)!
+        #expect(try JSONDecoder().decode(OpenPressPhase.self, from: legacyReach) == .reachability(isReachable: true, detail: "satisfied"))
+        for phase in [OpenPressPhase.attempt(number: 4), .waitingForNetwork] {
+            let data = try JSONEncoder().encode(phase)
+            #expect(try JSONDecoder().decode(OpenPressPhase.self, from: data) == phase)
+        }
+        let attempt = #"{"kind":"attempt","number":2}"#.data(using: .utf8)!
+        #expect(try JSONDecoder().decode(OpenPressPhase.self, from: attempt) == .attempt(number: 2))
     }
 
     // MARK: - TaskLocal pressId propagation into open() (gateopener-41m.22)
@@ -415,6 +750,10 @@ struct OpenGateFlowTests {
             },
             snapshot: store,
             reloadTimelines: {},
+            // Frozen clock at the press start: the deadline is measured from
+            // `pressStartedAt` via `now`, so a real clock would put this 2023
+            // date far past the deadline.
+            now: { explicitPressStartedAt },
             pressStartedAt: explicitPressStartedAt
         )
 

@@ -30,6 +30,7 @@ public final class AppSettings: @unchecked Sendable {
         static let allowOpenWhileLocked = "ie.boboco.GateOpener.allowOpenWhileLocked"
         static let autoStartDoorVideoOnLaunch = "ie.boboco.GateOpener.autoStartDoorVideoOnLaunch"
         static let cachedCameraEndpointId = "ie.boboco.GateOpener.cachedCameraEndpointId"
+        static let notifyOnOpenSuccess = "ie.boboco.GateOpener.notifyOnOpenSuccess"
 
         /// All keys owned by `AppSettings`. Used by `reset()` so unrelated
         /// UserDefaults keys (e.g. from other parts of the app, or the test
@@ -37,7 +38,7 @@ public final class AppSettings: @unchecked Sendable {
         static let all = [
             aptId, selectedEndpointId, selectedEndpointName, lastDiscoveryDate, shortcutPreference,
             showOpenConfirmationOverlay, autoShowDoorVideoOnOpen, cachedGates, allowOpenWhileLocked,
-            autoStartDoorVideoOnLaunch, cachedCameraEndpointId,
+            autoStartDoorVideoOnLaunch, cachedCameraEndpointId, notifyOnOpenSuccess,
         ]
     }
 
@@ -239,6 +240,20 @@ public final class AppSettings: @unchecked Sendable {
                 : defaults.bool(forKey: Keys.autoStartDoorVideoOnLaunch)
         }
         set { defaults.set(newValue, forKey: Keys.autoStartDoorVideoOnLaunch) }
+    }
+
+    /// Whether a "Gate opened" notification is posted after a successful
+    /// open (iOS result notifications, bead gateopener-6qa.3). Failures are
+    /// always announced regardless. Defaults to `true`.
+    public var notifyOnOpenSuccess: Bool {
+        get {
+            // Absent key means true (same as `allowOpenWhileLocked`);
+            // do not "simplify" to `defaults.bool(forKey:)`.
+            defaults.object(forKey: Keys.notifyOnOpenSuccess) == nil
+                ? true
+                : defaults.bool(forKey: Keys.notifyOnOpenSuccess)
+        }
+        set { defaults.set(newValue, forKey: Keys.notifyOnOpenSuccess) }
     }
 
     /// The door-camera endpoint id discovered by a PAST video session (bead

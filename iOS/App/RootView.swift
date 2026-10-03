@@ -28,6 +28,16 @@ struct RootView: View {
                 )
             }
         }
+        // Bead gateopener-6qa.3: ask for notification permission once the
+        // user is signed in (never in the widget extension). Re-runs on
+        // the needsSetup -> signed-in edge; a no-op unless status is
+        // `.notDetermined`.
+        .task(id: observable.state == .needsSetup) {
+            guard observable.state != .needsSetup else { return }
+            let notifier = OpenResultNotifier(settings: appSettings)
+            notifier.registerCategories()
+            await notifier.requestAuthorizationIfNeeded()
+        }
         // Bead gateopener-41m.12: once sign-in completes (`.needsSetup` ->
         // anything else) while the app is active, the user has just landed
         // on `MainView` for the first time this session — start door video

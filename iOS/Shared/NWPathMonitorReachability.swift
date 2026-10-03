@@ -37,6 +37,10 @@ public final class NWPathMonitorReachability: ReachabilityProviding, @unchecked 
     /// `.reachability(detail:)` phase.
     private var _latestPath: NWPath?
     private var onChangeHandler: (@Sendable (Bool) -> Void)?
+    /// Backs `waitUntilReachable(timeout:)`. Independent of `onChangeHandler`
+    /// (`setOnChange` REPLACES its single handler), so waiting never
+    /// disturbs or stacks handlers.
+    private let waiter = ReachabilityWaiter(initiallyReachable: true)
 
     public init() {
         monitor = NWPathMonitor()
@@ -48,6 +52,7 @@ public final class NWPathMonitorReachability: ReachabilityProviding, @unchecked 
             self._latestPath = path
             let handler = self.onChangeHandler
             self.lock.unlock()
+            self.waiter.update(reachable)
             handler?(reachable)
         }
         monitor.start(queue: queue)
@@ -61,6 +66,13 @@ public final class NWPathMonitorReachability: ReachabilityProviding, @unchecked 
         lock.lock()
         defer { lock.unlock() }
         return _isReachable
+    }
+
+    /// Returns `true` at once if reachable; otherwise waits until a satisfied
+    /// path arrives (`true`) or `timeout` elapses (`false`). See
+    /// `ReachabilityWaiter`.
+    public func waitUntilReachable(timeout: Duration) async -> Bool {
+        await waiter.wait(timeout: timeout)
     }
 
     public func setOnChange(_ handler: (@Sendable (Bool) -> Void)?) {

@@ -2,6 +2,7 @@ import SwiftUI
 import GateOpenerCore
 import Security
 import UIKit
+import UserNotifications
 
 /// The Settings screen presented from `MainView`'s gear button (bead
 /// gateopener-672.10).
@@ -39,6 +40,7 @@ struct SettingsView: View {
     @State private var isConfirmingSignOut = false
     @State private var lockScreenErrorMessage: String?
     @State private var isConfirmingClearVideoLogs = false
+    @State private var notificationsDenied = false
 
     /// The full text of the last persisted `VideoDiagnostics` log (bead
     /// gateopener-672.27), or `nil` if none has ever been persisted. Loaded
@@ -93,6 +95,7 @@ struct SettingsView: View {
                 videoSection
                 quickAccessSection
                 lockScreenSection
+                notificationsSection
                 accountSection
                 videoDiagnosticsSection
                 diagnosticsSection
@@ -113,6 +116,7 @@ struct SettingsView: View {
                 }
             }
             .onAppear { reloadVideoDiagnostics() }
+            .task { await reloadNotificationAuthorization() }
             .onChange(of: refreshToken) { _, _ in reloadVideoDiagnostics() }
         }
     }
@@ -296,6 +300,39 @@ struct SettingsView: View {
                 }
             }
         )
+    }
+
+    // MARK: - Notifications
+
+    private var notificationsSection: some View {
+        Section {
+            Toggle("Notify when the gate opens", isOn: notifyOnOpenSuccessBinding)
+        } header: {
+            Text("Notifications")
+        } footer: {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("A notification with a distinct sound tells you the result, even when your iPhone is locked. Failures are always announced.")
+                if notificationsDenied {
+                    Text("Notifications are turned off for GateOpener. Enable them in iOS Settings > Notifications.")
+                }
+            }
+        }
+    }
+
+    private var notifyOnOpenSuccessBinding: Binding<Bool> {
+        Binding(
+            get: { appSettings.notifyOnOpenSuccess },
+            set: { newValue in
+                appSettings.notifyOnOpenSuccess = newValue
+                refreshToken += 1
+            }
+        )
+    }
+
+    private func reloadNotificationAuthorization() async {
+        guard Bundle.main.bundleIdentifier != nil else { return }
+        let status = await UNUserNotificationCenter.current().notificationSettings().authorizationStatus
+        notificationsDenied = (status == .denied)
     }
 
     // MARK: - Account

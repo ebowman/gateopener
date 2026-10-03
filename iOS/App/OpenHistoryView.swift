@@ -352,6 +352,10 @@ struct OpenHistoryView: View {
             return "\(offset) finished: \(outcome)"
         case .timedOut:
             return "\(offset) timed out"
+        case .attempt(let number):
+            return "\(offset) Attempt \(number)"
+        case .waitingForNetwork:
+            return "\(offset) Waiting for network"
         }
     }
 

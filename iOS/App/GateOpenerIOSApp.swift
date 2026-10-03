@@ -18,6 +18,7 @@ import os
 /// screens are later beads (gateopener-672.9, .10).
 @main
 struct GateOpenerIOSApp: App {
+    @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @State private var environment: AppEnvironment
     @State private var observable: GateControllerObservable
     @State private var doorVideoCoordinator: DoorVideoCoordinator
@@ -117,6 +118,7 @@ struct GateOpenerIOSApp: App {
             }
         )
 
+        OpenResultNotificationHandler.shared.configure(environment: environment)
         _environment = State(initialValue: environment)
         _observable = State(initialValue: observable)
         _doorVideoCoordinator = State(initialValue: doorVideoCoordinator)
