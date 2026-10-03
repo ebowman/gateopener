@@ -445,4 +445,109 @@ struct OpenGateIntentTests {
         #expect(elapsed < 6)
         #expect(gate.openCallCount == 1)
     }
+
+    // MARK: - Result notifications (bead gateopener-6qa.4)
+
+    private func runWithNotifier(
+        gate: FakeGateOpening, deadline: Duration, notifier: FakeNotifier, signedIn: Bool = true
+    ) async throws -> OpenGateFlow.Outcome {
+        let (defaults, cleanup) = makeInMemoryDefaults()
+        defer { cleanup() }
+        let journalURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("intent-notif-\(UUID().uuidString).jsonl")
+        OpenGateIntent.journalURLOverride = .some(journalURL)
+        defer { OpenGateIntent.journalURLOverride = nil }
+        let environment: AppEnvironment
+        if signedIn {
+            environment = try makeSignedInEnvironment(defaults: defaults, gate: gate, journalURL: journalURL)
+        } else {
+            environment = AppEnvironment.make(
+                defaults: defaults,
+                reachability: FakeReachabilityProviding(isReachable: true),
+                timelineReloader: {},
+                gateClient: gate,
+                tokenResolver: FakeTokenResolving()
+            )
+        }
+        return await OpenGateIntent.runFlow(environment: environment, deadline: deadline, notifier: notifier)
+    }
+
+    @Test func openedPostsSuccess() async throws {
+        let notifier = FakeNotifier()
+        let outcome = try await runWithNotifier(gate: FakeGateOpening(), deadline: .seconds(10), notifier: notifier)
+        #expect(outcome == .opened)
+        #expect(notifier.events.count == 1)
+        if case .success = notifier.events.first {} else { Issue.record("expected success post") }
+        #expect(notifier.registerCount >= 1)
+    }
+
+    @Test func failedPostsFailureWithPressStart() async throws {
+        let gate = FakeGateOpening()
+        gate.shouldSucceed = false
+        let notifier = FakeNotifier()
+        let before = Date()
+        let outcome = try await runWithNotifier(gate: gate, deadline: .seconds(4), notifier: notifier)
+        let after = Date()
+        guard case .failed = outcome else { Issue.record("expected failed, got \(outcome)"); return }
+        #expect(notifier.events.count == 1)
+        guard case .failure(_, _, let pressedAt) = notifier.events.first else {
+            Issue.record("expected failure post"); return
+        }
+        #expect(pressedAt >= before.addingTimeInterval(-0.5))
+        #expect(pressedAt <= before.addingTimeInterval(2))
+        #expect(pressedAt < after)
+    }
+
+    /// With a 1s deadline no attempt fits, so the flow ends not-opened
+    /// (failed or timedOut); either must post a failure.
+    @Test func noAttemptWindowPostsFailure() async throws {
+        let gate = FakeGateOpening()
+        gate.shouldSucceed = false
+        let notifier = FakeNotifier()
+        let outcome = try await runWithNotifier(gate: gate, deadline: .seconds(1), notifier: notifier)
+        #expect(outcome != .opened && outcome != .needsSetup)
+        #expect(notifier.events.count == 1)
+        if case .failure = notifier.events.first {} else { Issue.record("expected failure post") }
+    }
+
+    @Test func needsSetupPostsNothing() async throws {
+        let notifier = FakeNotifier()
+        let outcome = try await runWithNotifier(
+            gate: FakeGateOpening(), deadline: .seconds(5), notifier: notifier, signedIn: false)
+        #expect(outcome == .needsSetup)
+        #expect(notifier.events.isEmpty)
+    }
+
+    @Test func hangingNotifierIsBoundedToAboutTwoSeconds() async throws {
+        let notifier = FakeNotifier()
+        notifier.hang = true
+        let start = Date()
+        let outcome = try await runWithNotifier(gate: FakeGateOpening(), deadline: .seconds(10), notifier: notifier)
+        let elapsed = Date().timeIntervalSince(start)
+        #expect(outcome == .opened)
+        #expect(elapsed < 4.5)
+    }
+}
+
+final class FakeNotifier: OpenResultNotifying, @unchecked Sendable {
+    enum Event {
+        case success(gateName: String?)
+        case failure(gateName: String?, message: String, pressedAt: Date)
+    }
+    private let lock = NSLock()
+    private var _events: [Event] = []
+    private var _registerCount = 0
+    var hang = false
+    var events: [Event] { lock.lock(); defer { lock.unlock() }; return _events }
+    var registerCount: Int { lock.lock(); defer { lock.unlock() }; return _registerCount }
+    func registerCategories() { lock.lock(); _registerCount += 1; lock.unlock() }
+    func requestAuthorizationIfNeeded() async {}
+    func postFailure(gateName: String?, message: String, pressedAt: Date) async {
+        lock.withLock { _events.append(.failure(gateName: gateName, message: message, pressedAt: pressedAt)) }
+        if hang { try? await Task.sleep(for: .seconds(60)) }
+    }
+    func postSuccess(gateName: String?) async {
+        lock.withLock { _events.append(.success(gateName: gateName)) }
+        if hang { try? await Task.sleep(for: .seconds(60)) }
+    }
 }

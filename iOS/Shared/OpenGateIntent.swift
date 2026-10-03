@@ -94,7 +94,8 @@ public struct OpenGateIntent: AppIntent {
     @MainActor
     static func runFlow(
         environment: AppEnvironment? = nil,
-        deadline pressDeadline: Duration = OpenGateIntent.pressDeadline
+        deadline pressDeadline: Duration = OpenGateIntent.pressDeadline,
+        notifier: (any OpenResultNotifying)? = nil
     ) async -> OpenGateFlow.Outcome {
         // FIRST statements: press identity + the direct journal write,
         // before AppEnvironment.make() -- see this method's doc comment.
@@ -184,6 +185,56 @@ public struct OpenGateIntent: AppIntent {
             pressAppVersion: appVersion
         )
 
+        // Result notification. Budget: flow deadline 27s + at most
+        // `notificationBound` (2s) = 29s, under iOS's ~30s intent limit.
+        // `.needsSetup` posts nothing (the dialog already says sign in).
+        let notifier = notifier ?? OpenResultNotifier(settings: environment.appSettings)
+        let post: (@Sendable () async -> Void)?
+        switch outcome {
+        case .opened:
+            post = { await notifier.postSuccess(gateName: gateName) }
+        case .failed(let message):
+            post = { await notifier.postFailure(gateName: gateName, message: message, pressedAt: pressStartedAt) }
+        case .timedOut:
+            post = { await notifier.postFailure(gateName: gateName, message: outcome.dialog, pressedAt: pressStartedAt) }
+        case .needsSetup:
+            post = nil
+        }
+        if let post {
+            notifier.registerCategories()
+            await Self.runBounded(notificationBound, post)
+        }
+
         return outcome
+    }
+
+    /// Max time `runFlow` waits for the notification to be enqueued.
+    static let notificationBound: Duration = .seconds(2)
+
+    /// Runs `work`, returning when it finishes OR after `bound`, whichever
+    /// is first. Does not wait for `work` if it ignores cancellation.
+    static func runBounded(_ bound: Duration, _ work: @escaping @Sendable () async -> Void) async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            let gate = OnceGate(continuation)
+            let worker = Task { await work(); gate.fire() }
+            Task {
+                try? await Task.sleep(for: bound)
+                gate.fire()
+                worker.cancel()
+            }
+        }
+    }
+}
+
+private final class OnceGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Void, Never>?
+    init(_ continuation: CheckedContinuation<Void, Never>) { self.continuation = continuation }
+    func fire() {
+        lock.lock()
+        let c = continuation
+        continuation = nil
+        lock.unlock()
+        c?.resume()
     }
 }
