@@ -375,4 +375,74 @@ struct OpenGateIntentTests {
         #expect(phases[3] == .finished(outcome: "Sign in to GateOpener first"))
         #expect(Set(pressRecords.map(\.pressId)).count == 1)
     }
+
+    // MARK: - persistent retry through the real intent
+
+    private func makeSignedInEnvironment(
+        defaults: UserDefaults, gate: FakeGateOpening, journalURL: URL
+    ) throws -> AppEnvironment {
+        let store = InMemoryCredentialStore()
+        try store.saveCredentials(username: "u", password: "p")
+        let settings = AppSettings(defaults: defaults)
+        settings.selectedEndpointId = "mock"
+        settings.selectedEndpointName = "Mock Gate"
+        return AppEnvironment.make(
+            defaults: defaults,
+            reachability: FakeReachabilityProviding(isReachable: true),
+            timelineReloader: {},
+            gateClient: gate,
+            tokenResolver: FakeTokenResolving(),
+            openAttemptJournalURL: journalURL,
+            controllerCredentialStore: store
+        )
+    }
+
+    @Test func pressDeadlineIs27Seconds() {
+        #expect(OpenGateIntent.pressDeadline == .seconds(27))
+    }
+
+    /// Fails retryably on the first open, succeeds on the second: the intent
+    /// must retry (after the 1s retryDelay) and report `.opened`.
+    @Test func failThenSucceedRetriesAndOpens() async throws {
+        let (defaults, cleanup) = makeInMemoryDefaults()
+        defer { cleanup() }
+        let journalURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("intent-retry-\(UUID().uuidString).jsonl")
+        OpenGateIntent.journalURLOverride = .some(journalURL)
+        defer { OpenGateIntent.journalURLOverride = nil }
+
+        let gate = FakeGateOpening()
+        gate.failuresBeforeSuccess = 1
+        let environment = try makeSignedInEnvironment(defaults: defaults, gate: gate, journalURL: journalURL)
+        #expect(environment.controller.state == .idle)
+
+        let outcome = await OpenGateIntent.runFlow(environment: environment, deadline: .seconds(10))
+        #expect(outcome == .opened)
+        #expect(gate.openCallCount == 2)
+    }
+
+    /// Always-failing gate: with `deadline: 4s` and the flow's 3.5s minimum
+    /// attempt window, exactly one attempt fits (then the 1s retry delay
+    /// leaves <3.5s), so the loop ends in ~1s with a failure. With a 1s
+    /// deadline NO attempt would fit -- so this proves the passed deadline
+    /// (not the 27s default, which would allow ~5 attempts) is honoured.
+    @Test func deadlineIsPassedThroughToFlow() async throws {
+        let (defaults, cleanup) = makeInMemoryDefaults()
+        defer { cleanup() }
+        let journalURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("intent-deadline-\(UUID().uuidString).jsonl")
+        OpenGateIntent.journalURLOverride = .some(journalURL)
+        defer { OpenGateIntent.journalURLOverride = nil }
+
+        let gate = FakeGateOpening()
+        gate.shouldSucceed = false
+        let environment = try makeSignedInEnvironment(defaults: defaults, gate: gate, journalURL: journalURL)
+
+        let start = Date()
+        let outcome = await OpenGateIntent.runFlow(environment: environment, deadline: .seconds(4))
+        let elapsed = Date().timeIntervalSince(start)
+        #expect(outcome != .opened)
+        #expect(elapsed < 6)
+        #expect(gate.openCallCount == 1)
+    }
 }

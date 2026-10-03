@@ -40,6 +40,13 @@ public struct OpenGateIntent: AppIntent {
     nonisolated(unsafe) static var journalURLOverride: URL??
     #endif
 
+    /// Wall-clock budget for one press, measured from press start. iOS gives
+    /// background intents roughly 30s, so the persistent retry loop in
+    /// `OpenGateFlow` stops at 27s, leaving headroom to write the terminal
+    /// snapshot and return the dialog. Per-request timeouts (`GateClient`'s
+    /// RetryPolicy) are deliberately unchanged.
+    static let pressDeadline: Duration = .seconds(27)
+
     public init() {}
 
     public func perform() async throws -> some IntentResult & ProvidesDialog {
@@ -85,7 +92,10 @@ public struct OpenGateIntent: AppIntent {
     ///   credentials, exactly as `AppEnvironment.make(gateClient:
     ///   tokenResolver:)`'s own doc comment warns against.
     @MainActor
-    static func runFlow(environment: AppEnvironment? = nil) async -> OpenGateFlow.Outcome {
+    static func runFlow(
+        environment: AppEnvironment? = nil,
+        deadline pressDeadline: Duration = OpenGateIntent.pressDeadline
+    ) async -> OpenGateFlow.Outcome {
         // FIRST statements: press identity + the direct journal write,
         // before AppEnvironment.make() -- see this method's doc comment.
         let pressStartedAt = Date()
@@ -133,29 +143,13 @@ public struct OpenGateIntent: AppIntent {
 
         emit(.environmentReady)
 
-        // Reachability seam: `AppEnvironment.make()` defaults to a real
-        // `NWPathMonitorReachability()` (see that type's initializer) when
-        // no `reachability:` override is passed, exactly as here. Its
-        // `isReachable` is optimistic (`true`) until the very first path
-        // update arrives (documented on `NWPathMonitorReachability
-        // ._isReachable`) — a fresh instance constructed inline in this
-        // intent's process has essentially no time to receive that first
-        // update before `OpenGateFlow.run` reads it. CHOICE MADE HERE:
-        // accept that optimistic initial `true` rather than adding an
-        // artificial wait for the first path update. Rationale: (1) a
-        // genuinely offline device delivers its first `unsatisfied` update
-        // "almost immediately" per that type's own doc comment, but
-        // "almost immediately" is not a bounded guarantee worth blocking
-        // this latency-sensitive, ~20s-budget intent on; (2) even if this
-        // races and reads stale-optimistic `true` on a genuinely offline
-        // device, the flow does not hang — `GateController.performOpen()`'s
-        // own network call will simply fail (via `GateClient`'s existing
-        // retry/timeout budget, ~18s worst case) and `OpenGateFlow` maps
-        // that to `.failed(message:)`, which still produces a correct,
-        // bounded, user-visible dialog. The `isReachable == false` fast
-        // path exists to avoid the ~45s `requestOpen()` QUEUE TTL (which
-        // this intent never uses in the first place, since it always calls
-        // `openGate()` directly), not to avoid the retry budget itself.
+        // Reachability: a fresh `NWPathMonitorReachability` is optimistic
+        // (`true`) until its first path update arrives, so the initial
+        // `isReachable` read below may be stale. That is harmless now:
+        // `OpenGateFlow.run` retries failed attempts until `pressDeadline`,
+        // re-reading the LIVE `isReachableNow` between attempts and, when
+        // offline, waiting (bounded by the deadline) via
+        // `waitForReachability` for a satisfied path.
         let reachability = NWPathMonitorReachability()
 
         let currentState = environment.controller.state
@@ -178,6 +172,9 @@ public struct OpenGateIntent: AppIntent {
             },
             snapshot: environment.snapshotStore,
             reloadTimelines: { WidgetCenter.shared.reloadAllTimelines() },
+            deadline: pressDeadline,
+            isReachableNow: { reachability.isReachable },
+            waitForReachability: { await reachability.waitUntilReachable(timeout: $0) },
             journal: journalWriter,
             pressId: pressId,
             pressStartedAt: pressStartedAt,

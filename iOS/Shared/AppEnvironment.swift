@@ -144,7 +144,8 @@ public final class AppEnvironment {
         timelineReloader: @escaping @Sendable () -> Void = { WidgetCenter.shared.reloadAllTimelines() },
         gateClient: (any GateOpening)? = nil,
         tokenResolver: (any TokenResolving)? = nil,
-        openAttemptJournalURL: URL?? = nil
+        openAttemptJournalURL: URL?? = nil,
+        controllerCredentialStore: (any CredentialStoring)? = nil
     ) -> AppEnvironment {
         let resolvedDefaults: UserDefaults
         if let defaults {
@@ -276,7 +277,10 @@ public final class AppEnvironment {
         let controller = GateController(
             gateClient: resolvedGateClient,
             tokenManager: resolvedTokenResolver,
-            credentialStore: credentialStore,
+            // TEST SEAM: `controllerCredentialStore` (an in-memory fake) lets
+            // tests build a signed-in `.idle` controller without the real
+            // Keychain. `nil` in production.
+            credentialStore: controllerCredentialStore ?? credentialStore,
             appSettings: appSettings,
             reachability: resolvedReachability
         )

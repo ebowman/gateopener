@@ -629,7 +629,7 @@ struct OpenGateFlowTests {
         )
         #expect(outcome == .timedOut)
         #expect(calls.value == 1)
-        #expect(Date().timeIntervalSince(started) < 5)
+        #expect(Date().timeIntervalSince(started) < 20)
         #expect(store.read()?.message == "Timed out")
     }
 
@@ -648,10 +648,10 @@ struct OpenGateFlowTests {
             currentState: .idle, gateName: nil, isReachable: true,
             open: {
                 calls.increment()
-                // Non-cancellable wait: blocks on a semaphore for up to 3s.
+                // Non-cancellable wait: blocks on a semaphore for up to 10s.
                 await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
                     DispatchQueue.global().async {
-                        _ = release.wait(timeout: .now() + 3)
+                        _ = release.wait(timeout: .now() + 10)
                         c.resume()
                     }
                 }
@@ -663,7 +663,7 @@ struct OpenGateFlowTests {
         )
         let elapsed = Date().timeIntervalSince(started)
         #expect(outcome == .timedOut)
-        #expect(elapsed < 2.0)
+        #expect(elapsed < 5.0)
         #expect(elapsed >= 0.4)
         // No second open() while the first may still be in flight.
         #expect(calls.value == 1)

@@ -58,6 +58,9 @@ final class FakeGateOpening: GateOpening, @unchecked Sendable {
     private var _discoverCallCount = 0
 
     var shouldSucceed: Bool = true
+    /// When > 0, the next N `open` calls throw, then calls succeed (if
+    /// `shouldSucceed`). Guarded by `lock` via `recordOpenCall`.
+    var failuresBeforeSuccess: Int = 0
     var discoverResult: [Endpoint] = []
 
     var openCallCount: Int {
@@ -82,6 +85,10 @@ final class FakeGateOpening: GateOpening, @unchecked Sendable {
     private func recordOpenCall() -> Bool {
         lock.lock(); defer { lock.unlock() }
         _openCallCount += 1
+        if failuresBeforeSuccess > 0 {
+            failuresBeforeSuccess -= 1
+            return false
+        }
         return shouldSucceed
     }
 
