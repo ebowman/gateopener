@@ -181,6 +181,21 @@ struct AppSettingsTests {
         #expect(settingsB.autoShowDoorVideoOnOpen)
     }
 
+    @Test func notifyOnOpenSuccessDefaultsToTrueAndResets() {
+        let (defaults, cleanup) = makeSuite()
+        defer { cleanup() }
+
+        let settings = AppSettings(defaults: defaults)
+        #expect(settings.notifyOnOpenSuccess)
+
+        settings.notifyOnOpenSuccess = false
+        #expect(!settings.notifyOnOpenSuccess)
+        #expect(!AppSettings(defaults: defaults).notifyOnOpenSuccess)
+
+        settings.reset()
+        #expect(settings.notifyOnOpenSuccess)
+    }
+
     @Test func allowOpenWhileLockedDefaultsToTrueWhenUnset() {
         let (defaults, cleanup) = makeSuite()
         defer { cleanup() }

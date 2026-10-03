@@ -37,6 +37,9 @@ targets:
           - "*.entitlements"
       - path: iOS/Shared
       - path: iOS/Resources/Assets.xcassets
+      # Failure-notification sound (scripts/generate-failure-sound.py).
+      - path: iOS/Resources/gate-failed.caf
+        buildPhase: resources
       - path: iOS/App/PrivacyInfo.xcprivacy
         buildPhase: resources
       # Shared verbatim with the macOS target (Sources/GateOpener) — see
@@ -139,6 +142,11 @@ targets:
           - "*.plist"
           - "*.entitlements"
       - path: iOS/Shared
+      # Also bundled in the widget extension: notifications posted from
+      # the extension process are not verified (on device) to resolve
+      # custom sounds from the containing app's bundle, so ship it in both.
+      - path: iOS/Resources/gate-failed.caf
+        buildPhase: resources
     dependencies:
       - package: GateOpenerCore
         product: GateOpenerCore

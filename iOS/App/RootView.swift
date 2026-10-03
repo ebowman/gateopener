@@ -41,6 +41,16 @@ struct RootView: View {
         // the needsSetup -> not-needsSetup edge and never again on
         // subsequent state changes within the non-needsSetup regime (e.g.
         // `.idle` -> `.opening` -> `.succeeded` while opening a gate).
+        // Bead gateopener-6qa.3: ask for notification permission once the
+        // user is signed in (never in the widget extension). Re-runs on
+        // the needsSetup -> signed-in edge; a no-op unless status is
+        // `.notDetermined`.
+        .task(id: observable.state == .needsSetup) {
+            guard observable.state != .needsSetup else { return }
+            let notifier = OpenResultNotifier(settings: appSettings)
+            notifier.registerCategories()
+            await notifier.requestAuthorizationIfNeeded()
+        }
         .onChange(of: observable.state == .needsSetup) { wasNeedsSetup, isNeedsSetup in
             guard wasNeedsSetup, !isNeedsSetup, scenePhase == .active else { return }
             doorVideoCoordinator.startForForeground()
