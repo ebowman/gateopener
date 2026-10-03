@@ -120,20 +120,20 @@ struct OpenGateFlowTests {
         #expect(store.read()?.message == "x")
     }
 
-    // MARK: - Unreachable (no way to wait): "No network" without any open() call
-    // (Behaviour note: previously a fail-fast guard; now the loop calls
-    // `waitForReachability`, whose default `{ _ in false }` yields the same
-    // outcome. A .waitingForNetwork phase is additionally journaled.)
+    // MARK: - Unreachable and never recovering: "No network" without any open() call
+    // (Behaviour note: the loop calls `waitForReachability`, whose default
+    // `{ _ in false }` means the network never comes back, so it gives up
+    // with "No network". A .waitingForNetwork phase is additionally journaled.)
 
-    /// Zero `open()` calls when unreachable — the extension must not queue
-    /// or wait 45s.
+    /// Zero `open()` calls when the network never recovers — the extension
+    /// must not queue an open or wait out the full deadline.
     ///
-    /// MUTATION CHECK: removing the `guard isReachable else { ... }`
-    /// short-circuit (so this always falls through to the `open()` call)
-    /// makes `openCallCount` go from 0 to 1 and the outcome flip from
-    /// `.failed("No network")` to `.opened` (the injected `open` here
-    /// returns `.succeeded`), so both assertions would fail — not vacuous.
-    @Test func unreachableFailsFastWithZeroOpenCalls() async {
+    /// MUTATION CHECK: if the loop skipped the reachability wait/give-up and
+    /// fell through to the `open()` call anyway, `openCallCount` would go from
+    /// 0 to 1 and the outcome would flip from `.failed("No network")` to
+    /// `.opened` (the injected `open` here returns `.succeeded`), so both
+    /// assertions would fail — not vacuous.
+    @Test func unreachableNeverRecoveringFailsWithZeroOpenCalls() async {
         let (defaults, cleanup) = makeSuite()
         defer { cleanup() }
         let store = WidgetSnapshotStore(defaults: defaults)
