@@ -207,6 +207,12 @@ public final class DoorVideoSession: NSObject {
     /// NEXT attempt (see that helper's doc comment).
     private var offerAccepted = false
 
+    /// Count of LOCAL srflx+relay candidates the page gathered for this
+    /// session's offer (from `window.getLocalCandidateSummary()`), or `nil`
+    /// if the summary could not be read. Feeds `DoorVideoBusyPolicy.classify`
+    /// so a 500 with 0 reflexive candidates is not mislabelled "busy".
+    private var localSrflxOrRelayCount: Int?
+
     /// Set to `true` the instant `applyAnswer(_:)` succeeds (bead
     /// gateopener-6s8.6). Consulted only by the candidate-pair diagnostics
     /// dump (`dumpCandidatePairs(reason:)`): a `.failed` transition that
@@ -732,7 +738,30 @@ public final class DoorVideoSession: NSObject {
         Self.logger.notice("offer SDP ready: \(sdp.count) chars, \(candidateCount, privacy: .public) ICE candidates")
         recordDiag(VideoDiagnosticsStage.offerReady(candidateCount: candidateCount))
 
+        await recordLocalCandidateSummary()
+
         return sdp
+    }
+
+    /// Reads `window.getLocalCandidateSummary()` once (bead gateopener-kgx.14),
+    /// stores the srflx+relay total in `localSrflxOrRelayCount` for
+    /// `putOfferOnce`'s 500 classification, and records
+    /// "local candidates: host=N srflx=N relay=N". Never throws: on any
+    /// failure the count stays `nil` and classification falls back to the
+    /// pre-existing 500 -> `.doorBusy` mapping.
+    private func recordLocalCandidateSummary() async {
+        guard let raw = try? await contentView.callAsyncJavaScript(
+            "return window.getLocalCandidateSummary ? window.getLocalCandidateSummary() : null;",
+            contentWorld: .page
+        ), let dict = raw as? [String: Any] else {
+            localSrflxOrRelayCount = nil
+            return
+        }
+        let host = (dict["host"] as? NSNumber)?.intValue ?? 0
+        let srflx = (dict["srflx"] as? NSNumber)?.intValue ?? 0
+        let relay = (dict["relay"] as? NSNumber)?.intValue ?? 0
+        localSrflxOrRelayCount = srflx + relay
+        recordDiag("local candidates: host=\(host) srflx=\(srflx) relay=\(relay)")
     }
 
     private func applyAnswer(_ answerSDP: String) async throws {
@@ -953,7 +982,11 @@ public final class DoorVideoSession: NSObject {
         guard let http = response as? HTTPURLResponse else {
             return (DoorVideoBusyPolicy.classify(httpStatus: nil, transportError: .other), nil)
         }
-        let outcome = DoorVideoBusyPolicy.classify(httpStatus: http.statusCode, transportError: nil)
+        let outcome = DoorVideoBusyPolicy.classify(
+            httpStatus: http.statusCode,
+            transportError: nil,
+            localSrflxOrRelayCount: localSrflxOrRelayCount
+        )
         guard outcome == .accepted else {
             return (outcome, nil)
         }
@@ -1036,7 +1069,8 @@ public final class DoorVideoSession: NSObject {
                 statusDescription = "500 \(diagLabel)"
             case .serverError(let status):
                 statusDescription = "\(status) \(diagLabel)"
-            case .unauthorized, .timedOut, .network, .accepted:
+            case .unauthorized, .timedOut, .network, .accepted, .noReflexiveCandidate:
+                // `.noReflexiveCandidate`'s label already carries the "500".
                 statusDescription = diagLabel
             }
             recordDiag(VideoDiagnosticsStage.offerAttempt(n: attempt, of: maxAttempts, outcome: .failure(statusDescription), latencyMs: latencyMs))

@@ -10,6 +10,9 @@ public enum DoorVideoNegotiationFailure {
             .joined(separator: " ")
             .lowercased()
 
+        if details.contains("ice-no-reflexive") {
+            return DoorVideoBusyPolicy.failureMessage(for: .noReflexiveCandidate)
+        }
         if details.contains("ice-gathering-timeout") ||
             details.contains("ice gathering did not complete within 15 seconds") {
             return "Video network setup timed out"

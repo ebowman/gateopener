@@ -42,6 +42,11 @@ public enum DoorVideoBusyPolicy {
     public enum OfferOutcome: Sendable, Equatable {
         case accepted
         case doorBusy
+        /// HTTP 500 where the offer carried ZERO local srflx/relay
+        /// candidates (STUN/UDP blocked): the backend rejects offers with
+        /// no publicly reachable candidate, so nothing was "busy". Memory
+        /// `comelit-rtc-offer-500-means-door-busy`, cause (B).
+        case noReflexiveCandidate
         case unauthorized
         case serverError(Int)
         case timedOut
@@ -75,12 +80,24 @@ public enum DoorVideoBusyPolicy {
     ///   `.timedOut`.
     /// - `httpStatus == nil` and `transportError == .other` (or `nil`) ->
     ///   `.network`.
-    public static func classify(httpStatus: Int?, transportError: OfferTransportError?) -> OfferOutcome {
+    ///
+    /// `localSrflxOrRelayCount` (default `nil`) refines the `500` case only:
+    /// `0` -> `.noReflexiveCandidate` (the offer had no srflx/relay
+    /// candidate, so the 500 is not a busy door); `> 0` or `nil` (unknown,
+    /// e.g. callers that do not collect candidate counts) -> `.doorBusy`.
+    public static func classify(
+        httpStatus: Int?,
+        transportError: OfferTransportError?,
+        localSrflxOrRelayCount: Int? = nil
+    ) -> OfferOutcome {
         if let httpStatus {
             switch httpStatus {
             case 200:
                 return .accepted
             case 500:
+                if let localSrflxOrRelayCount, localSrflxOrRelayCount == 0 {
+                    return .noReflexiveCandidate
+                }
                 return .doorBusy
             case 401, 403:
                 return .unauthorized
@@ -151,6 +168,8 @@ public enum DoorVideoBusyPolicy {
             return ""
         case .doorBusy:
             return "Door camera busy"
+        case .noReflexiveCandidate:
+            return "This network blocks door video (STUN/UDP)"
         case .unauthorized:
             return "Sign-in required"
         case .timedOut:
@@ -189,6 +208,8 @@ public enum DoorVideoBusyPolicy {
             return "accepted"
         case .doorBusy:
             return "door-busy"
+        case .noReflexiveCandidate:
+            return "500 no-reflexive"
         case .unauthorized:
             return "unauthorized"
         case .serverError:

@@ -42,3 +42,14 @@ struct DoorVideoNegotiationFailureTests {
         #expect(DoorVideoNegotiationFailure.userMessage(for: error) == "Could not negotiate video session")
     }
 }
+
+extension DoorVideoNegotiationFailureTests {
+    @Test func iceNoReflexiveMapsToStunBlockedMessage() {
+        let error = NSError(domain: "WKErrorDomain", code: 4, userInfo: [
+            NSLocalizedDescriptionKey: "A JavaScript exception occurred",
+            "WKJavaScriptExceptionMessage": "ICE gathering produced no srflx/relay candidate (ice-no-reflexive)",
+        ])
+        #expect(DoorVideoNegotiationFailure.userMessage(for: error) == "This network blocks door video (STUN/UDP)")
+        #expect(OverlayFailureDecision.showsReason(for: DoorVideoNegotiationFailure.userMessage(for: error)) == true)
+    }
+}

@@ -690,7 +690,66 @@ async function answerAudioDiagParsesSendrecvPcmaFromCaptureSample() {
   assert.ok(context.__diag.some((line) => line.includes("answer audio: sendrecv PCMA")));
 }
 
+const HOST_LINE = "candidate:1 1 udp 2122260223 192.0.2.5 40001 typ host";
+
+async function hostOnlyFor3sRejectsIceNoReflexive() {
+  const { context, clock } = loadPage();
+  const { result, pc } = await beginNegotiation(context);
+  const settled = result.then(() => null, (e) => e);
+  pc.onicecandidate({ candidate: { candidate: HOST_LINE } });
+  clock.advance(2900);
+  assert.equal(context.__diag.some((l) => l.includes("stun blocked")), false);
+  clock.advance(100);
+  const error = await settled;
+  assert.ok(error, "expected rejection at 3s");
+  assert.equal(error.code, "ice-no-reflexive");
+  assert.equal(error.name, "DoorVideoNegotiationError");
+  assert.ok(context.__diag.some((l) => l.includes("stun blocked: no reflexive candidate after 3s")));
+  assert.equal(context.__state.offerReady, false);
+  assert.equal(pc.listenerCount(), 0);
+  assert.equal(clock.timers.size, 0);
+}
+
+async function srflxAtOneSecondDoesNotRejectAndPublishesNormally() {
+  const { context, clock } = loadPage();
+  const { result, pc } = await beginNegotiation(context);
+  pc.onicecandidate({ candidate: { candidate: HOST_LINE } });
+  clock.advance(1000);
+  pc.onicecandidate({ candidate: { candidate: validCandidate().substring(2) } });
+  clock.advance(600); // quiet period
+  const sdp = await result;
+  assert.equal(sdp, pc.localDescription.sdp);
+  assert.equal(context.__state.offerReady, true);
+  assert.equal(context.__diag.some((l) => l.includes("stun blocked")), false);
+  assert.equal(clock.timers.size, 0);
+}
+
+async function zeroCandidatesAt3sDoesNotRejectEarly() {
+  const { context, clock } = loadPage();
+  const { result, pc } = await beginNegotiation(context);
+  const settled = result.then(() => "resolved", (e) => e);
+  clock.advance(5000);
+  await Promise.resolve();
+  assert.equal(context.__diag.some((l) => l.includes("stun blocked")), false);
+  clock.advance(10000); // existing 15s deadline path
+  const outcome = await settled;
+  assert.equal(outcome.code, "ice-gathering-timeout");
+}
+
+// A test awaiting a promise that never settles would otherwise let node exit 0
+// silently; fail loudly instead.
+let completed = false;
+process.on("exit", () => {
+  if (!completed && !process.exitCode) {
+    console.error("door-video negotiation tests did not run to completion");
+    process.exitCode = 1;
+  }
+});
+
 (async () => {
+  await hostOnlyFor3sRejectsIceNoReflexive();
+  await srflxAtOneSecondDoesNotRejectAndPublishesNormally();
+  await zeroCandidatesAt3sDoesNotRejectEarly();
   iceWaitDecisionRuleTable(loadPage().context);
   await lateCompletionAfterEightSecondsUsesFinalSdp();
   await quickCompletionIsUnchanged();
@@ -713,6 +772,7 @@ async function answerAudioDiagParsesSendrecvPcmaFromCaptureSample() {
   await viewModeTransceiverOrderUnchangedAudioRecvonlyVideoRecvonlyDatachannel();
   await micRejectionFailsBeforeOfferWithMicPrefixedError();
   await answerAudioDiagParsesSendrecvPcmaFromCaptureSample();
+  completed = true;
   console.log("door-video negotiation tests passed");
 })().catch((error) => {
   console.error(error);

@@ -87,7 +87,13 @@ final class StubURLProtocol: URLProtocol, @unchecked Sendable {
         }
 
         let state = sentState(in: request)
-        let responseURL = stub.responseURL ?? request.url!
+        var responseURL = stub.responseURL ?? request.url!
+        // A responseURL may contain `__STATE__`, replaced with the sent state
+        // (braces would be percent-encoded in a URL, so `{{STATE}}` can't be used).
+        if responseURL.absoluteString.contains("__STATE__"),
+           let substituted = URL(string: responseURL.absoluteString.replacingOccurrences(of: "__STATE__", with: state)) {
+            responseURL = substituted
+        }
         let headers = stub.headers.mapValues { $0.replacingOccurrences(of: echoStatePlaceholder, with: state) }
         let httpResponse = HTTPURLResponse(
             url: responseURL,
@@ -367,6 +373,57 @@ private func stateTestTokenHandler(runId: String) throws {
     await #expect(throws: ComelitError.stateMismatch) {
         _ = try await api.login(username: "user@example.com", password: "hunter2")
     }
+}
+
+@Test func loginMismatchedStateInFinalResponseURLThrowsStateMismatch() async throws {
+    let runId = UUID().uuidString
+    // No code in body or Location header; only the final response URL has it.
+    StubURLProtocol.addHandler(runId: runId, pathSuffix: "/o-auth-2/auth", stub: .init(
+        status: 200,
+        body: Data("{}".utf8),
+        responseURL: URL(string: "https://app.comelitgroup.com/oauth_redirect/comelit?code=final&state=WRONG-STATE")!))
+    try stateTestTokenHandler(runId: runId)
+
+    let api = ComelitAPI(session: makeStubbedSession(runId: runId))
+    await #expect(throws: ComelitError.stateMismatch) {
+        _ = try await api.login(username: "user@example.com", password: "hunter2")
+    }
+}
+
+@Test func loginMatchingStateInFinalResponseURLSucceeds() async throws {
+    let runId = UUID().uuidString
+    StubURLProtocol.addHandler(runId: runId, pathSuffix: "/o-auth-2/auth", stub: .init(
+        status: 200,
+        body: Data("{}".utf8),
+        responseURL: URL(string: "https://app.comelitgroup.com/oauth_redirect/comelit?code=final&state=__STATE__")!))
+    try stateTestTokenHandler(runId: runId)
+
+    let api = ComelitAPI(session: makeStubbedSession(runId: runId))
+    let tokens = try await api.login(username: "user@example.com", password: "hunter2")
+    #expect(tokens.accessToken == "tok")
+}
+
+@Test func loginMismatchedStateInJSONCodeBodyThrowsStateMismatch() async throws {
+    let runId = UUID().uuidString
+    let authBody: [String: Any] = ["code": "json-code", "state": "WRONG-STATE"]
+    StubURLProtocol.addHandler(runId: runId, pathSuffix: "/o-auth-2/auth", stub: .init(status: 200, body: try JSONSerialization.data(withJSONObject: authBody)))
+    try stateTestTokenHandler(runId: runId)
+
+    let api = ComelitAPI(session: makeStubbedSession(runId: runId))
+    await #expect(throws: ComelitError.stateMismatch) {
+        _ = try await api.login(username: "user@example.com", password: "hunter2")
+    }
+}
+
+@Test func loginMatchingStateInJSONCodeBodySucceeds() async throws {
+    let runId = UUID().uuidString
+    let authBody: [String: Any] = ["code": "json-code", "state": "{{STATE}}"]
+    StubURLProtocol.addHandler(runId: runId, pathSuffix: "/o-auth-2/auth", stub: .init(status: 200, body: try JSONSerialization.data(withJSONObject: authBody)))
+    try stateTestTokenHandler(runId: runId)
+
+    let api = ComelitAPI(session: makeStubbedSession(runId: runId))
+    let tokens = try await api.login(username: "user@example.com", password: "hunter2")
+    #expect(tokens.accessToken == "tok")
 }
 
 @Test func loginAbsentStateStillSucceeds() async throws {

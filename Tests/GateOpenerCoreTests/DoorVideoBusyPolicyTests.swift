@@ -202,4 +202,55 @@ struct DoorVideoBusyPolicyTests {
     @Test func diagLabelAccepted() {
         #expect(DoorVideoBusyPolicy.diagLabel(for: .accepted) == "accepted")
     }
+
+    // MARK: - noReflexiveCandidate (gateopener-kgx.14)
+
+    @Test func classify500WithZeroReflexiveIsNoReflexiveCandidate() {
+        #expect(DoorVideoBusyPolicy.classify(httpStatus: 500, transportError: nil, localSrflxOrRelayCount: 0) == .noReflexiveCandidate)
+    }
+
+    @Test func classify500WithReflexivePresentIsDoorBusy() {
+        #expect(DoorVideoBusyPolicy.classify(httpStatus: 500, transportError: nil, localSrflxOrRelayCount: 1) == .doorBusy)
+        #expect(DoorVideoBusyPolicy.classify(httpStatus: 500, transportError: nil, localSrflxOrRelayCount: 5) == .doorBusy)
+    }
+
+    @Test func classify500WithNilCountKeepsDoorBusy() {
+        #expect(DoorVideoBusyPolicy.classify(httpStatus: 500, transportError: nil, localSrflxOrRelayCount: nil) == .doorBusy)
+    }
+
+    @Test func zeroCountDoesNotAffectNon500Statuses() {
+        #expect(DoorVideoBusyPolicy.classify(httpStatus: 200, transportError: nil, localSrflxOrRelayCount: 0) == .accepted)
+        #expect(DoorVideoBusyPolicy.classify(httpStatus: 401, transportError: nil, localSrflxOrRelayCount: 0) == .unauthorized)
+        #expect(DoorVideoBusyPolicy.classify(httpStatus: 503, transportError: nil, localSrflxOrRelayCount: 0) == .serverError(503))
+        #expect(DoorVideoBusyPolicy.classify(httpStatus: nil, transportError: .timedOut, localSrflxOrRelayCount: 0) == .timedOut)
+        #expect(DoorVideoBusyPolicy.classify(httpStatus: nil, transportError: .other, localSrflxOrRelayCount: 0) == .network)
+    }
+
+    @Test func noReflexiveCandidateIsNotRetried() {
+        #expect(DoorVideoBusyPolicy.shouldRetry(.noReflexiveCandidate) == false)
+    }
+
+    @Test func noReflexiveCandidateMessageAndLabel() {
+        #expect(DoorVideoBusyPolicy.failureMessage(for: .noReflexiveCandidate) == "This network blocks door video (STUN/UDP)")
+        #expect(DoorVideoBusyPolicy.diagLabel(for: .noReflexiveCandidate) == "500 no-reflexive")
+    }
+
+    @Test func overlayShowsReasonForNoReflexiveMessage() {
+        let message = DoorVideoBusyPolicy.failureMessage(for: .noReflexiveCandidate)
+        #expect(OverlayFailureDecision.showsReason(for: message) == true)
+    }
+
+    /// A no-reflexive failure never has its offer accepted, so
+    /// `shouldRecordEnd(offerAccepted: false)` keeps the registry from
+    /// starting a busy cooldown for it.
+    @MainActor @Test func noReflexiveFailureDoesNotRecordSessionEnd() {
+        let registry = DoorVideoSessionRegistry()
+        let outcome = DoorVideoBusyPolicy.classify(httpStatus: 500, transportError: nil, localSrflxOrRelayCount: 0)
+        #expect(outcome == .noReflexiveCandidate)
+        if DoorVideoSessionRegistry.shouldRecordEnd(offerAccepted: false) {
+            registry.recordSessionEnded()
+        }
+        #expect(registry.lastSessionEnded == nil)
+        #expect(registry.waitBeforeOffer(now: Date()) == .zero)
+    }
 }
