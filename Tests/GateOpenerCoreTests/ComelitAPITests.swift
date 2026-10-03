@@ -12,6 +12,37 @@ import Testing
 /// injected by `makeStubbedSession(runId:)`, rather than shared global state —
 /// this avoids cross-test races where one test's handler matches another
 /// test's concurrently in-flight request.
+/// Placeholder a stub body/header/URL may contain; replaced at serve time with
+/// the `state` the client actually sent in the `/o-auth-2/auth` request body.
+let echoStatePlaceholder = "{{STATE}}"
+
+/// Extracts the JSON `state` the client sent (URLProtocol sees bodies as streams).
+func sentState(in request: URLRequest) -> String {
+    var data = request.httpBody
+    if data == nil, let stream = request.httpBodyStream {
+        stream.open()
+        defer { stream.close() }
+        var buf = [UInt8](repeating: 0, count: 4096)
+        var acc = Data()
+        while stream.hasBytesAvailable {
+            let n = stream.read(&buf, maxLength: buf.count)
+            if n <= 0 { break }
+            acc.append(buf, count: n)
+        }
+        data = acc
+    }
+    guard let data, let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return "" }
+    return json["state"] as? String ?? ""
+}
+
+func substitutingState(_ data: Data, _ state: String) -> Data {
+    guard let str = String(data: data, encoding: .utf8) else { return data }
+    let encoded = state.replacingOccurrences(of: "-", with: "%2D")
+    return Data(str
+        .replacingOccurrences(of: "{{STATE_PCT}}", with: encoded)
+        .replacingOccurrences(of: echoStatePlaceholder, with: state).utf8)
+}
+
 final class StubURLProtocol: URLProtocol, @unchecked Sendable {
     struct Stub {
         let status: Int
@@ -55,15 +86,17 @@ final class StubURLProtocol: URLProtocol, @unchecked Sendable {
             return
         }
 
+        let state = sentState(in: request)
         let responseURL = stub.responseURL ?? request.url!
+        let headers = stub.headers.mapValues { $0.replacingOccurrences(of: echoStatePlaceholder, with: state) }
         let httpResponse = HTTPURLResponse(
             url: responseURL,
             statusCode: stub.status,
             httpVersion: "HTTP/1.1",
-            headerFields: stub.headers
+            headerFields: headers
         )!
         client?.urlProtocol(self, didReceive: httpResponse, cacheStoragePolicy: .notAllowed)
-        client?.urlProtocol(self, didLoad: stub.body)
+        client?.urlProtocol(self, didLoad: substitutingState(stub.body, state))
         client?.urlProtocolDidFinishLoading(self)
     }
 
@@ -167,7 +200,7 @@ final class RecordingURLProtocol: URLProtocol, @unchecked Sendable {
             headerFields: [:]
         )!
         client?.urlProtocol(self, didReceive: httpResponse, cacheStoragePolicy: .notAllowed)
-        client?.urlProtocol(self, didLoad: body)
+        client?.urlProtocol(self, didLoad: substitutingState(body, sentState(in: request)))
         client?.urlProtocolDidFinishLoading(self)
     }
 
@@ -244,7 +277,7 @@ final class RecordingURLProtocol: URLProtocol, @unchecked Sendable {
 
 @Test func loginTwoStepExchangeProducesTokenSet() async throws {
     let runId = UUID().uuidString
-    let authBody: [String: Any] = ["location": "https://app.comelitgroup.com/oauth_redirect/comelit?code=abc123&state=xyz"]
+    let authBody: [String: Any] = ["location": "https://app.comelitgroup.com/oauth_redirect/comelit?code=abc123&state={{STATE}}"]
     let authData = try JSONSerialization.data(withJSONObject: authBody)
     StubURLProtocol.addHandler(runId: runId, pathSuffix: "/o-auth-2/auth", stub: .init(status: 200, body: authData))
 
@@ -273,7 +306,7 @@ final class RecordingURLProtocol: URLProtocol, @unchecked Sendable {
         pathSuffix: "/o-auth-2/auth",
         stub: .init(
             status: 200,
-            headers: ["Location": "https://app.comelitgroup.com/oauth_redirect/comelit?code=from-header&state=xyz"],
+            headers: ["Location": "https://app.comelitgroup.com/oauth_redirect/comelit?code=from-header&state={{STATE}}"],
             body: Data("{}".utf8)
         )
     )
@@ -301,6 +334,64 @@ final class RecordingURLProtocol: URLProtocol, @unchecked Sendable {
     let tokens = try await api.login(username: "user@example.com", password: "hunter2")
 
     #expect(tokens.accessToken == "tok-from-json")
+}
+
+// MARK: - Login: state validation (gateopener-4ub.15)
+
+private func stateTestTokenHandler(runId: String) throws {
+    let tokenData = try JSONSerialization.data(withJSONObject: ["access_token": "tok", "expires_in": 3600])
+    StubURLProtocol.addHandler(runId: runId, pathSuffix: "/o-auth-2/token", stub: .init(status: 200, body: tokenData))
+}
+
+@Test func loginMismatchedStateThrowsStateMismatch() async throws {
+    let runId = UUID().uuidString
+    let authBody: [String: Any] = ["location": "https://app.comelitgroup.com/oauth_redirect/comelit?code=abc123&state=TOTALLY-WRONG-STATE"]
+    StubURLProtocol.addHandler(runId: runId, pathSuffix: "/o-auth-2/auth", stub: .init(status: 200, body: try JSONSerialization.data(withJSONObject: authBody)))
+    try stateTestTokenHandler(runId: runId)
+
+    let api = ComelitAPI(session: makeStubbedSession(runId: runId))
+    await #expect(throws: ComelitError.stateMismatch) {
+        _ = try await api.login(username: "user@example.com", password: "hunter2")
+    }
+}
+
+@Test func loginMismatchedStateInLocationHeaderThrowsStateMismatch() async throws {
+    let runId = UUID().uuidString
+    StubURLProtocol.addHandler(runId: runId, pathSuffix: "/o-auth-2/auth", stub: .init(
+        status: 200,
+        headers: ["Location": "https://app.comelitgroup.com/oauth_redirect/comelit?code=c&state=wrong"],
+        body: Data("{}".utf8)))
+    try stateTestTokenHandler(runId: runId)
+
+    let api = ComelitAPI(session: makeStubbedSession(runId: runId))
+    await #expect(throws: ComelitError.stateMismatch) {
+        _ = try await api.login(username: "user@example.com", password: "hunter2")
+    }
+}
+
+@Test func loginAbsentStateStillSucceeds() async throws {
+    let runId = UUID().uuidString
+    // Location with a code but no state parameter at all.
+    let authBody: [String: Any] = ["location": "https://app.comelitgroup.com/oauth_redirect/comelit?code=abc123"]
+    StubURLProtocol.addHandler(runId: runId, pathSuffix: "/o-auth-2/auth", stub: .init(status: 200, body: try JSONSerialization.data(withJSONObject: authBody)))
+    try stateTestTokenHandler(runId: runId)
+
+    let api = ComelitAPI(session: makeStubbedSession(runId: runId))
+    let tokens = try await api.login(username: "user@example.com", password: "hunter2")
+    #expect(tokens.accessToken == "tok")
+}
+
+@Test func loginPercentEncodedEchoedStateMatches() async throws {
+    let runId = UUID().uuidString
+    // The echoed state has every "-" percent-encoded as %2D; after the same
+    // decoding used for the code it must equal the state that was sent.
+    let authBody: [String: Any] = ["location": "https://app.comelitgroup.com/oauth_redirect/comelit?code=abc123&state={{STATE_PCT}}"]
+    StubURLProtocol.addHandler(runId: runId, pathSuffix: "/o-auth-2/auth", stub: .init(status: 200, body: try JSONSerialization.data(withJSONObject: authBody)))
+    try stateTestTokenHandler(runId: runId)
+
+    let api = ComelitAPI(session: makeStubbedSession(runId: runId))
+    let tokens = try await api.login(username: "user@example.com", password: "hunter2")
+    #expect(tokens.accessToken == "tok")
 }
 
 // MARK: - Login: error mapping
@@ -394,7 +485,7 @@ final class RecordingURLProtocol: URLProtocol, @unchecked Sendable {
 /// requests issued by `login` carry the same `requestTimeout`.
 @Test func loginAppliesTimeoutToBothAuthAndTokenRequests() async throws {
     let runId = UUID().uuidString
-    let authBody: [String: Any] = ["location": "https://app.comelitgroup.com/oauth_redirect/comelit?code=abc123&state=xyz"]
+    let authBody: [String: Any] = ["location": "https://app.comelitgroup.com/oauth_redirect/comelit?code=abc123&state={{STATE}}"]
     let authData = try JSONSerialization.data(withJSONObject: authBody)
     RecordingURLProtocol.setStatus(runId: runId, pathSuffix: "/o-auth-2/auth", status: 200, body: authData)
 
@@ -553,7 +644,7 @@ final class RecordingURLProtocol: URLProtocol, @unchecked Sendable {
 /// once then succeed.
 @Test func loginTokenExchange500ThenSuccessRetriesOnceAndSucceeds() async throws {
     let runId = UUID().uuidString
-    let authBody: [String: Any] = ["location": "https://app.comelitgroup.com/oauth_redirect/comelit?code=abc123&state=xyz"]
+    let authBody: [String: Any] = ["location": "https://app.comelitgroup.com/oauth_redirect/comelit?code=abc123&state={{STATE}}"]
     let authData = try JSONSerialization.data(withJSONObject: authBody)
     RecordingURLProtocol.setStatus(runId: runId, pathSuffix: "/o-auth-2/auth", status: 200, body: authData)
     RecordingURLProtocol.setStatus(runId: runId, pathSuffix: "/o-auth-2/token", status: 500, body: Data("server error".utf8))

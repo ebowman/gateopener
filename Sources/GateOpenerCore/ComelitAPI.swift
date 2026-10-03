@@ -23,6 +23,10 @@ public enum ComelitError: Error, Equatable, Sendable {
     case server(status: Int, body: String)
     case decoding(String)
     case missingRefreshToken
+    /// The `/o-auth-2/auth` response echoed a `state` that differs from the
+    /// one the client sent. Fail-closed, mirroring the Python reference
+    /// (`comelit/auth.py`). Never carries the state/code values.
+    case stateMismatch
 }
 
 /// PKCE (Proof Key for Code Exchange) verifier/challenge generation.
@@ -156,54 +160,68 @@ public struct ComelitAPI: Sendable {
             throw ComelitError.server(status: httpResponse.statusCode, body: String(bodyString.prefix(300)))
         }
 
-        if let code = extractCode(fromBodyData: data, response: httpResponse) {
-            return code
+        if let extracted = extractCode(fromBodyData: data, response: httpResponse) {
+            // Validate only when the response actually carries a state (the
+            // JSON code-only route has none). Both values were percent-decoded
+            // by URLComponents, as the code was. Never log either value.
+            if let returnedState = extracted.state, returnedState != state {
+                throw ComelitError.stateMismatch
+            }
+            return extracted.code
         }
 
         throw ComelitError.decoding("login step 1 returned no auth code. Body: \(String(bodyString.prefix(300)))")
     }
 
-    /// Extract the authorization `code` query parameter defensively from, in order:
+    /// Extract the authorization `code` (and the echoed `state`, if any) defensively from, in order:
     /// 1. a JSON body field named `location` (as returned by `/o-auth-2/auth`),
-    /// 2. an HTTP `Location` header (if URLSession did not already follow it),
-    /// 3. the final (possibly redirected) response URL's query string.
-    private func extractCode(fromBodyData data: Data, response: HTTPURLResponse) -> String? {
+    /// 2. a JSON body `code` field (state optional, read from a `state` field),
+    /// 3. an HTTP `Location` header (if URLSession did not already follow it),
+    /// 4. the final (possibly redirected) response URL's query string.
+    /// `state` is nil when the response carries none.
+    private func extractCode(
+        fromBodyData data: Data,
+        response: HTTPURLResponse
+    ) -> (code: String, state: String?)? {
+        let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+
         // 1. JSON body field "location".
-        if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let location = json["location"] as? String,
-           let code = code(fromURLString: location) {
-            return code
+        if let location = json?["location"] as? String,
+           let result = codeAndState(fromURLString: location) {
+            return result
         }
 
         // 2. JSON body field "code" directly.
-        if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let code = json["code"] as? String {
-            return code
+        if let code = json?["code"] as? String {
+            return (code, json?["state"] as? String)
         }
 
         // 3. Location header.
         if let locationHeader = response.value(forHTTPHeaderField: "Location")
             ?? response.value(forHTTPHeaderField: "location"),
-           let code = code(fromURLString: locationHeader) {
-            return code
+           let result = codeAndState(fromURLString: locationHeader) {
+            return result
         }
 
         // 4. Final redirected response URL's query string.
-        if let finalURL = response.url, let code = code(fromURL: finalURL) {
-            return code
+        if let finalURL = response.url, let result = codeAndState(fromURL: finalURL) {
+            return result
         }
 
         return nil
     }
 
-    private func code(fromURLString string: String) -> String? {
+    private func codeAndState(fromURLString string: String) -> (code: String, state: String?)? {
         guard let url = URL(string: string) else { return nil }
-        return code(fromURL: url)
+        return codeAndState(fromURL: url)
     }
 
-    private func code(fromURL url: URL) -> String? {
-        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return nil }
-        return components.queryItems?.first(where: { $0.name == "code" })?.value
+    private func codeAndState(fromURL url: URL) -> (code: String, state: String?)? {
+        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let items = components.queryItems,
+              let code = items.first(where: { $0.name == "code" })?.value
+        else { return nil }
+        return (code, items.first(where: { $0.name == "state" })?.value)
     }
 
     /// Step 2 of login: exchange an authorization code + PKCE verifier for tokens.

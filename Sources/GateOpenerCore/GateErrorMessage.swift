@@ -33,6 +33,8 @@ public enum GateErrorMessage {
                 return "Could not reach the gate"
             case .decoding:
                 return "Could not reach the gate"
+            case .stateMismatch:
+                return "Sign-in failed - please try again"
             }
         }
         if let gateClientError = error as? GateClientError {
@@ -95,7 +97,7 @@ public enum GateErrorMessage {
                 return "Wrong username or password"
             case .network:
                 return "Can't reach Comelit. Check your connection and try again."
-            case .server, .missingRefreshToken, .decoding:
+            case .server, .missingRefreshToken, .decoding, .stateMismatch:
                 return "Sign-in failed. Please try again."
             }
         }

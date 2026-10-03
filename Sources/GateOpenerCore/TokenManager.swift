@@ -348,7 +348,7 @@ public actor TokenManager {
             return true
         case .server(let status, _):
             return status >= 500 || status == 429
-        case .invalidCredentials, .decoding, .missingRefreshToken:
+        case .invalidCredentials, .decoding, .missingRefreshToken, .stateMismatch:
             return false
         }
     }
