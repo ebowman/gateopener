@@ -63,7 +63,8 @@ public enum OverlayFailureDecision: Equatable {
     public static func showsReason(for message: String) -> Bool {
         switch message {
         case DoorVideoBusyPolicy.failureMessage(for: .doorBusy),
-             DoorVideoBusyPolicy.failureMessage(for: .timedOut):
+             DoorVideoBusyPolicy.failureMessage(for: .timedOut),
+             DoorVideoBusyPolicy.failureMessage(for: .noReflexiveCandidate):
             return true
         default:
             return false

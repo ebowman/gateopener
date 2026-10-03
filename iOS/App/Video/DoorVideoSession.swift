@@ -1711,7 +1711,7 @@ public final class DoorVideoSession: NSObject {
                 statusDescription = "500 \(diagLabel)"
             case .serverError(let status):
                 statusDescription = "\(status) \(diagLabel)"
-            case .unauthorized, .timedOut, .network, .accepted:
+            case .unauthorized, .timedOut, .network, .accepted, .noReflexiveCandidate:
                 statusDescription = diagLabel
             }
             diagnostics.append("[\(Self.diagTimestamp())] rtc/offer attempt \(attempt)/\(maxAttempts) status=\(statusDescription) latencyMs=\(latencyMs) retryable=\(retryable)")

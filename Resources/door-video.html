@@ -58,6 +58,14 @@ const ICE_QUIET_PERIOD_MS = 600;
 const ICE_MAX_WAIT_MS = 4000;
 const ICE_WAIT_TICK_MS = 100;
 
+// NO-REFLEXIVE fail-fast (gateopener-kgx.14): if after this long there is at
+// least one host candidate and ZERO srflx/relay candidates, STUN/UDP is
+// blocked (the Comelit backend answers 500 to such offers; memory
+// comelit-rtc-offer-500-means-door-busy) and waiting out the 15s deadline is
+// wasted. Zero candidates of any kind does NOT trigger this (existing path).
+// Evaluated on the existing ICE_WAIT_TICK_MS tick, so no extra timer exists.
+const ICE_NO_REFLEXIVE_CHECK_MS = 3000;
+
 function negotiationError(code, message) {
   const error = new Error(message);
   error.name = "DoorVideoNegotiationError";
@@ -80,6 +88,16 @@ function iceGatheringTimeoutError() {
     "ICE gathering did not produce a usable bounded snapshot within 15 seconds"
   );
   diag("negotiation failed: " + error.code + " after " + ICE_GATHERING_TIMEOUT_MS + "ms");
+  return error;
+}
+
+function iceNoReflexiveError() {
+  const error = negotiationError(
+    "ice-no-reflexive",
+    "ICE gathering produced no srflx/relay candidate within 3 seconds (STUN/UDP blocked)"
+  );
+  diag("stun blocked: no reflexive candidate after 3s");
+  diag("negotiation failed: " + error.code);
   return error;
 }
 
@@ -326,7 +344,13 @@ function waitForBoundedIceSnapshot(pc) {
         msSinceStart: now - waitStartedAt,
         gatheringComplete: pc.iceGatheringState === "complete",
       });
-      if (decision === ICE_WAIT_WAIT) return;
+      if (decision === ICE_WAIT_WAIT) {
+        if (now - waitStartedAt >= ICE_NO_REFLEXIVE_CHECK_MS &&
+            tracker.hasHost && !tracker.hasSrflxOrRelay) {
+          finish(() => reject(iceNoReflexiveError()));
+        }
+        return;
+      }
       if (decision === ICE_WAIT_DEADLINE_CANDIDATE) {
         const sdp = pc.localDescription && pc.localDescription.sdp;
         if (sdpHasQualifyingDeadlineCandidate(sdp)) {
@@ -572,6 +596,11 @@ async function negotiate() {
       tracker.count += 1;
       tracker.lastCandidateAt = Date.now();
     }
+    // Per-type counts for window.getLocalCandidateSummary() (gateopener-kgx.14).
+    const counts = pc.__candidateTypeCounts || (pc.__candidateTypeCounts = { host: 0, srflx: 0, relay: 0 });
+    if (summary.type === "host" || summary.type === "srflx" || summary.type === "relay") {
+      counts[summary.type] += 1;
+    }
     if (pc.__iceWaitEvaluate) pc.__iceWaitEvaluate();
   };
 
@@ -711,6 +740,15 @@ window.applyAnswer = async function (answerSdp) {
 window.startNegotiation = async function () {
   await negotiate();
   return window.__state.offerSdp;
+};
+
+// Local candidate counts by type gathered so far for the current pc
+// (gateopener-kgx.14). Additive: lets Swift tell "500 because the offer had
+// no srflx/relay candidate (STUN blocked)" from "500 because door busy".
+window.getLocalCandidateSummary = function () {
+  const pc = window.__state.pc;
+  const c = (pc && pc.__candidateTypeCounts) || { host: 0, srflx: 0, relay: 0 };
+  return { host: c.host, srflx: c.srflx, relay: c.relay };
 };
 
 window.getState = function () {
