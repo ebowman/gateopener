@@ -490,6 +490,7 @@ struct OpenGateIntentTests {
         let after = Date()
         guard case .failed = outcome else { Issue.record("expected failed, got \(outcome)"); return }
         #expect(notifier.events.count == 1)
+        if case .failure = notifier.events.first {} else { Issue.record("expected didn't-open failure post") }
         guard case .failure(_, _, let pressedAt) = notifier.events.first else {
             Issue.record("expected failure post"); return
         }
@@ -507,7 +508,26 @@ struct OpenGateIntentTests {
         let outcome = try await runWithNotifier(gate: gate, deadline: .seconds(1), notifier: notifier)
         #expect(outcome != .opened && outcome != .needsSetup)
         #expect(notifier.events.count == 1)
-        if case .failure = notifier.events.first {} else { Issue.record("expected failure post") }
+        switch notifier.events.first {
+        case .failure, .unconfirmed: break
+        default: Issue.record("expected failure or unconfirmed post")
+        }
+    }
+
+    /// A gate whose open hangs past the deadline (but with room for one
+    /// attempt) forces `.timedOut`, which must post the "couldn't confirm"
+    /// variant, not "didn't open".
+    @Test func timedOutPostsUnconfirmed() async throws {
+        let gate = FakeGateOpening()
+        gate.openDelay = .seconds(60)
+        let notifier = FakeNotifier()
+        let outcome = try await runWithNotifier(gate: gate, deadline: .seconds(4), notifier: notifier)
+        #expect(outcome == .timedOut)
+        #expect(notifier.events.count == 1)
+        guard case .unconfirmed(_, let pressedAt) = notifier.events.first else {
+            Issue.record("expected unconfirmed post, got \(notifier.events)"); return
+        }
+        #expect(pressedAt <= Date())
     }
 
     @Test func needsSetupPostsNothing() async throws {
@@ -533,6 +553,7 @@ final class FakeNotifier: OpenResultNotifying, @unchecked Sendable {
     enum Event {
         case success(gateName: String?)
         case failure(gateName: String?, message: String, pressedAt: Date)
+        case unconfirmed(gateName: String?, pressedAt: Date)
     }
     private let lock = NSLock()
     private var _events: [Event] = []
@@ -547,6 +568,10 @@ final class FakeNotifier: OpenResultNotifying, @unchecked Sendable {
     func requestAuthorizationIfNeeded() async {}
     func postFailure(gateName: String?, message: String, pressedAt: Date) async {
         lock.withLock { _events.append(.failure(gateName: gateName, message: message, pressedAt: pressedAt)) }
+        if hang { try? await Task.sleep(for: .seconds(60)) }
+    }
+    func postUnconfirmed(gateName: String?, pressedAt: Date) async {
+        lock.withLock { _events.append(.unconfirmed(gateName: gateName, pressedAt: pressedAt)) }
         if hang { try? await Task.sleep(for: .seconds(60)) }
     }
     func postSuccess(gateName: String?) async {

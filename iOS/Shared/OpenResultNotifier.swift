@@ -21,6 +21,9 @@ protocol OpenResultNotifying: Sendable {
     func registerCategories()
     func requestAuthorizationIfNeeded() async
     func postFailure(gateName: String?, message: String, pressedAt: Date) async
+    /// `.timedOut` outcome: the abandoned open() may still succeed, so the
+    /// wording says the open could not be CONFIRMED (not that it failed).
+    func postUnconfirmed(gateName: String?, pressedAt: Date) async
     func postSuccess(gateName: String?) async
     func postRetryExpired() async
 }
@@ -116,10 +119,28 @@ final class OpenResultNotifier: OpenResultNotifying {
     }
 
     func postFailure(gateName: String?, message: String, pressedAt: Date) async {
+        await postRetryable(
+            title: "Gate didn't open",
+            body: "\(message) — tap Retry to try again",
+            gateName: gateName,
+            pressedAt: pressedAt
+        )
+    }
+
+    func postUnconfirmed(gateName: String?, pressedAt: Date) async {
+        await postRetryable(
+            title: "Couldn't confirm gate opened",
+            body: "No response in time — tap Retry if the gate is still closed",
+            gateName: gateName,
+            pressedAt: pressedAt
+        )
+    }
+
+    private func postRetryable(title: String, body: String, gateName: String?, pressedAt: Date) async {
         guard await isAuthorized() else { return }
         let content = UNMutableNotificationContent()
-        content.title = "Gate didn't open"
-        content.body = "\(message) — tap Retry to try again"
+        content.title = title
+        content.body = body
         if let gateName { content.subtitle = gateName }
         content.categoryIdentifier = Self.failureCategoryIdentifier
         content.userInfo = [Self.pressedAtUserInfoKey: pressedAt.timeIntervalSince1970]
