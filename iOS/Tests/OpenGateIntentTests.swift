@@ -538,6 +538,9 @@ final class FakeNotifier: OpenResultNotifying, @unchecked Sendable {
     private var _events: [Event] = []
     private var _registerCount = 0
     var hang = false
+    private var _expiredCount = 0
+    var expiredCount: Int { lock.lock(); defer { lock.unlock() }; return _expiredCount }
+    func postRetryExpired() async { lock.withLock { _expiredCount += 1 } }
     var events: [Event] { lock.lock(); defer { lock.unlock() }; return _events }
     var registerCount: Int { lock.lock(); defer { lock.unlock() }; return _registerCount }
     func registerCategories() { lock.lock(); _registerCount += 1; lock.unlock() }

@@ -22,6 +22,7 @@ protocol OpenResultNotifying: Sendable {
     func requestAuthorizationIfNeeded() async
     func postFailure(gateName: String?, message: String, pressedAt: Date) async
     func postSuccess(gateName: String?) async
+    func postRetryExpired() async
 }
 
 /// Production adapter. Resolves `UNUserNotificationCenter.current()`
@@ -133,6 +134,17 @@ final class OpenResultNotifier: OpenResultNotifying {
         let content = UNMutableNotificationContent()
         content.title = "Gate opened"
         if let gateName { content.subtitle = gateName }
+        content.interruptionLevel = .active
+        content.sound = .default
+        await add(content)
+    }
+
+    /// Replaces the failure notification (same id) with a plain one that has
+    /// NO category, hence no Retry action.
+    func postRetryExpired() async {
+        guard await isAuthorized() else { return }
+        let content = UNMutableNotificationContent()
+        content.title = "Retry expired — open GateOpener to try again"
         content.interruptionLevel = .active
         content.sound = .default
         await add(content)

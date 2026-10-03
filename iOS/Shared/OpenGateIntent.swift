@@ -95,7 +95,8 @@ public struct OpenGateIntent: AppIntent {
     static func runFlow(
         environment: AppEnvironment? = nil,
         deadline pressDeadline: Duration = OpenGateIntent.pressDeadline,
-        notifier: (any OpenResultNotifying)? = nil
+        notifier: (any OpenResultNotifying)? = nil,
+        source: String = "intent"
     ) async -> OpenGateFlow.Outcome {
         // FIRST statements: press identity + the direct journal write,
         // before AppEnvironment.make() -- see this method's doc comment.
@@ -129,7 +130,7 @@ public struct OpenGateIntent: AppIntent {
                 OpenPressRecord(
                     pressId: pressId,
                     timestamp: Date(),
-                    source: "intent",
+                    source: source,
                     process: process,
                     appVersion: appVersion,
                     phase: phase,
@@ -180,7 +181,7 @@ public struct OpenGateIntent: AppIntent {
             pressId: pressId,
             pressStartedAt: pressStartedAt,
             reachabilityDetail: reachability.pathDescription,
-            pressSource: "intent",
+            pressSource: source,
             pressProcess: process,
             pressAppVersion: appVersion
         )
