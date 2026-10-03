@@ -92,14 +92,12 @@ final class BackgroundOpenRunner {
     private func beginBackgroundTaskIfNeeded() {
         guard currentTaskId == nil else { return }
         currentTaskId = host.beginBackgroundTask { [weak self] in
-            // Expiration handler: the system is about to force-kill the
-            // app if this background task is not ended now. End it
-            // immediately; the open itself may still fail asynchronously,
-            // but there is nothing further this runner can do to extend
-            // its lifetime. The handler itself must be `@Sendable` (it may
-            // be invoked off the main actor), so hop back to the main
-            // actor before touching this main-actor-isolated instance.
-            Task { @MainActor in
+            // Expiration handler: iOS requires endBackgroundTask to be
+            // called synchronously inside this handler (UIKit invokes it
+            // on the main thread), so no Task hop here. The open itself
+            // may still fail asynchronously, but there is nothing further
+            // this runner can do to extend its lifetime.
+            MainActor.assumeIsolated {
                 self?.endCurrentTaskIfNeeded()
             }
         }

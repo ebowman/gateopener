@@ -142,15 +142,9 @@ struct BackgroundOpenRunnerTests {
         #expect(host.endCallCount == 0)
 
         // Simulate the OS calling the expiration handler.
+        // The handler must end the task synchronously (no await between
+        // firing and asserting).
         host.lastExpirationHandler?()
-        // The expiration handler hops to the main actor via `Task { @MainActor in ... }`;
-        // yield until it has run.
-        var attempts = 0
-        while host.endCallCount == 0, attempts < 200 {
-            await Task.yield()
-            attempts += 1
-        }
-
         #expect(host.endCallCount == 1)
 
         // A second, redundant end (mirroring another terminal-state
