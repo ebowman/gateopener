@@ -71,6 +71,42 @@ import UserNotifications
         #expect(r.host.endCallCount == 1)
     }
 
+    @Test func expirationHandlerEndsTaskSynchronouslyExactlyOnce() async {
+        let host = FakeBackgroundTaskHost()
+        let notifier = FakeNotifier()
+        let flowStarted = AsyncStream<Void>.makeStream()
+        let flowGate = AsyncStream<Void>.makeStream()
+        let handler = OpenResultNotificationHandler(
+            now: { [t0] in t0.addingTimeInterval(1) },
+            runFlow: { _ in
+                flowStarted.continuation.yield()
+                for await _ in flowGate.stream { break }
+            },
+            host: host, notifier: notifier
+        )
+        let info: [AnyHashable: Any] = [OpenResultNotifier.pressedAtUserInfoKey: t0.timeIntervalSince1970]
+        var completions = 0
+        let task = Task { @MainActor in
+            await handler.handle(actionIdentifier: OpenResultNotifier.retryActionIdentifier, userInfo: info)
+            completions += 1
+        }
+        for await _ in flowStarted.stream { break }
+        #expect(host.beginCallCount == 1)
+        #expect(host.endCallCount == 0)
+
+        // Fire expiration while the flow is still running; end must have
+        // happened by the time the handler returns (no async hop).
+        host.lastExpirationHandler?()
+        #expect(host.endCallCount == 1)
+        #expect(completions == 0)
+
+        // Flow later finishes: no second end, completion happens once.
+        flowGate.continuation.yield()
+        await task.value
+        #expect(host.endCallCount == 1)
+        #expect(completions == 1)
+    }
+
     @Test func handleReturnsOnlyAfterFlowCompletes() async {
         let start = Date()
         _ = await make(pressedAt: t0, age: 1, flowDelay: .milliseconds(200))

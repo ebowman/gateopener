@@ -64,7 +64,10 @@ final class OpenResultNotificationHandler: NSObject, UNUserNotificationCenterDel
 
         let box = TaskBox()
         box.id = host.beginBackgroundTask { [weak self, box] in
-            Task { @MainActor in
+            // iOS requires endBackgroundTask to be called synchronously
+            // inside the expiration handler (invoked on the main thread),
+            // so no Task hop here.
+            MainActor.assumeIsolated {
                 guard let self, let id = box.id else { return }
                 box.id = nil
                 self.host.endBackgroundTask(id)
