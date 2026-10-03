@@ -142,6 +142,12 @@ public enum OpenPressPhase: Sendable, Equatable {
     case finished(outcome: String)
     /// The press's own timeout elapsed before `open()` completed.
     case timedOut
+    /// The persistent retry loop is about to start open attempt `number`
+    /// (1-based; attempt 1 included).
+    case attempt(number: Int)
+    /// The device was not reachable and the loop entered a bounded wait for
+    /// connectivity.
+    case waitingForNetwork
 
     private enum Kind: String, Codable {
         case started
@@ -152,10 +158,13 @@ public enum OpenPressPhase: Sendable, Equatable {
         case openStarted
         case finished
         case timedOut
+        case attempt
+        case waitingForNetwork
     }
 
     private enum CodingKeys: String, CodingKey {
         case kind
+        case number
         case isReachable
         case detail
         case tokenKind
@@ -190,6 +199,11 @@ extension OpenPressPhase: Codable {
             self = .finished(outcome: outcome)
         case .timedOut:
             self = .timedOut
+        case .attempt:
+            let number = try container.decode(Int.self, forKey: .number)
+            self = .attempt(number: number)
+        case .waitingForNetwork:
+            self = .waitingForNetwork
         }
     }
 
@@ -217,6 +231,11 @@ extension OpenPressPhase: Codable {
             try container.encode(outcome, forKey: .outcome)
         case .timedOut:
             try container.encode(Kind.timedOut, forKey: .kind)
+        case .attempt(let number):
+            try container.encode(Kind.attempt, forKey: .kind)
+            try container.encode(number, forKey: .number)
+        case .waitingForNetwork:
+            try container.encode(Kind.waitingForNetwork, forKey: .kind)
         }
     }
 }

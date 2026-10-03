@@ -232,6 +232,7 @@ struct OpenGateIntentTests {
             .environmentReady,
             .reachability(isReachable: true, detail: ""),
             .openStarted,
+            .attempt(number: 1),
             .finished(outcome: "Gate opened"),
         ])
         #expect(Set(pressRecords.map(\.pressId)).count == 1)
@@ -279,7 +280,9 @@ struct OpenGateIntentTests {
             currentState: .idle,
             gateName: "Front Gate",
             isReachable: true,
-            open: { .failed(message: "Server error") },
+            // Non-retryable message so the persistent loop stops after one attempt
+            // (a retryable one would keep retrying for the real 27s deadline).
+            open: { .failed(message: "Wrong username or password") },
             snapshot: environment.snapshotStore,
             reloadTimelines: {},
             journal: { journal.record($0) },
@@ -305,6 +308,7 @@ struct OpenGateIntentTests {
             .environmentReady,
             .reachability(isReachable: true, detail: ""),
             .openStarted,
+            .attempt(number: 1),
             .finished(outcome: message),
         ])
         #expect(Set(pressRecords.map(\.pressId)).count == 1)
