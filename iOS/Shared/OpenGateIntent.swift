@@ -197,7 +197,7 @@ public struct OpenGateIntent: AppIntent {
         case .failed(let message):
             post = { await notifier.postFailure(gateName: gateName, message: message, pressedAt: pressStartedAt) }
         case .timedOut:
-            post = { await notifier.postFailure(gateName: gateName, message: outcome.dialog, pressedAt: pressStartedAt) }
+            post = { await notifier.postUnconfirmed(gateName: gateName, pressedAt: pressStartedAt) }
         case .needsSetup:
             post = nil
         }

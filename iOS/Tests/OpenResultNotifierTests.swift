@@ -45,6 +45,26 @@ private func makeSettings() -> (AppSettings, () -> Void) {
         #expect(content.sound != nil && content.sound != .default)
     }
 
+    @Test func unconfirmedContent() async {
+        let (settings, cleanup) = makeSettings(); defer { cleanup() }
+        let center = FakeCenter()
+        let notifier = OpenResultNotifier(settings: settings, center: center)
+        let pressed = Date(timeIntervalSince1970: 1_700_000_000)
+
+        await notifier.postUnconfirmed(gateName: "Main gate", pressedAt: pressed)
+
+        #expect(center.added.count == 1)
+        #expect(center.added[0].identifier == OpenResultNotifier.notificationIdentifier)
+        let content = center.added[0].content
+        #expect(content.title == "Couldn't confirm gate opened")
+        #expect(content.body == "No response in time — tap Retry if the gate is still closed")
+        #expect(content.subtitle == "Main gate")
+        #expect(content.categoryIdentifier == OpenResultNotifier.failureCategoryIdentifier)
+        #expect(content.userInfo[OpenResultNotifier.pressedAtUserInfoKey] as? Double == 1_700_000_000)
+        #expect(content.interruptionLevel == .active)
+        #expect(content.sound != nil && content.sound != .default)
+    }
+
     @Test func failureWithoutGateNameHasNoSubtitle() async {
         let (settings, cleanup) = makeSettings(); defer { cleanup() }
         let center = FakeCenter()

@@ -58,6 +58,9 @@ final class FakeGateOpening: GateOpening, @unchecked Sendable {
     private var _discoverCallCount = 0
 
     var shouldSucceed: Bool = true
+    /// When set, `open` sleeps this long (cancellable) before returning,
+    /// to force the flow's deadline race to time out.
+    var openDelay: Duration?
     /// When > 0, the next N `open` calls throw, then calls succeed (if
     /// `shouldSucceed`). Guarded by `lock` via `recordOpenCall`.
     var failuresBeforeSuccess: Int = 0
@@ -97,6 +100,7 @@ final class FakeGateOpening: GateOpening, @unchecked Sendable {
     }
 
     func open(endpointId: String) async throws {
+        if let openDelay { try await Task.sleep(for: openDelay) }
         guard recordOpenCall() else {
             throw FakeGateOpeningError.forcedFailure
         }
