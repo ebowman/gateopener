@@ -35,7 +35,9 @@ final class GateControllerObservable {
     /// The runner `requestOpen()` forwards to, so an open dispatched from
     /// SwiftUI runs inside a `UIApplication` background task (see
     /// `BackgroundOpenRunner`) rather than risking suspension mid-flight.
+    #if os(iOS)
     private let backgroundOpenRunner: BackgroundOpenRunner
+    #endif
 
     /// The journal this class writes in-app press records to (bead
     /// gateopener-41m.23). `nil` exactly when `environment.openAttemptJournal`
@@ -80,6 +82,7 @@ final class GateControllerObservable {
     ///     (empty detail) so existing call sites/tests that do not care
     ///     about this string need no changes; `GateOpenerIOSApp` passes the
     ///     real reachability instance's `pathDescription`.
+    #if os(iOS)
     init(
         environment: AppEnvironment,
         backgroundOpenRunner: BackgroundOpenRunner,
@@ -96,6 +99,27 @@ final class GateControllerObservable {
             self?.handleStateChange(newState)
         }
     }
+    #else
+    /// watchOS init (bead gateopener-3d7.7): no `BackgroundOpenRunner` (a
+    /// UIKit `UIApplication` background-task wrapper that does not exist on
+    /// watchOS), so `requestOpen()` calls `controller.requestOpen(pressId:)`
+    /// directly. Everything else (state mirroring, press journaling with
+    /// source "app") is identical to the iOS init.
+    init(
+        environment: AppEnvironment,
+        reachabilityDetail: @escaping () -> String = { "" }
+    ) {
+        self.controller = environment.controller
+        self.state = environment.controller.state
+        self.journal = environment.openAttemptJournal
+        self.reachabilityDetail = reachabilityDetail
+        self.process = Bundle.main.bundleIdentifier ?? "?"
+        self.appVersion = AppVersion.current
+        environment.addStateObserver { [weak self] newState in
+            self?.handleStateChange(newState)
+        }
+    }
+    #endif
 
     /// TEST SEAM ONLY: builds this class directly from a `GateController`
     /// (registering the state observer via `controller.onStateChange`
@@ -115,6 +139,7 @@ final class GateControllerObservable {
     /// directly here (not `addStateObserver`, an `AppEnvironment`-only API)
     /// — acceptable ONLY because this initializer is never used alongside a
     /// real `AppEnvironment`'s own snapshot-publishing subscriber.
+    #if os(iOS)
     init(
         testController controller: GateController,
         backgroundOpenRunner: BackgroundOpenRunner,
@@ -132,6 +157,7 @@ final class GateControllerObservable {
             self?.handleStateChange(newState)
         }
     }
+    #endif
 
     /// Forwards to `BackgroundOpenRunner.requestOpen()`, which wraps
     /// `controller.requestOpen()` in a `UIApplication` background task so
@@ -158,7 +184,11 @@ final class GateControllerObservable {
             emit(.started, pressId: pressId, startedAt: startedAt, source: "app")
             forwardedPressId = pressId
         }
+        #if os(iOS)
         backgroundOpenRunner.requestOpen(pressId: forwardedPressId)
+        #else
+        controller.requestOpen(pressId: forwardedPressId)
+        #endif
     }
 
     /// Mirrors `state` (unchanged from before this bead) and, additionally,

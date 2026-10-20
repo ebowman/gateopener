@@ -202,6 +202,10 @@ targets:
       # AppIntents + GateOpenerCore, so the watch app exposes "Open Gate" too
       # (bead gateopener-3d7.8).
       - path: iOS/App/GateOpenerShortcuts.swift
+      # Single file (bead gateopener-3d7.7): the @Observable bridge the watch
+      # UI uses. Its iOS-only BackgroundOpenRunner references are gated with
+      # #if os(iOS); on watchOS requestOpen() calls the controller directly.
+      - path: iOS/App/GateControllerObservable.swift
       - path: Watch/Resources/Assets.xcassets
     dependencies:
       - package: GateOpenerCore
