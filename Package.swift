@@ -5,7 +5,8 @@ let package = Package(
     name: "GateOpener",
     platforms: [
         .macOS(.v14),
-        .iOS(.v18)
+        .iOS(.v18),
+        .watchOS(.v11)
     ],
     products: [
         .executable(name: "GateOpener", targets: ["GateOpener"]),

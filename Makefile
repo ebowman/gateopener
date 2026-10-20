@@ -1,4 +1,4 @@
-.PHONY: build test run clean release xcodeproj ios-build ios-sim-build ios-sim-run ios-test testflight-archive video-diag
+.PHONY: build test run clean release xcodeproj ios-build core-watch-build ios-sim-build ios-sim-run ios-test testflight-archive video-diag
 
 build:
 	swift build
@@ -18,6 +18,14 @@ clean:
 # it by hand.
 xcodeproj:
 	xcodegen generate --spec project.yml
+
+# Builds the Foundation-only GateOpenerCore library for the watchOS
+# Simulator (no project or code signing needed; xcodebuild builds the
+# SwiftPM package directly). Guards against watchOS-incompatible APIs
+# creeping into the shared core.
+core-watch-build:
+	xcodebuild -scheme GateOpenerCore \
+		-destination 'generic/platform=watchOS Simulator' build
 
 # Regenerates the Xcode project and builds the iOS app target for the
 # Simulator, without code signing (no team-provisioned device involved).
