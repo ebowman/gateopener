@@ -16,6 +16,10 @@
         <string>GateOpener AppStore ios</string>
         <key>ie.boboco.GateOpener.widget</key>
         <string>GateOpener AppStore widget</string>
+        <key>ie.boboco.GateOpener.watchkitapp</key>
+        <string>GateOpener AppStore watch</string>
+        <key>ie.boboco.GateOpener.watchkitapp.widget</key>
+        <string>GateOpener AppStore watch widget</string>
     </dict>
     <key>uploadSymbols</key>
     <true/>

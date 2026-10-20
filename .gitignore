@@ -40,3 +40,6 @@ Resources/AppIcon.icns
 # successful release does not dirty the tree and trip the next release's
 # clean-tree precondition.
 appcast.json
+
+# Operator evidence exports (Open history, diagnostics) are personal activity logs: never commit them.
+docs/evidence/
