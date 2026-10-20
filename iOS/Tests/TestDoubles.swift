@@ -95,6 +95,14 @@ final class FakeGateOpening: GateOpening, @unchecked Sendable {
         return shouldSucceed
     }
 
+    /// Invoked (if set) when the flow asks for the pending-confirmation wait
+    /// (gateopener-pi0.9 ordering tests). Set before the press starts.
+    var onWaitForPendingConfirmation: (@Sendable () -> Void)?
+
+    func waitForPendingConfirmation(upTo bound: Duration) async {
+        onWaitForPendingConfirmation?()
+    }
+
     func discover(aptId: String?) async throws -> [Endpoint] {
         recordDiscoverCall()
     }

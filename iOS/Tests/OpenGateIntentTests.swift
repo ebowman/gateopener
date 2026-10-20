@@ -538,6 +538,20 @@ struct OpenGateIntentTests {
         #expect(notifier.events.isEmpty)
     }
 
+    /// gateopener-pi0.9. Removing the flow's `onFinished` call-before-wait
+    /// (or posting after `run` returns, as before) makes the confirmation
+    /// wait come first, so events == ["wait", "post"] and this fails.
+    @Test func notificationIsPostedBeforeConfirmationWait() async throws {
+        let log = EventLog()
+        let notifier = FakeNotifier()
+        notifier.onPost = { log.add("post") }
+        let gate = FakeGateOpening()
+        gate.onWaitForPendingConfirmation = { log.add("wait") }
+        let outcome = try await runWithNotifier(gate: gate, deadline: .seconds(10), notifier: notifier)
+        #expect(outcome == .opened)
+        #expect(log.items == ["post", "wait"])
+    }
+
     @Test func hangingNotifierIsBoundedToAboutTwoSeconds() async throws {
         let notifier = FakeNotifier()
         notifier.hang = true
@@ -559,6 +573,8 @@ final class FakeNotifier: OpenResultNotifying, @unchecked Sendable {
     private var _events: [Event] = []
     private var _registerCount = 0
     var hang = false
+    /// Called at the start of every post (gateopener-pi0.9 ordering test).
+    var onPost: (@Sendable () -> Void)?
     private var _expiredCount = 0
     var expiredCount: Int { lock.lock(); defer { lock.unlock() }; return _expiredCount }
     func postRetryExpired() async { lock.withLock { _expiredCount += 1 } }
@@ -567,15 +583,25 @@ final class FakeNotifier: OpenResultNotifying, @unchecked Sendable {
     func registerCategories() { lock.lock(); _registerCount += 1; lock.unlock() }
     func requestAuthorizationIfNeeded() async {}
     func postFailure(gateName: String?, message: String, pressedAt: Date) async {
+        onPost?()
         lock.withLock { _events.append(.failure(gateName: gateName, message: message, pressedAt: pressedAt)) }
         if hang { try? await Task.sleep(for: .seconds(60)) }
     }
     func postUnconfirmed(gateName: String?, pressedAt: Date) async {
+        onPost?()
         lock.withLock { _events.append(.unconfirmed(gateName: gateName, pressedAt: pressedAt)) }
         if hang { try? await Task.sleep(for: .seconds(60)) }
     }
     func postSuccess(gateName: String?) async {
+        onPost?()
         lock.withLock { _events.append(.success(gateName: gateName)) }
         if hang { try? await Task.sleep(for: .seconds(60)) }
     }
+}
+
+final class EventLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _items: [String] = []
+    func add(_ item: String) { lock.lock(); _items.append(item); lock.unlock() }
+    var items: [String] { lock.lock(); defer { lock.unlock() }; return _items }
 }

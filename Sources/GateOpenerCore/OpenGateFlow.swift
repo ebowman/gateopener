@@ -161,7 +161,9 @@ public struct OpenGateFlow: Sendable {
         pressSource: String = "intent",
         pressProcess: String = "?",
         pressAppVersion: String = "",
-        awaitConfirmation: @escaping @Sendable (Duration) async -> Void = { _ in }
+        awaitConfirmation: @escaping @Sendable (Duration) async -> Void = { _ in },
+        notificationBound: Duration = .seconds(2),
+        onFinished: (@Sendable (Outcome) async -> Void)? = nil
     ) async -> Outcome {
         func emit(_ phase: OpenPressPhase) {
             guard let journal else { return }
@@ -311,6 +313,15 @@ public struct OpenGateFlow: Sendable {
             emit(.timedOut)
         } else {
             emit(.finished(outcome: outcome.dialog))
+        }
+
+        // gateopener-pi0.9: report the result (notification / dialog data)
+        // BEFORE the confirmation wait so it is not delayed by up to 3.4s.
+        // Bounded via the injected `sleep`: worst case deadline +
+        // `notificationBound` (27s + 2s = 29s). `.needsSetup` returned early
+        // above (posts nothing); a `.needsSetup` from `open()` is skipped too.
+        if let onFinished, outcome != .needsSetup {
+            await Self.boundedAwait(bound: notificationBound, sleep: sleep) { await onFinished(outcome) }
         }
 
         // gateopener-pi0.5: the result is already decided and journaled; give

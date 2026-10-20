@@ -164,6 +164,27 @@ public struct OpenGateIntent: AppIntent {
             journalWriter = nil
         }
 
+        // Result notification, posted by the flow right after the terminal
+        // snapshot + `.finished` journal entry and BEFORE the confirmation
+        // wait (gateopener-pi0.9). The flow bounds it (2s) via its sleep seam:
+        // worst case 27s deadline + 2s = 29s, under iOS's ~30s intent limit.
+        // `.needsSetup` posts nothing (the dialog already says sign in); the
+        // flow does not call `onFinished` for it.
+        let notifier = notifier ?? OpenResultNotifier(settings: environment.appSettings)
+        notifier.registerCategories()
+        let onFinished: @Sendable (OpenGateFlow.Outcome) async -> Void = { outcome in
+            switch outcome {
+            case .opened:
+                await notifier.postSuccess(gateName: gateName)
+            case .failed(let message):
+                await notifier.postFailure(gateName: gateName, message: message, pressedAt: pressStartedAt)
+            case .timedOut:
+                await notifier.postUnconfirmed(gateName: gateName, pressedAt: pressStartedAt)
+            case .needsSetup:
+                break
+            }
+        }
+
         let outcome = await OpenGateFlow().run(
             currentState: currentState,
             gateName: gateName,
@@ -188,59 +209,10 @@ public struct OpenGateIntent: AppIntent {
             // background confirmation send up to min(3.4s, remaining
             // deadline); the flow bounds this itself and never lets it
             // change the outcome.
-            awaitConfirmation: { await environment.gateClient.waitForPendingConfirmation(upTo: $0) }
+            awaitConfirmation: { await environment.gateClient.waitForPendingConfirmation(upTo: $0) },
+            onFinished: onFinished
         )
 
-        // Result notification. Budget: flow deadline 27s + at most
-        // `notificationBound` (2s) = 29s, under iOS's ~30s intent limit.
-        // `.needsSetup` posts nothing (the dialog already says sign in).
-        let notifier = notifier ?? OpenResultNotifier(settings: environment.appSettings)
-        let post: (@Sendable () async -> Void)?
-        switch outcome {
-        case .opened:
-            post = { await notifier.postSuccess(gateName: gateName) }
-        case .failed(let message):
-            post = { await notifier.postFailure(gateName: gateName, message: message, pressedAt: pressStartedAt) }
-        case .timedOut:
-            post = { await notifier.postUnconfirmed(gateName: gateName, pressedAt: pressStartedAt) }
-        case .needsSetup:
-            post = nil
-        }
-        if let post {
-            notifier.registerCategories()
-            await Self.runBounded(notificationBound, post)
-        }
-
         return outcome
-    }
-
-    /// Max time `runFlow` waits for the notification to be enqueued.
-    static let notificationBound: Duration = .seconds(2)
-
-    /// Runs `work`, returning when it finishes OR after `bound`, whichever
-    /// is first. Does not wait for `work` if it ignores cancellation.
-    static func runBounded(_ bound: Duration, _ work: @escaping @Sendable () async -> Void) async {
-        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            let gate = OnceGate(continuation)
-            let worker = Task { await work(); gate.fire() }
-            Task {
-                try? await Task.sleep(for: bound)
-                gate.fire()
-                worker.cancel()
-            }
-        }
-    }
-}
-
-private final class OnceGate: @unchecked Sendable {
-    private let lock = NSLock()
-    private var continuation: CheckedContinuation<Void, Never>?
-    init(_ continuation: CheckedContinuation<Void, Never>) { self.continuation = continuation }
-    func fire() {
-        lock.lock()
-        let c = continuation
-        continuation = nil
-        lock.unlock()
-        c?.resume()
     }
 }
