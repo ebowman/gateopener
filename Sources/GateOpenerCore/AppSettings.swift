@@ -32,6 +32,7 @@ public final class AppSettings: @unchecked Sendable {
         static let cachedCameraEndpointId = "ie.boboco.GateOpener.cachedCameraEndpointId"
         static let notifyOnOpenSuccess = "ie.boboco.GateOpener.notifyOnOpenSuccess"
         static let watchProvisioningAppliedAt = "ie.boboco.GateOpener.watchProvisioningAppliedAt"
+        static let dismissedLastPressId = "ie.boboco.GateOpener.dismissedLastPressId"
 
         /// All keys owned by `AppSettings`. Used by `reset()` so unrelated
         /// UserDefaults keys (e.g. from other parts of the app, or the test
@@ -40,7 +41,7 @@ public final class AppSettings: @unchecked Sendable {
             aptId, selectedEndpointId, selectedEndpointName, lastDiscoveryDate, shortcutPreference,
             showOpenConfirmationOverlay, autoShowDoorVideoOnOpen, cachedGates, allowOpenWhileLocked,
             autoStartDoorVideoOnLaunch, cachedCameraEndpointId, notifyOnOpenSuccess,
-            watchProvisioningAppliedAt,
+            watchProvisioningAppliedAt, dismissedLastPressId,
         ]
     }
 
@@ -94,6 +95,13 @@ public final class AppSettings: @unchecked Sendable {
         set { defaults.set(newValue, forKey: Keys.watchProvisioningAppliedAt) }
     }
 
+    /// The `pressId` of the last-press banner (bead gateopener-pi0.3) the user
+    /// dismissed; the banner stays hidden until a NEWER press appears.
+    public var dismissedLastPressId: UUID? {
+        get { defaults.string(forKey: Keys.dismissedLastPressId).flatMap(UUID.init(uuidString:)) }
+        set { defaults.set(newValue?.uuidString, forKey: Keys.dismissedLastPressId) }
+    }
+
     /// The user's global-hotkey preference: unset (use the default chord),
     /// explicitly disabled (no hotkey), or a specific custom chord.
     ///
@@ -104,6 +112,7 @@ public final class AppSettings: @unchecked Sendable {
     /// `UserDefaults` cannot store as a native property-list type directly.
     /// A missing or corrupt/unrecognized stored value decodes to `.unset`
     /// (see `ShortcutPreference.init(from:)`) rather than crashing.
+
     public var shortcutPreference: ShortcutPreference {
         get {
             guard let data = defaults.data(forKey: Keys.shortcutPreference) else { return .unset }

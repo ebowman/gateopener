@@ -195,6 +195,12 @@ struct MainView: View {
             // screen's most thumb-reachable zone regardless of how much
             // space the video slot above claims.
             VStack(spacing: 16) {
+                LastPressBannerView(
+                    journal: environment.openAttemptJournal,
+                    settings: appSettings,
+                    state: observable.state
+                )
+
                 Text(statusText)
                     .font(.subheadline)
                     .foregroundStyle(.secondary)

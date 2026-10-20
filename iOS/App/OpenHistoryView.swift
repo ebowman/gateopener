@@ -131,170 +131,28 @@ struct OpenHistoryView: View {
 
     // MARK: - Pure, unit-testable helpers
 
-    /// One group per PRESS: every `OpenPressRecord`/`OpenAttemptRecord`
-    /// sharing the same `pressId`. `OpenAttemptRecord`s with no `pressId`
-    /// (predating bead gateopener-41m.22, or produced outside any press
-    /// context) fall back to the OLD attempt==1 heuristic, forming their own
-    /// "legacy" groups labelled source "Unknown (older build)".
-    ///
-    /// A group's `time` is its `.started` press record's timestamp; failing
-    /// that (a press whose `.started` line fell off the journal via
-    /// trimming), the earliest entry in the group. Legacy groups use their
-    /// first record's timestamp, exactly as before.
-    ///
-    /// Returned newest group first, by `time`.
-    ///
-    /// `nonisolated` (and every pure helper below) despite `OpenHistoryView`
-    /// being a `View` (implicitly `@MainActor`-isolated under this project's
-    /// `SWIFT_STRICT_CONCURRENCY: complete` setting): these are pure
-    /// functions over `Sendable` value types with no UI/actor state, and
-    /// tests call them directly off the main actor.
-    nonisolated struct Group: Identifiable {
-        let id: String
-        let time: Date
-        /// The raw `OpenPressRecord.source` of this group's `.started`
-        /// phase, or `nil` for a legacy (pressId-less) group.
-        let source: String?
-        /// Every entry (press phases and attempts) belonging to this press,
-        /// in the order they appear in the journal (oldest first).
-        let entries: [OpenJournalEntry]
-
-        /// "Action Button / Control" for "intent", "App" for "app", the raw
-        /// value for anything else, "Unknown (older build)" for a legacy
-        /// group with no `pressId` at all.
-        var sourceLabel: String {
-            guard let source else { return "Unknown (older build)" }
-            return OpenHistoryView.sourceLabel(for: source)
-        }
-
-        var resultBadge: String {
-            OpenHistoryView.resultBadge(for: self)
-        }
-    }
+    /// Grouping lives in core (`OpenPressGroup`, bead gateopener-pi0.3) so the
+    /// main-screen banner shares it; these are thin wrappers.
+    typealias Group = OpenPressGroup
 
     /// "Action Button / Control" for "intent", "App" for "app", the raw
     /// value for anything else.
     nonisolated static func sourceLabel(for source: String) -> String {
-        switch source {
-        case "intent":
-            return "Action Button / Control"
-        case "app":
-            return "App"
-        default:
-            return source
-        }
+        OpenPressGroup.sourceLabel(for: source)
     }
 
     nonisolated static let unfinishedFootnote =
         "This press started but never reported a result — iOS may have stopped the extension before it finished."
 
     nonisolated static func groups(from entries: [OpenJournalEntry]) -> [Group] {
-        var byPressId: [UUID: [OpenJournalEntry]] = [:]
-        var pressOrder: [UUID] = []
-        var legacyAttempts: [OpenAttemptRecord] = []
-
-        for entry in entries {
-            switch entry {
-            case .press(let press):
-                if byPressId[press.pressId] == nil {
-                    pressOrder.append(press.pressId)
-                }
-                byPressId[press.pressId, default: []].append(entry)
-            case .attempt(let attempt):
-                guard let pressId = attempt.pressId else {
-                    legacyAttempts.append(attempt)
-                    continue
-                }
-                if byPressId[pressId] == nil {
-                    pressOrder.append(pressId)
-                }
-                byPressId[pressId, default: []].append(entry)
-            }
-        }
-
-        var groups: [Group] = pressOrder.map { pressId in
-            let groupEntries = byPressId[pressId] ?? []
-            let startedRecord = groupEntries.compactMap { entry -> OpenPressRecord? in
-                if case .press(let press) = entry, case .started = press.phase { return press }
-                return nil
-            }.first
-            let time = startedRecord?.timestamp ?? groupEntries.map(timestamp(of:)).min() ?? Date()
-            let source = startedRecord?.source
-            return Group(id: pressId.uuidString, time: time, source: source, entries: groupEntries)
-        }
-
-        groups.append(contentsOf: legacyGroups(from: legacyAttempts))
-
-        return groups.sorted { $0.time > $1.time }
-    }
-
-    /// Legacy fallback grouping for `OpenAttemptRecord`s with no `pressId`:
-    /// the pre-gateopener-41m.24 attempt==1 heuristic. Records before the
-    /// first `attempt == 1` record (possible after the journal has been
-    /// trimmed mid-open) form a leading group. Ids are stable (derived from
-    /// the group's first timestamp + its index among legacy groups), not
-    /// positional in the combined list, so `List` animates correctly across
-    /// reloads.
-    private nonisolated static func legacyGroups(from attempts: [OpenAttemptRecord]) -> [Group] {
-        var rawGroups: [[OpenAttemptRecord]] = []
-        for record in attempts {
-            if record.attempt == 1 || rawGroups.isEmpty {
-                rawGroups.append([record])
-            } else {
-                rawGroups[rawGroups.count - 1].append(record)
-            }
-        }
-        let isoFormatter = ISO8601DateFormatter()
-        return rawGroups.enumerated().map { index, records in
-            let time = records.first?.timestamp ?? Date()
-            let id = "legacy-\(isoFormatter.string(from: time))-\(index)"
-            return Group(id: id, time: time, source: nil, entries: records.map { .attempt($0) })
-        }
-    }
-
-    private nonisolated static func timestamp(of entry: OpenJournalEntry) -> Date {
-        switch entry {
-        case .press(let press): return press.timestamp
-        case .attempt(let attempt): return attempt.timestamp
-        }
+        OpenPressGroup.groups(from: entries)
     }
 
     /// One-line footer shown above the history groups.
     nonisolated static let acceptedFooter = "Accepted means Comelit's cloud took the command; it does not confirm the gate moved."
 
-    /// Result badge precedence for a press-backed group: `.finished` beats
-    /// `.timedOut` beats "no terminal phase yet" (`Unfinished`) — though in
-    /// practice a press only ever emits ONE of `.finished`/`.timedOut`, this
-    /// searches for `.finished` first to match the bead's documented
-    /// precedence. A legacy (pressId-less) group has no phases at all, so it
-    /// keeps the OLD attempt-outcome-scan logic (Accepted if any attempt in
-    /// the group succeeded, else Failed).
     nonisolated static func resultBadge(for group: Group) -> String {
-        guard group.source != nil else {
-            return legacyResultBadge(for: group.entries)
-        }
-
-        for entry in group.entries {
-            guard case .press(let press) = entry, case .finished(let outcome) = press.phase else { continue }
-            // "Gate opened" is the pre-pi0.4 literal still present in
-            // journal lines already on disk.
-            if outcome == OpenGateFlow.Outcome.acceptedDialog || outcome == "Gate opened" { return "Accepted" }
-            if outcome == "No network" { return "No network" }
-            return "Failed: \(outcome)"
-        }
-        for entry in group.entries {
-            guard case .press(let press) = entry, case .timedOut = press.phase else { continue }
-            return "Timed out"
-        }
-        return "Unfinished"
-    }
-
-    private nonisolated static func legacyResultBadge(for entries: [OpenJournalEntry]) -> String {
-        let attempts = entries.compactMap { entry -> OpenAttemptRecord? in
-            if case .attempt(let record) = entry { return record }
-            return nil
-        }
-        return attempts.contains { if case .success = $0.outcome { return true } else { return false } } ? "Accepted" : "Failed"
+        OpenPressGroup.resultBadge(for: group)
     }
 
     /// Full phase/attempt timeline for one press group, oldest first, each
