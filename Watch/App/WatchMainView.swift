@@ -17,7 +17,10 @@ struct WatchMainView: View {
 
     init(environment: AppEnvironment) {
         self.environment = environment
-        _observable = State(initialValue: GateControllerObservable(environment: environment))
+        _observable = State(initialValue: GateControllerObservable(
+            environment: environment,
+            reachabilityDetail: { "watchOS: path monitor bypassed (companion link reports unsatisfied)" }
+        ))
     }
 
     var body: some View {

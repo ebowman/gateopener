@@ -160,7 +160,20 @@ public struct OpenGateIntent: AppIntent {
         // re-reading the LIVE `isReachableNow` between attempts and, when
         // offline, waiting (bounded by the deadline) via
         // `waitForReachability` for a satisfied path.
+        #if os(watchOS)
+        // gateopener-3d7.16: NWPathMonitor is .unsatisfied on the companion
+        // link although URLSession works; never gate on it on the watch.
+        let isReachableNow: @Sendable () -> Bool = { true }
+        let waitForReachability: @Sendable (Duration) async -> Bool = { _ in true }
+        let reachabilityDetail = "watchOS: path monitor bypassed (companion link reports unsatisfied)"
+        let initiallyReachable = true
+        #else
         let reachability = NWPathMonitorReachability()
+        let isReachableNow: @Sendable () -> Bool = { reachability.isReachable }
+        let waitForReachability: @Sendable (Duration) async -> Bool = { await reachability.waitUntilReachable(timeout: $0) }
+        let reachabilityDetail = reachability.pathDescription
+        let initiallyReachable = reachability.isReachable
+        #endif
 
         let currentState = environment.controller.state
         let gateName = environment.appSettings.selectedEndpointName
@@ -212,7 +225,7 @@ public struct OpenGateIntent: AppIntent {
         let outcome = await OpenGateFlow().run(
             currentState: currentState,
             gateName: gateName,
-            isReachable: reachability.isReachable,
+            isReachable: initiallyReachable,
             open: {
                 await environment.controller.openGate()
                 return await environment.controller.state
@@ -220,12 +233,12 @@ public struct OpenGateIntent: AppIntent {
             snapshot: environment.snapshotStore,
             reloadTimelines: { WidgetCenter.shared.reloadAllTimelines() },
             deadline: pressDeadline,
-            isReachableNow: { reachability.isReachable },
-            waitForReachability: { await reachability.waitUntilReachable(timeout: $0) },
+            isReachableNow: isReachableNow,
+            waitForReachability: waitForReachability,
             journal: journalWriter,
             pressId: pressId,
             pressStartedAt: pressStartedAt,
-            reachabilityDetail: reachability.pathDescription,
+            reachabilityDetail: reachabilityDetail,
             pressSource: source,
             pressProcess: process,
             pressAppVersion: appVersion,

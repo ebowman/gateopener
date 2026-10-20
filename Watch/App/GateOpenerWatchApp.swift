@@ -14,7 +14,12 @@ struct GateOpenerWatchApp: App {
     @State private var receiver: WatchProvisioningReceiver
 
     init() {
-        let environment = AppEnvironment.make()
+        // gateopener-3d7.16: NWPathMonitor reports .unsatisfied on the watch's
+        // Bluetooth companion link (NECP policy on the ipsec interface) even
+        // though URLSession works through the companion proxy (Apple forum
+        // evidence). Gating on it queued every press and ended in 'No network'
+        // after 45 s with the PUT never sent. So never gate on the path here.
+        let environment = AppEnvironment.make(reachability: AlwaysReachable())
         Logger(subsystem: "ie.boboco.GateOpener", category: "watch")
             .notice("watch launch: SharedContainer.sharedDefaults() non-nil = \(SharedContainer.sharedDefaults() != nil, privacy: .public)")
         _environment = State(initialValue: environment)
