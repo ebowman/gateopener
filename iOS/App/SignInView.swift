@@ -15,6 +15,7 @@ import GateOpenerCore
 /// candidate) a short inline message is shown here instead.
 struct SignInView: View {
     let observable: GateControllerObservable
+    @Environment(\.watchSync) private var watchSync
 
     @State private var username: String = ""
     @State private var password: String = ""
@@ -97,6 +98,8 @@ struct SignInView: View {
             }
             do {
                 try await observable.controller.performFirstTimeSetup(username: user, password: pass)
+                // Trigger (b): sign-in succeeded (credentials + gate now stored).
+                watchSync?.pushNow(reason: "sign-in")
                 // On success `RootView` switches away because `state`
                 // (mirrored by `observable.state`) leaves `.needsSetup` —
                 // nothing further to do here.

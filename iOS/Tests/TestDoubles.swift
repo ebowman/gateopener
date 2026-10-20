@@ -1,5 +1,6 @@
 import Foundation
 import GateOpenerCore
+@testable import GateOpener
 
 // MARK: - Test doubles shared across the iOS unit-test bundle (bead gateopener-672.18)
 //
@@ -216,4 +217,29 @@ func makeInMemoryDefaults(function: String = #function) -> (defaults: UserDefaul
         defaults.removePersistentDomain(forName: suiteName)
     }
     return (defaults, cleanup)
+}
+
+/// Fake `WatchSessionProviding` (bead gateopener-3d7.5): records every
+/// `updateApplicationContext` call; never touches `WCSession`.
+@MainActor
+final class FakeWatchSession: WatchSessionProviding {
+    struct PushError: Error {}
+    var isSupported = true
+    var isPaired = true
+    var isWatchAppInstalled = true
+    var activationState: WatchSessionActivation = .activated
+    var onStateChange: (@MainActor () -> Void)?
+    var updateError: Error?
+    private(set) var activateCallCount = 0
+    private(set) var contexts: [[String: Any]] = []
+
+    func activate() { activateCallCount += 1 }
+
+    func updateApplicationContext(_ context: [String: Any]) throws {
+        if let updateError { throw updateError }
+        contexts.append(context)
+    }
+
+    /// Simulates the system finishing activation / a watch-state change.
+    func fireStateChange() { onStateChange?() }
 }

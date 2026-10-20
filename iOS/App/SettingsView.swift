@@ -25,6 +25,7 @@ struct SettingsView: View {
     var appSettings: AppSettings
 
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.watchSync) private var watchSync
 
     /// Bumped after every mutation made through this view (gate selection,
     /// toggle flips) so SwiftUI re-renders reads of `appSettings`, which is
@@ -164,6 +165,8 @@ struct SettingsView: View {
             set: { newId in
                 guard let newId, let gate = appSettings.cachedGates.first(where: { $0.endpointId == newId }) else { return }
                 observable.controller.selectGate(gate)
+                // Trigger (c): default gate changed.
+                watchSync?.pushNow(reason: "select-gate")
                 environment.publishSnapshot()
                 refreshToken += 1
             }
@@ -357,6 +360,8 @@ struct SettingsView: View {
         ) {
             Button("Sign Out", role: .destructive) {
                 observable.controller.signOut()
+                // Trigger (e): after signOut() completed -> pushes .signedOut.
+                watchSync?.pushNow(reason: "sign-out")
                 dismiss()
             }
             Button("Cancel", role: .cancel) {}

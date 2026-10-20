@@ -23,6 +23,7 @@ struct GateOpenerIOSApp: App {
     @State private var observable: GateControllerObservable
     @State private var doorVideoCoordinator: DoorVideoCoordinator
     private let backgroundOpenRunner: BackgroundOpenRunner
+    private let watchSync: WatchSync
 
     #if DEBUG
     /// `--video-harness` (bead gateopener-672.11 verification): held
@@ -118,11 +119,20 @@ struct GateOpenerIOSApp: App {
             }
         )
 
+        // Pushes provisioning to the paired Apple Watch (bead gateopener-3d7.5).
+        let watchSync = WatchSync(
+            session: WCSessionAdapter(),
+            appSettings: environment.appSettings,
+            credentialStore: environment.credentialStore
+        )
+        watchSync.start()
+
         OpenResultNotificationHandler.shared.configure(environment: environment)
         _environment = State(initialValue: environment)
         _observable = State(initialValue: observable)
         _doorVideoCoordinator = State(initialValue: doorVideoCoordinator)
         self.backgroundOpenRunner = runner
+        self.watchSync = watchSync
     }
 
     var body: some Scene {
@@ -173,6 +183,8 @@ struct GateOpenerIOSApp: App {
             case .startIfAppropriate:
                 Task { await environment.tokenManager.prewarm() }
                 environment.publishSnapshot()
+                // Trigger (d): every foreground (application context is latest-wins).
+                watchSync.pushNow(reason: "foreground")
                 startDoorVideoForForegroundIfAppropriate()
             }
         }
@@ -259,6 +271,7 @@ struct GateOpenerIOSApp: App {
             appSettings: environment.appSettings,
             doorVideoCoordinator: doorVideoCoordinator
         )
+            .environment(\.watchSync, watchSync)
             // Cold-launch auto-start (bead gateopener-41m.12):
             // `.onChange(of: scenePhase)` above never fires for the
             // INITIAL scenePhase value, only on subsequent transitions — so
