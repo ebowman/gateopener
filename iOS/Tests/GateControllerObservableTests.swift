@@ -23,7 +23,7 @@ struct GateControllerObservableTests {
     /// mirroring `BackgroundOpenRunnerTests.makeIdleController`.
     private func makeIdleController(
         defaults: UserDefaults,
-        gateClient: FakeGateOpening,
+        gateClient: any GateOpening,
         reachability: any ReachabilityProviding = AlwaysReachable()
     ) -> GateController {
         let appSettings = AppSettings(defaults: defaults)
@@ -102,6 +102,57 @@ struct GateControllerObservableTests {
         #expect(phases == [.started, .finished(outcome: "Gate opened")])
         #expect(Set(records.map(\.pressId)).count == 1)
         #expect(records.allSatisfy { $0.source == "app" })
+    }
+
+    /// A `GateOpening` that, like `GateClient.open`, reports an
+    /// `OpenAttemptRecord` stamped with `OpenPressContext.pressId`.
+    private final class AttemptReportingGateOpening: GateOpening, @unchecked Sendable {
+        let observer: OpenAttemptObserving
+        init(observer: OpenAttemptObserving) { self.observer = observer }
+        func discover(aptId: String?) async throws -> [Endpoint] { [] }
+        func open(endpointId: String) async throws {
+            observer.record(OpenAttemptRecord(
+                timestamp: Date(), attempt: 1, maxAttempts: 3,
+                outcome: .success(status: 202), elapsedMilliseconds: 1,
+                willRetry: false, pressId: OpenPressContext.pressId
+            ))
+        }
+    }
+
+    /// The attempt record written during an in-app press carries the same
+    /// pressId as the press's `.started` phase (bead gateopener-pi0.8).
+    ///
+    /// MUTATION CHECK: removing the `pressId:` forwarding in
+    /// `GateControllerObservable.requestOpen()` (or the binding in
+    /// `GateController.openGate`) leaves the attempt's pressId nil, failing
+    /// the `== startedId` assertion.
+    @Test func attemptRecordCarriesTheInAppPressId() async {
+        let (defaults, cleanup) = makeInMemoryDefaults()
+        defer { cleanup() }
+        let (journalURL, cleanupJournal) = makeTempJournalURL()
+        defer { cleanupJournal() }
+
+        let journal = OpenAttemptJournal(fileURL: journalURL, capacity: 1000)
+        let controller = makeIdleController(
+            defaults: defaults,
+            gateClient: AttemptReportingGateOpening(observer: journal)
+        )
+        let runner = BackgroundOpenRunner(controller: controller, host: FakeBackgroundTaskHost())
+        let observable = GateControllerObservable(testController: controller, backgroundOpenRunner: runner, journal: journal)
+
+        observable.requestOpen()
+        await waitUntilDeadline {
+            pressRecords(at: journalURL).contains { if case .finished = $0.phase { return true }; return false }
+        }
+
+        let startedId = pressRecords(at: journalURL).first { $0.phase == .started }?.pressId
+        let attempts: [OpenAttemptRecord] = journal.journalEntries().compactMap {
+            if case .attempt(let record) = $0 { return record }
+            return nil
+        }
+        #expect(startedId != nil)
+        #expect(attempts.count == 1)
+        #expect(attempts.first?.pressId == startedId)
     }
 
     /// Failure variant: `FakeGateOpening.shouldSucceed = false` makes the

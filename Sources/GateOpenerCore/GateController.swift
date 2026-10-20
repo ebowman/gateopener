@@ -167,6 +167,8 @@ public final class GateController {
     /// fired — can recognize it is stale and no-op rather than clobbering a
     /// newer queued request or double-firing.
     private var queuedRequestToken: UUID?
+    /// Press id of the queued request (bead gateopener-pi0.8); fired with the request.
+    private var queuedPressId: UUID?
 
     /// Tracks the scheduled TTL task for the currently-queued request, so it
     /// can be cancelled the moment the request fires (reachability flip) or
@@ -229,7 +231,15 @@ public final class GateController {
     /// A throwing/failing attempt never leaves `state` stuck in `.opening`:
     /// the terminal state (`.succeeded`/`.failed`) is set from a `defer`-like
     /// guarantee around the actual work.
-    public func openGate() async {
+    ///
+    /// `pressId` (bead gateopener-pi0.8): when non-nil it is bound to
+    /// `OpenPressContext.pressId` INSIDE the `Task` that runs `performOpen()`
+    /// (and hence `gateClient.open`), so GateClient's attempt records carry
+    /// the in-app press id. Bound inside that Task (not around the caller)
+    /// because `requestOpen` returns synchronously and the queued path fires
+    /// from a reachability callback, neither of which has a caller scope.
+    /// If an open is already in flight, the in-flight open's pressId wins.
+    public func openGate(pressId: UUID? = nil) async {
         // Idempotency: if a call is already in flight, await ITS completion
         // rather than starting a new one. This is deterministic under real
         // concurrency (two Tasks calling openGate() "at the same time"), not
@@ -251,7 +261,13 @@ public final class GateController {
         }
 
         let task = Task { [weak self] () -> Void in
-            await self?.performOpen()
+            if let pressId {
+                await OpenPressContext.$pressId.withValue(pressId) {
+                    await self?.performOpen()
+                }
+            } else {
+                await self?.performOpen()
+            }
         }
         openTask = task
         await task.value
@@ -285,20 +301,24 @@ public final class GateController {
     ///    (or expired) must NOT fire a stale request — enforced by
     ///    comparing `queuedRequestToken` by identity everywhere it is
     ///    consulted.
-    public func requestOpen() {
+    ///
+    /// `pressId` (bead gateopener-pi0.8) is forwarded to `openGate(pressId:)`
+    /// on both the immediate and the queued-then-reachable paths.
+    public func requestOpen(pressId: UUID? = nil) {
         if state == .opening || state == .queued {
             return
         }
 
         if reachability.isReachable {
             Task { [weak self] in
-                await self?.openGate()
+                await self?.openGate(pressId: pressId)
             }
             return
         }
 
         let token = UUID()
         queuedRequestToken = token
+        queuedPressId = pressId
         state = .queued
 
         queueTTLTask = Task { [weak self, queueTTL, sleep] in
@@ -318,6 +338,7 @@ public final class GateController {
     private func handleQueueTTLElapsed(for token: UUID) {
         guard queuedRequestToken == token else { return }
         queuedRequestToken = nil
+        queuedPressId = nil
         queueTTLTask = nil
         transition(to: .failed(message: "No network"))
     }
@@ -331,10 +352,12 @@ public final class GateController {
     private func handleReachabilityBecameTrue() {
         guard queuedRequestToken != nil else { return }
         queuedRequestToken = nil
+        let pressId = queuedPressId
+        queuedPressId = nil
         queueTTLTask?.cancel()
         queueTTLTask = nil
         Task { [weak self] in
-            await self?.openGate()
+            await self?.openGate(pressId: pressId)
         }
     }
 

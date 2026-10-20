@@ -200,6 +200,44 @@ struct OpenHistoryViewTests {
         #expect(groups[0].entries.count == 4)
     }
 
+    /// bead gateopener-pi0.8: an in-app press (source "app") plus its attempt
+    /// sharing a pressId renders ONE group labelled "App", the timeline
+    /// contains the attempt line, and no "Unknown (older build)" group exists.
+    ///
+    /// MUTATION CHECK: if the attempt's pressId were nil (the pre-fix
+    /// behaviour) there would be 2 groups and an "Unknown (older build)"
+    /// label, failing `groups.count == 1` and the label assertions.
+    @Test func inAppPressWithSharedPressIdAttemptRendersOneGroupWithAttemptLine() {
+        let pressId = UUID()
+        let started = makePress(pressId: pressId, timestamp: baseTime, source: "app", phase: .started, elapsedMilliseconds: 0)
+        let attempt = makeAttempt(attempt: 1, maxAttempts: 3, outcome: .success(status: 202), timestamp: baseTime.addingTimeInterval(0.5), pressId: pressId)
+        let finished = makePress(pressId: pressId, timestamp: baseTime.addingTimeInterval(1), source: "app", phase: .finished(outcome: "Gate opened"), elapsedMilliseconds: 1_000)
+
+        let groups = OpenHistoryView.groups(from: [.press(started), .attempt(attempt), .press(finished)])
+        #expect(groups.count == 1)
+        #expect(groups[0].sourceLabel == "App")
+        #expect(groups[0].resultBadge == "Opened")
+        #expect(!groups.contains { $0.sourceLabel == "Unknown (older build)" })
+        let lines = OpenHistoryView.timelineLines(for: groups[0])
+        #expect(lines.contains { $0.contains("attempt 1/3") })
+    }
+
+    /// Legacy mirror of the above: the same app press with a nil-pressId
+    /// attempt (pre-fix journal) still yields the separate legacy group.
+    ///
+    /// MUTATION CHECK: removing the legacy nil-pressId grouping path makes
+    /// the "Unknown (older build)" label assertion fail.
+    @Test func inAppPressWithNilPressIdAttemptStillRendersLegacyGroup() {
+        let pressId = UUID()
+        let started = makePress(pressId: pressId, timestamp: baseTime, source: "app", phase: .started, elapsedMilliseconds: 0)
+        let attempt = makeAttempt(attempt: 1, maxAttempts: 3, timestamp: baseTime.addingTimeInterval(0.5), pressId: nil)
+
+        let groups = OpenHistoryView.groups(from: [.press(started), .attempt(attempt)])
+        #expect(groups.count == 2)
+        #expect(groups.contains { $0.sourceLabel == "Unknown (older build)" })
+        #expect(groups.contains { $0.sourceLabel == "App" })
+    }
+
     /// Two interleaved concurrent presses (different `pressId`s, entries
     /// interleaved in journal order) split into two separate groups, each
     /// containing only its own entries.

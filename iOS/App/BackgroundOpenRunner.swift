@@ -66,9 +66,9 @@ final class BackgroundOpenRunner {
     /// task around the resulting state transition. Safe to call
     /// repeatedly — `GateController.requestOpen()` already coalesces
     /// repeat calls while queued/opening.
-    func requestOpen() {
+    func requestOpen(pressId: UUID? = nil) {
         updateBackgroundTask(for: controller.state)
-        controller.requestOpen()
+        controller.requestOpen(pressId: pressId)
         updateBackgroundTask(for: controller.state)
     }
 

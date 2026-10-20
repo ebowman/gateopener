@@ -144,25 +144,21 @@ final class GateControllerObservable {
     /// -- a repeat tap while one is already in flight is a no-op there, and
     /// must not start a second, untracked press here either).
     ///
-    /// ATTEMPT CORRELATION GAP (per this bead's brief, deliberately not
-    /// fixed here): `GateController.requestOpen()` calls `openGate()` ->
-    /// `performOpen()` internally, NOT from this observable, so there is no
-    /// call site here that could wrap the underlying `GateClient.open()` in
-    /// `OpenPressContext.$pressId.withValue(...)` without changing
-    /// `GateOpenerCore`. As a result, `OpenAttemptRecord`s produced by an
-    /// in-app open do NOT carry this press's `pressId` -- only the press
-    /// lines themselves (`.started`/`.reachability`/`.finished`) are
-    /// written, and they still are valuable on their own (they show when an
-    /// in-app tap happened and how it concluded, even without per-attempt
-    /// correlation).
+    /// ATTEMPT CORRELATION (bead gateopener-pi0.8): the press id is passed
+    /// through `BackgroundOpenRunner` to `GateController.requestOpen(pressId:)`,
+    /// which binds `OpenPressContext.pressId` inside the Task that runs
+    /// `GateClient.open` (immediate and queued-then-reachable paths alike), so
+    /// attempt records carry this press's id and history shows one group.
     func requestOpen() {
+        var forwardedPressId: UUID?
         if inFlightPress == nil {
             let pressId = UUID()
             let startedAt = Date()
             inFlightPress = (pressId, startedAt, false)
             emit(.started, pressId: pressId, startedAt: startedAt, source: "app")
+            forwardedPressId = pressId
         }
-        backgroundOpenRunner.requestOpen()
+        backgroundOpenRunner.requestOpen(pressId: forwardedPressId)
     }
 
     /// Mirrors `state` (unchanged from before this bead) and, additionally,

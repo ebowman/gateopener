@@ -23,6 +23,8 @@ final class MockGateOpening: GateOpening, @unchecked Sendable {
 
     private(set) var openCallCount = 0
     private(set) var discoverCallCount = 0
+    /// `OpenPressContext.pressId` as seen inside each `open` call (bead gateopener-pi0.8).
+    private(set) var observedPressIds: [UUID?] = []
 
     /// When true, `open(endpointId:)` suspends on a continuation until
     /// `releaseOpen()` is called, letting a test observe "call has started"
@@ -45,6 +47,7 @@ final class MockGateOpening: GateOpening, @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         openCallCount += 1
+        observedPressIds.append(OpenPressContext.pressId)
         return gateOpenCalls
     }
 
@@ -929,4 +932,62 @@ private func waitUntilDeadline(_ predicate: () -> Bool) async {
 
     #expect(gateOpening.openCallCount == 1)
     #expect(observedStates.contains { if case .succeeded = $0 { return true }; return false })
+}
+
+
+// MARK: - pi0.8: press id reaches GateClient.open via OpenPressContext
+
+/// Removal check: dropping the `withValue(pressId)` in `openGate`'s Task makes
+/// the captured id nil, failing the `== [pressId]` assertion.
+@Test @MainActor func requestOpenBindsPressIdAroundImmediateOpen() async throws {
+    let (controller, gateOpening, _, _, _) = makeController()
+    let pressId = UUID()
+
+    controller.requestOpen(pressId: pressId)
+    await waitUntil {
+        if case .succeeded = controller.state { return true }
+        return false
+    }
+
+    #expect(gateOpening.observedPressIds == [pressId])
+}
+
+/// Removal check: not storing/forwarding `queuedPressId` in the reachability
+/// path makes the captured id nil, failing the `== [pressId]` assertion.
+@Test @MainActor func requestOpenBindsPressIdOnQueuedThenReachablePath() async throws {
+    let reachability = FakeReachability(isReachable: false)
+    let gatedSleep = GatedSleep()
+    let (controller, gateOpening, _, _, _) = makeController(
+        sleepFn: gatedSleep.fn,
+        reachability: reachability
+    )
+    let pressId = UUID()
+
+    controller.requestOpen(pressId: pressId)
+    #expect(controller.state == .queued)
+    while gatedSleep.waitingCount() < 1 {
+        await Task.yield()
+    }
+    reachability.flip(true)
+    await waitUntil {
+        if case .succeeded = controller.state { return true }
+        return false
+    }
+
+    #expect(gateOpening.observedPressIds == [pressId])
+}
+
+/// Removal check: if the pressId were bound unconditionally/leaked (e.g. a
+/// static), the nil-default call would see a stale id; asserts nil default.
+@Test @MainActor func requestOpenWithoutPressIdLeavesContextNil() async throws {
+    let (controller, gateOpening, _, _, _) = makeController()
+
+    controller.requestOpen()
+    await waitUntil {
+        if case .succeeded = controller.state { return true }
+        return false
+    }
+
+    #expect(gateOpening.observedPressIds.count == 1)
+    #expect(gateOpening.observedPressIds.first! == nil)
 }
