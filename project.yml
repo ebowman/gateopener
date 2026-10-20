@@ -197,6 +197,11 @@ targets:
       - path: iOS/Shared
         excludes:
           - "README.md"
+      # Single file, NOT the whole iOS/App directory: the AppShortcutsProvider
+      # (Siri phrases / Shortcuts / Ultra Action Button) imports only
+      # AppIntents + GateOpenerCore, so the watch app exposes "Open Gate" too
+      # (bead gateopener-3d7.8).
+      - path: iOS/App/GateOpenerShortcuts.swift
       - path: Watch/Resources/Assets.xcassets
     dependencies:
       - package: GateOpenerCore

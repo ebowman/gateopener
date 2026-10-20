@@ -32,6 +32,22 @@ to the same public cloud API that Comelit's own mobile app uses. See
 - Self-updates in place, verifying every update against a SHA-256 digest
   *and* Apple notarization before installing it (see [Security](#security)).
 
+## Apple Watch
+
+The watch app is standalone (it holds its own copy of your credentials,
+provisioned from the paired iPhone). It offers three ways to open the gate:
+
+1. **Watch app button** — a large Open button in the app. _Coming in a later
+   build._
+2. **Smart Stack and complications** — an interactive Open button in the
+   Smart Stack plus circular/corner/inline complications. _Coming in a later
+   build._
+3. **Siri, Shortcuts and the Action Button** — the "Open Gate" App Shortcut
+   from GateOpener runs without launching the app UI. Say "Hey Siri, open
+   the gate with GateOpener", run it from the Shortcuts app, or bind it to
+   the Apple Watch Ultra Action Button: on the watch, **Settings → Action
+   Button → Shortcut → Open Gate**.
+
 ## Install
 
 The simplest path is the prebuilt app:

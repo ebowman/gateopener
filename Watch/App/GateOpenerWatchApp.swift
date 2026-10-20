@@ -21,7 +21,7 @@ struct GateOpenerWatchApp: App {
         let receiver = WatchProvisioningReceiver(
             settings: environment.appSettings,
             credentialStore: environment.credentialStore
-        ) { [weak controller = environment.controller, tokenManager = environment.tokenManager] message in
+        ) { [weak controller = environment.controller, tokenManager = environment.tokenManager, appSettings = environment.appSettings] message in
             Task { @MainActor in
                 if case .signedOut = message {
                     // Drop the in-memory access token (actor method, hence
@@ -31,6 +31,14 @@ struct GateOpenerWatchApp: App {
                 }
                 controller?.refreshStateFromStores()
                 WidgetCenter.shared.reloadAllTimelines()
+                if case .provision = message {
+                    // The watch just became configured: ask for notification
+                    // permission now (no-op unless `.notDetermined`) so
+                    // Siri/Action Button failures can post (bead 3d7.8).
+                    let notifier = OpenResultNotifier(settings: appSettings)
+                    notifier.registerCategories()
+                    await notifier.requestAuthorizationIfNeeded()
+                }
             }
         }
         _receiver = State(initialValue: receiver)
@@ -38,11 +46,32 @@ struct GateOpenerWatchApp: App {
 
     var body: some Scene {
         WindowGroup {
-            Text("GateOpener")
+            WatchRootView(environment: environment)
                 // Started from `.task` (once the scene exists) rather than
                 // `init`, so WCSession activation never races App setup.
                 // `start()` is idempotent.
                 .task { receiver.start() }
         }
+    }
+}
+
+/// Placeholder root view; also requests notification authorization on first
+/// foreground once the watch is configured (mirrors `RootView` on iOS; bead
+/// gateopener-3d7.8). The real UI arrives with bead 3d7.7.
+private struct WatchRootView: View {
+    let environment: AppEnvironment
+    @Environment(\.scenePhase) private var scenePhase
+    @State private var requestedAuthorization = false
+
+    var body: some View {
+        Text("GateOpener")
+            .task(id: scenePhase) {
+                guard scenePhase == .active, !requestedAuthorization else { return }
+                guard environment.controller.state != .needsSetup else { return }
+                requestedAuthorization = true
+                let notifier = OpenResultNotifier(settings: environment.appSettings)
+                notifier.registerCategories()
+                await notifier.requestAuthorizationIfNeeded()
+            }
     }
 }
