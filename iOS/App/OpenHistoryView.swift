@@ -324,6 +324,9 @@ struct OpenHistoryView: View {
     private nonisolated static func legacyTimelineLines(for entries: [OpenJournalEntry]) -> [String] {
         entries.compactMap { entry -> String? in
             guard case .attempt(let record) = entry else { return nil }
+            if record.kind == .confirmation {
+                return "\(confirmationText(for: record.outcome)) \(elapsedText(forMilliseconds: record.elapsedMilliseconds))"
+            }
             let outcome = outcomeText(for: record.outcome)
             let retry = record.willRetry ? "  retrying" : ""
             return "attempt \(record.attempt)/\(record.maxAttempts) \(outcome) \(elapsedText(forMilliseconds: record.elapsedMilliseconds))\(retry)"
@@ -361,9 +364,20 @@ struct OpenHistoryView: View {
 
     private nonisolated static func attemptLine(for attempt: OpenAttemptRecord, offsetMilliseconds: Int) -> String {
         let offset = offsetText(forMilliseconds: offsetMilliseconds)
+        if attempt.kind == .confirmation {
+            return "\(offset) \(confirmationText(for: attempt.outcome)) \(elapsedText(forMilliseconds: attempt.elapsedMilliseconds))"
+        }
         let outcome = outcomeText(for: attempt.outcome)
         let retry = attempt.willRetry ? "  retrying" : ""
         return "\(offset) attempt \(attempt.attempt)/\(attempt.maxAttempts) \(outcome) \(elapsedText(forMilliseconds: attempt.elapsedMilliseconds))\(retry)"
+    }
+
+    /// The post-accept confirmation send (gateopener-pi0.5): "confirmation:
+    /// Accepted (202)" on 202/200, otherwise "confirmation: " + the usual
+    /// outcome text (e.g. "confirmation: HTTP 500").
+    nonisolated static func confirmationText(for outcome: OpenAttemptOutcome) -> String {
+        if case .success(let status) = outcome { return "confirmation: Accepted (\(status))" }
+        return "confirmation: \(outcomeText(for: outcome))"
     }
 
     /// "+0 ms" / "+412 ms" for offsets under 1000 ms; "+1.9 s" / "+25.0 s"

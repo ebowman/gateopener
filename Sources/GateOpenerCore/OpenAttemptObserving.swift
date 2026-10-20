@@ -26,6 +26,19 @@ public enum OpenAttemptOutcome: Sendable, Equatable, Codable {
     case tokenFailure(description: String)
 }
 
+// MARK: - OpenSendKind
+
+/// Which of a press's HTTP sends an `OpenAttemptRecord` describes.
+public enum OpenSendKind: String, Sendable, Equatable, Codable {
+    /// An ordinary attempt of the retry loop (the only kind before the
+    /// confirmation send existed).
+    case primary
+    /// The extra identical PUT sent ~400ms after the primary send was
+    /// accepted (parity with the official app). Journaled only; it never
+    /// changes the press result.
+    case confirmation
+}
+
 // MARK: - OpenAttemptRecord
 
 /// A record of exactly one attempt within a single `GateClient.open` call,
@@ -53,6 +66,29 @@ public struct OpenAttemptRecord: Sendable, Equatable, Codable {
     /// JSONL line written before this field existed -- `pressId` is optional
     /// specifically so old on-disk lines keep decoding.
     public let pressId: UUID?
+    /// Whether this is an ordinary retry-loop attempt or the post-accept
+    /// confirmation send. ALWAYS `.primary` when decoding a legacy JSONL
+    /// line written before this field existed. Persisted under the JSON key
+    /// `sendKind` (NOT `kind`, which `OpenJournalEntry` already uses as its
+    /// own top-level discriminator on the same flat line).
+    public let kind: OpenSendKind
+
+    private enum CodingKeys: String, CodingKey {
+        case timestamp, attempt, maxAttempts, outcome, elapsedMilliseconds, willRetry, pressId
+        case kind = "sendKind"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        timestamp = try c.decode(Date.self, forKey: .timestamp)
+        attempt = try c.decode(Int.self, forKey: .attempt)
+        maxAttempts = try c.decode(Int.self, forKey: .maxAttempts)
+        outcome = try c.decode(OpenAttemptOutcome.self, forKey: .outcome)
+        elapsedMilliseconds = try c.decode(Int.self, forKey: .elapsedMilliseconds)
+        willRetry = try c.decode(Bool.self, forKey: .willRetry)
+        pressId = try c.decodeIfPresent(UUID.self, forKey: .pressId)
+        kind = try c.decodeIfPresent(OpenSendKind.self, forKey: .kind) ?? .primary
+    }
 
     public init(
         timestamp: Date,
@@ -61,7 +97,8 @@ public struct OpenAttemptRecord: Sendable, Equatable, Codable {
         outcome: OpenAttemptOutcome,
         elapsedMilliseconds: Int,
         willRetry: Bool,
-        pressId: UUID? = nil
+        pressId: UUID? = nil,
+        kind: OpenSendKind = .primary
     ) {
         self.timestamp = timestamp
         self.attempt = attempt
@@ -70,6 +107,7 @@ public struct OpenAttemptRecord: Sendable, Equatable, Codable {
         self.elapsedMilliseconds = elapsedMilliseconds
         self.willRetry = willRetry
         self.pressId = pressId
+        self.kind = kind
     }
 }
 

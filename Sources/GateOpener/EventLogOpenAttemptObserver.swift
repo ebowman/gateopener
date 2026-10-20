@@ -43,6 +43,14 @@ struct EventLogOpenAttemptObserver: OpenAttemptObserving {
     }
 
     func record(_ record: OpenAttemptRecord) {
+        // The post-accept confirmation send (gateopener-pi0.5) is journaled
+        // as a single "confirmation: ..." line; it must NOT emit
+        // "open attempted"/"open succeeded"/"failed" lines, which describe
+        // the press result decided by the primary send.
+        if record.kind == .confirmation {
+            eventLog.logOpenConfirmation(outcome: record.outcome)
+            return
+        }
         eventLog.logOpenAttempt(attempt: record.attempt, of: record.maxAttempts)
         switch record.outcome {
         case .success:

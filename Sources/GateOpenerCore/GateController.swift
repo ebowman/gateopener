@@ -66,6 +66,13 @@ public enum GateState: Equatable, Sendable {
 public protocol GateOpening: Sendable {
     func discover(aptId: String?) async throws -> [Endpoint]
     func open(endpointId: String) async throws
+    /// Gives a post-accept confirmation send (gateopener-pi0.5) up to
+    /// `bound` to finish, without cancelling it. Default: no-op.
+    func waitForPendingConfirmation(upTo bound: Duration) async
+}
+
+extension GateOpening {
+    public func waitForPendingConfirmation(upTo bound: Duration) async {}
 }
 
 extension GateClient: GateOpening {}

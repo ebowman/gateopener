@@ -15,7 +15,8 @@ struct OpenHistoryViewTests {
         elapsedMilliseconds: Int = 2_900,
         willRetry: Bool = false,
         timestamp: Date = Date(timeIntervalSince1970: 1_700_000_000),
-        pressId: UUID? = nil
+        pressId: UUID? = nil,
+        kind: OpenSendKind = .primary
     ) -> OpenAttemptRecord {
         OpenAttemptRecord(
             timestamp: timestamp,
@@ -24,7 +25,8 @@ struct OpenHistoryViewTests {
             outcome: outcome,
             elapsedMilliseconds: elapsedMilliseconds,
             willRetry: willRetry,
-            pressId: pressId
+            pressId: pressId,
+            kind: kind
         )
     }
 
@@ -485,6 +487,27 @@ struct OpenHistoryViewTests {
         let lines = OpenHistoryView.timelineLines(for: group)
         #expect(lines[1] == "+4.2 s attempt 1/3 Network: timed out 5.0 s  retrying")
         #expect(lines[2] == "+9.3 s attempt 2/3 Opened (202) 2.3 s")
+    }
+
+    /// gateopener-pi0.5. Removing the `.confirmation` branch in `attemptLine`
+    /// makes these render as "attempt 1/1 Opened (202) ..." and fail.
+    @Test func timelineLinesConfirmationAcceptedHasConfirmationPrefix() {
+        let pressId = UUID()
+        let started = makePress(pressId: pressId, timestamp: baseTime, phase: .started, elapsedMilliseconds: 0)
+        let primary = makeAttempt(outcome: .success(status: 202), elapsedMilliseconds: 1_000, timestamp: baseTime.addingTimeInterval(0.5), pressId: pressId)
+        let confirm = makeAttempt(outcome: .success(status: 202), elapsedMilliseconds: 400, timestamp: baseTime.addingTimeInterval(1.9), pressId: pressId, kind: .confirmation)
+        let group = OpenHistoryView.groups(from: [.press(started), .attempt(primary), .attempt(confirm)])[0]
+        let lines = OpenHistoryView.timelineLines(for: group)
+        #expect(lines[1].hasPrefix("+500 ms attempt 1/1 Opened (202)"))
+        #expect(lines[2] == "+1.9 s confirmation: Accepted (202) 0.4 s")
+    }
+
+    @Test func timelineLinesConfirmationHttpFailureShowsStatusWithPrefix() {
+        let pressId = UUID()
+        let started = makePress(pressId: pressId, timestamp: baseTime, phase: .started, elapsedMilliseconds: 0)
+        let confirm = makeAttempt(outcome: .httpFailure(status: 500), elapsedMilliseconds: 300, timestamp: baseTime.addingTimeInterval(0.5), pressId: pressId, kind: .confirmation)
+        let group = OpenHistoryView.groups(from: [.press(started), .attempt(confirm)])[0]
+        #expect(OpenHistoryView.timelineLines(for: group)[1] == "+500 ms confirmation: HTTP 500 0.3 s")
     }
 
     /// MUTATION CHECK: an attempt timestamped BEFORE the press's `.started`

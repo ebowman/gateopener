@@ -166,8 +166,28 @@ public struct RetryPolicy: Sendable {
     /// `requestTimeouts == [3s, 5s, 8s]`, `maxTotalDelay == 2s`): `3 + 5 + 8
     /// = 16s` of requests, plus at most `2s` of bounded backoff sleep between
     /// attempts, for a `<= 18s` total -- comfortably under
-    /// `OpenGateFlow`'s 27s extension-lifetime deadline.
+    /// `OpenGateFlow`'s 27s extension-lifetime deadline. The post-accept
+    /// confirmation send (`confirmationSends`) is NOT on that critical path:
+    /// `open` returns at the first 202/200 and the confirmation (at most
+    /// `confirmationDelay` + `confirmationTimeout` = 0.4s + 3s) runs in the
+    /// background. An App Intent grants it up to `min(3.4s, remaining
+    /// deadline)` after reporting the result (`waitForPendingConfirmation`).
     public let requestTimeouts: [Duration]
+    /// How many identical "confirmation" PUTs `open` sends after the first
+    /// accepted (202/200) primary send. Default `1`: the official Comelit app
+    /// sends the open command twice, and the cloud sometimes 202s without the
+    /// intercom executing. `0` disables the confirmation entirely (exactly
+    /// the pre-confirmation request sequence). A confirmation reuses the
+    /// primary's access token, is journaled with `OpenSendKind.confirmation`,
+    /// and NEVER changes `open`'s result (any failure is journaled only).
+    public let confirmationSends: Int
+    /// Delay (via `sleep`, no second seam) between the accepted primary send
+    /// and each confirmation send. Default 400ms.
+    public let confirmationDelay: Duration
+    /// `URLRequest.timeoutInterval` of each confirmation send. Default 3s.
+    /// The confirmation therefore adds at most `confirmationDelay` + this
+    /// (0.4s + 3s) to the documented worst case.
+    public let confirmationTimeout: Duration
     /// Injectable sleep function so tests never actually sleep.
     public let sleep: @Sendable (Duration) async throws -> Void
 
@@ -179,6 +199,9 @@ public struct RetryPolicy: Sendable {
         baseDelay: Duration = .milliseconds(400),
         maxTotalDelay: Duration = .seconds(2),
         requestTimeouts: [Duration] = [.seconds(3), .seconds(5), .seconds(8)],
+        confirmationSends: Int = 1,
+        confirmationDelay: Duration = .milliseconds(400),
+        confirmationTimeout: Duration = .seconds(3),
         sleep: @escaping @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) }
     ) {
         precondition(!requestTimeouts.isEmpty, "RetryPolicy.requestTimeouts must be non-empty")
@@ -186,6 +209,9 @@ public struct RetryPolicy: Sendable {
         self.baseDelay = baseDelay
         self.maxTotalDelay = maxTotalDelay
         self.requestTimeouts = requestTimeouts
+        self.confirmationSends = max(0, confirmationSends)
+        self.confirmationDelay = confirmationDelay
+        self.confirmationTimeout = confirmationTimeout
         self.sleep = sleep
     }
 
@@ -198,6 +224,9 @@ public struct RetryPolicy: Sendable {
         baseDelay: Duration = .milliseconds(400),
         maxTotalDelay: Duration = .seconds(2),
         requestTimeout: Duration,
+        confirmationSends: Int = 1,
+        confirmationDelay: Duration = .milliseconds(400),
+        confirmationTimeout: Duration = .seconds(3),
         sleep: @escaping @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) }
     ) {
         self.init(
@@ -205,6 +234,9 @@ public struct RetryPolicy: Sendable {
             baseDelay: baseDelay,
             maxTotalDelay: maxTotalDelay,
             requestTimeouts: [requestTimeout],
+            confirmationSends: confirmationSends,
+            confirmationDelay: confirmationDelay,
+            confirmationTimeout: confirmationTimeout,
             sleep: sleep
         )
     }
@@ -215,15 +247,52 @@ public struct RetryPolicy: Sendable {
     public static let `default` = RetryPolicy()
 
     /// A policy for tests: same attempt/backoff/timeout shape as `.default`,
-    /// but `sleep` is a no-op so tests complete instantly.
-    public static func noDelay(maxAttempts: Int = 3) -> RetryPolicy {
+    /// but `sleep` is a no-op so tests complete instantly. Unlike `.default`,
+    /// `confirmationSends` defaults to `0` here so the many tests that assert
+    /// exact primary request sequences are unaffected; tests of the
+    /// confirmation send opt in with `confirmationSends: 1`.
+    public static func noDelay(maxAttempts: Int = 3, confirmationSends: Int = 0) -> RetryPolicy {
         RetryPolicy(
             maxAttempts: maxAttempts,
             baseDelay: .milliseconds(400),
             maxTotalDelay: .seconds(2),
             requestTimeouts: [.seconds(3), .seconds(5), .seconds(8)],
+            confirmationSends: confirmationSends,
             sleep: { _ in }
         )
+    }
+}
+
+// MARK: - Pending confirmation plumbing
+
+/// Lock-protected holder of the latest confirmation task.
+private final class PendingConfirmationBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var task: Task<Void, Never>?
+    func set(_ newTask: Task<Void, Never>) { lock.lock(); task = newTask; lock.unlock() }
+    func current() -> Task<Void, Never>? { lock.lock(); defer { lock.unlock() }; return task }
+}
+
+/// One-shot race flag: `claim()` is true for exactly the first caller, which
+/// then runs the `onWin` handler (if registered).
+private final class OneShotGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var claimed = false
+    private var handler: (@Sendable () -> Void)?
+    func claim() -> Bool {
+        lock.lock()
+        if claimed { lock.unlock(); return false }
+        claimed = true
+        let h = handler
+        lock.unlock()
+        h?()
+        return true
+    }
+    func onWin(_ h: @escaping @Sendable () -> Void) {
+        lock.lock()
+        if claimed { lock.unlock(); h(); return }
+        handler = h
+        lock.unlock()
     }
 }
 
@@ -306,6 +375,10 @@ public struct GateClient: Sendable {
     /// `attemptObserver`. Defaults to the real `Date()`/`ContinuousClock` so
     /// production behavior is unchanged; tests can inject a fixed sequence.
     private let now: @Sendable () -> Date
+    /// Holds the in-flight confirmation task (a reference box so the
+    /// `GateClient` struct stays a cheap `Sendable` value). Only the most
+    /// recent open's confirmation is tracked.
+    private let confirmationBox = PendingConfirmationBox()
 
     public init(
         session: URLSession = .shared,
@@ -506,8 +579,9 @@ public struct GateClient: Sendable {
             let timeoutForAttempt = retryPolicy.requestTimeouts[min(attempt - 1, retryPolicy.requestTimeouts.count - 1)]
             request.timeoutInterval = timeoutForAttempt.timeInterval
 
+            let token: String
             do {
-                let token = try await tokenManager.accessToken()
+                token = try await tokenManager.accessToken()
                 request.setValue("Bearer \(token)", forHTTPHeaderField: "authorization")
             } catch {
                 // .invalidCredentials (or any other token-resolution failure)
@@ -573,6 +647,20 @@ public struct GateClient: Sendable {
                         outcome: .success(status: httpResponse.statusCode),
                         willRetry: false
                     )
+                    // Accepted-ness is decided HERE, by the primary send, and
+                    // `open` returns NOW. The confirmation runs in an
+                    // UNSTRUCTURED task owned by this client (it inherits
+                    // task-locals such as the press id, but NOT caller
+                    // cancellation: the primary was accepted, the second
+                    // pulse is what the vendor app does). It can only add
+                    // journal records. Callers that want to give it a
+                    // bounded chance to finish (e.g. an App Intent about to
+                    // be suspended) use `waitForPendingConfirmation(upTo:)`.
+                    let confirmationRequest = request
+                    let confirmationTask = Task { [self] in
+                        await sendConfirmations(request: confirmationRequest, token: token, attempt: attempt)
+                    }
+                    confirmationBox.set(confirmationTask)
                     return
                 }
 
@@ -716,6 +804,84 @@ public struct GateClient: Sendable {
         throw lastError
     }
 
+    /// Waits for the confirmation send started by the most recent accepted
+    /// `open` -- but for at most `bound`, measured through the policy's
+    /// injectable `sleep` seam. Returns immediately when nothing is pending.
+    /// Returning at the bound does NOT cancel the confirmation: it keeps
+    /// running and still journals its record. Never throws.
+    public func waitForPendingConfirmation(upTo bound: Duration) async {
+        guard let task = confirmationBox.current(), bound > .zero else { return }
+        let gate = OneShotGate()
+        let sleep = retryPolicy.sleep
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            let waiter = Task {
+                await task.value
+                if gate.claim() { continuation.resume() }
+            }
+            let timer = Task {
+                try? await sleep(bound)
+                if gate.claim() { continuation.resume() }
+            }
+            gate.onWin {
+                timer.cancel()
+                _ = waiter // the waiter ends on its own when the task finishes
+            }
+        }
+    }
+
+    /// Test seam: the in-flight confirmation task, if any.
+    func pendingConfirmationTaskForTesting() -> Task<Void, Never>? { confirmationBox.current() }
+
+    /// Sends `retryPolicy.confirmationSends` identical PUTs after an accepted
+    /// primary send, each preceded by `confirmationDelay` (via the policy's
+    /// single `sleep` seam). Never throws and never changes `open`'s result:
+    /// every failure (HTTP status incl. 401, transport error, timeout) is
+    /// only reported to `attemptObserver` as `.confirmation`; nothing is
+    /// retried. Reuses the primary's already-resolved token (the request
+    /// carries its `Authorization` header) -- no second token resolution.
+    /// Runs in its own unstructured task (see `open`), so cancelling the
+    /// caller of `open` does not stop it.
+    private func sendConfirmations(request primary: URLRequest, token: String, attempt: Int) async {
+        guard retryPolicy.confirmationSends > 0 else { return }
+        for _ in 0..<retryPolicy.confirmationSends {
+            do {
+                try await retryPolicy.sleep(retryPolicy.confirmationDelay)
+            } catch {
+                return
+            }
+            if Task.isCancelled { return }
+
+            var request = primary
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "authorization")
+            request.timeoutInterval = retryPolicy.confirmationTimeout.timeInterval
+            let startedAt = now()
+            do {
+                let (_, response) = try await session.data(for: request)
+                if let http = response as? HTTPURLResponse {
+                    let ok = http.statusCode == 202 || http.statusCode == 200
+                    report(
+                        attempt: attempt,
+                        startedAt: startedAt,
+                        outcome: ok ? .success(status: http.statusCode) : .httpFailure(status: http.statusCode),
+                        willRetry: false,
+                        kind: .confirmation
+                    )
+                } else {
+                    report(attempt: attempt, startedAt: startedAt, outcome: .transportFailure(urlErrorCode: -1), willRetry: false, kind: .confirmation)
+                }
+            } catch {
+                if error is CancellationError || Task.isCancelled { return }
+                report(
+                    attempt: attempt,
+                    startedAt: startedAt,
+                    outcome: .transportFailure(urlErrorCode: (error as? URLError)?.code.rawValue ?? -1),
+                    willRetry: false,
+                    kind: .confirmation
+                )
+            }
+        }
+    }
+
     /// Single source of truth for "should this error be retried". Anything
     /// that decides retry-vs-fail for the HTTP request loop in `open` must
     /// go through this function rather than re-deriving retryability from
@@ -809,7 +975,8 @@ public struct GateClient: Sendable {
         attempt: Int,
         startedAt: Date,
         outcome: OpenAttemptOutcome,
-        willRetry: Bool
+        willRetry: Bool,
+        kind: OpenSendKind = .primary
     ) {
         guard let attemptObserver else { return }
         let elapsedSeconds = now().timeIntervalSince(startedAt)
@@ -830,7 +997,8 @@ public struct GateClient: Sendable {
                 // .withValue(...)` (see `OpenGateFlow.run`). `nil` when no
                 // press context is bound (e.g. `GateClient.open` called
                 // directly, as most tests in this file do).
-                pressId: OpenPressContext.pressId
+                pressId: OpenPressContext.pressId,
+                kind: kind
             )
         )
     }

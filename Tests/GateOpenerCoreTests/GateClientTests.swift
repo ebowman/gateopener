@@ -83,6 +83,9 @@ final class RequestScript: @unchecked Sendable {
     private var index = 0
     private(set) var requestCount = 0
     private(set) var lastPath: String?
+    /// Every request's path and HTTP method, in order (gateopener-pi0.5).
+    private(set) var paths: [String] = []
+    private(set) var methods: [String] = []
     /// The `authorization` header value seen on every request, in order.
     /// Lets tests prove a 401 retry used a DIFFERENT (freshly-resolved)
     /// bearer token than the first attempt, not just that a retry happened.
@@ -113,8 +116,10 @@ final class RequestScript: @unchecked Sendable {
     /// default so every pre-existing use of `RequestScript` is unaffected.
     var onRequest: (@Sendable () -> Void)?
 
-    func nextResponse(forPath path: String, authorizationHeader: String?, timeoutInterval: TimeInterval) -> ScriptedResponse {
+    func nextResponse(forPath path: String, authorizationHeader: String?, timeoutInterval: TimeInterval, method: String = "") -> ScriptedResponse {
         lock.lock()
+        paths.append(path)
+        methods.append(method)
         requestCount += 1
         lastPath = path
         authorizationHeaders.append(authorizationHeader ?? "")
@@ -167,7 +172,7 @@ final class SequencedStubURLProtocol: URLProtocol, @unchecked Sendable {
         }
 
         let authHeader = request.value(forHTTPHeaderField: "authorization")
-        let scripted = script.nextResponse(forPath: path, authorizationHeader: authHeader, timeoutInterval: request.timeoutInterval)
+        let scripted = script.nextResponse(forPath: path, authorizationHeader: authHeader, timeoutInterval: request.timeoutInterval, method: request.httpMethod ?? "")
 
         if let transportErrorCode = scripted.transportError {
             client?.urlProtocol(self, didFailWithError: URLError(transportErrorCode))
@@ -673,6 +678,7 @@ final class SleepRecorder: @unchecked Sendable {
         baseDelay: .milliseconds(400),
         maxTotalDelay: .seconds(6),
         requestTimeout: .seconds(3),
+        confirmationSends: 0,
         sleep: { duration in recorder.record(duration) }
     )
     let client = GateClient(session: session, tokenManager: tokenManager, retryPolicy: retryPolicy)
@@ -723,6 +729,7 @@ final class SleepRecorder: @unchecked Sendable {
         baseDelay: .milliseconds(1),
         maxTotalDelay: .milliseconds(1),
         requestTimeouts: [.seconds(3), .seconds(5), .seconds(8)],
+        confirmationSends: 0,
         sleep: { _ in }
     )
     let client = GateClient(session: session, tokenManager: tokenManager, retryPolicy: retryPolicy)
@@ -767,6 +774,7 @@ final class SleepRecorder: @unchecked Sendable {
         baseDelay: .milliseconds(400),
         maxTotalDelay: .seconds(2),
         requestTimeouts: [.seconds(3), .seconds(5), .seconds(8)],
+        confirmationSends: 0,
         sleep: { duration in recorder.record(duration) }
     )
     let client = GateClient(session: session, tokenManager: tokenManager, retryPolicy: retryPolicy)
@@ -805,6 +813,7 @@ final class SleepRecorder: @unchecked Sendable {
     let retryPolicy = RetryPolicy(
         maxAttempts: 3,
         requestTimeout: .seconds(5),
+        confirmationSends: 0,
         sleep: { _ in }
     )
     #expect(retryPolicy.requestTimeouts == [.seconds(5)])
@@ -834,6 +843,7 @@ final class SleepRecorder: @unchecked Sendable {
     let retryPolicy = RetryPolicy(
         maxAttempts: 1,
         requestTimeouts: [.milliseconds(2500)],
+        confirmationSends: 0,
         sleep: { _ in }
     )
     let client = GateClient(session: session, tokenManager: tokenManager, retryPolicy: retryPolicy)
@@ -1253,6 +1263,7 @@ final class GateClientTestsLockedCounter: @unchecked Sendable {
         baseDelay: .milliseconds(1),
         maxTotalDelay: .seconds(10),
         requestTimeouts: [.seconds(3)],
+        confirmationSends: 0,
         sleep: { _ in clock.advance(by: 5.0) }
     )
 
@@ -1313,6 +1324,7 @@ final class GateClientTestsLockedCounter: @unchecked Sendable {
         baseDelay: .milliseconds(1),
         maxTotalDelay: .seconds(10),
         requestTimeouts: [.seconds(3)],
+        confirmationSends: 0,
         sleep: { _ in throw CancellationError() }
     )
 

@@ -41,6 +41,22 @@ import Testing
     #expect(log.snapshot()[0].message == "open succeeded")
 }
 
+/// Breaks if the "confirmation: " prefix or the Accepted/HTTP wording changes
+/// (gateopener-pi0.5; mirrored by the iOS Open history text).
+@Test func logOpenConfirmationRecordsPrefixedMessages() {
+    let log = EventLog()
+    log.logOpenConfirmation(outcome: .success(status: 202))
+    log.logOpenConfirmation(outcome: .httpFailure(status: 500))
+    log.logOpenConfirmation(outcome: .transportFailure(urlErrorCode: -1001))
+    let entries = log.snapshot()
+    #expect(entries.map(\.message) == [
+        "confirmation: Accepted (202)",
+        "confirmation: HTTP 500",
+        "confirmation: failed (transport error)",
+    ])
+    #expect(entries.map(\.level) == [.info, .warning, .warning])
+}
+
 @Test func logTokenRefreshedRecordsLifetimeOnly() {
     let log = EventLog()
     log.logTokenRefreshed(expiresIn: 604800)

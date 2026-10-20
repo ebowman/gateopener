@@ -160,7 +160,8 @@ public struct OpenGateFlow: Sendable {
         reachabilityDetail: String = "",
         pressSource: String = "intent",
         pressProcess: String = "?",
-        pressAppVersion: String = ""
+        pressAppVersion: String = "",
+        awaitConfirmation: @escaping @Sendable (Duration) async -> Void = { _ in }
     ) async -> Outcome {
         func emit(_ phase: OpenPressPhase) {
             guard let journal else { return }
@@ -311,7 +312,42 @@ public struct OpenGateFlow: Sendable {
         } else {
             emit(.finished(outcome: outcome.dialog))
         }
+
+        // gateopener-pi0.5: the result is already decided and journaled; give
+        // the client's background confirmation send a bounded chance to
+        // finish before the host (App Intent) is suspended. Only after
+        // `.opened`; never changes the outcome; bounded here (via the
+        // injected `sleep`) so a misbehaving closure cannot push the press
+        // past its deadline.
+        if outcome == .opened {
+            let bound = min(Duration.seconds(3.4), remaining())
+            if bound > .zero {
+                await Self.boundedAwait(bound: bound, sleep: sleep) { await awaitConfirmation(bound) }
+            }
+        }
         return outcome
+    }
+
+    /// Runs `body`, resuming the caller as soon as either `body` finishes or
+    /// `sleep(bound)` returns/throws -- whichever is first. The loser is not
+    /// awaited (`body` may keep running; the timer is cancelled).
+    private static func boundedAwait(
+        bound: Duration,
+        sleep: @escaping @Sendable (Duration) async throws -> Void,
+        body: @escaping @Sendable () async -> Void
+    ) async {
+        let gate = RaceGate()
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            _ = Task {
+                await body()
+                if gate.claim() { continuation.resume() }
+            }
+            let timer = Task {
+                try? await sleep(bound)
+                if gate.claim() { continuation.resume() }
+            }
+            gate.onWin { timer.cancel() }
+        }
     }
 
     /// Whether a failure message produced by `GateController.performOpen()`

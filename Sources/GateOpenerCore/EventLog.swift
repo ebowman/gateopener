@@ -134,6 +134,22 @@ public final class EventLog: @unchecked Sendable {
         append(level: .warning, message: "attempt \(attempt) of \(total) failed (\(reason.logText))")
     }
 
+    /// Records the post-accept confirmation send (gateopener-pi0.5). Message
+    /// text mirrors the iOS Open history: "confirmation: Accepted (202)" /
+    /// "confirmation: HTTP 500" / "confirmation: failed (transport error)".
+    /// Takes only the closed `OpenAttemptOutcome` (status / URLError code),
+    /// never a body or header.
+    public func logOpenConfirmation(outcome: OpenAttemptOutcome) {
+        switch outcome {
+        case .success(let status):
+            append(level: .info, message: "confirmation: Accepted (\(status))")
+        case .httpFailure(let status):
+            append(level: .warning, message: "confirmation: HTTP \(status)")
+        case .transportFailure, .tokenFailure:
+            append(level: .warning, message: "confirmation: failed (\(OpenFailureReason.transport.logText))")
+        }
+    }
+
     /// Records that the open command succeeded.
     public func logOpenSucceeded() {
         append(level: .info, message: "open succeeded")

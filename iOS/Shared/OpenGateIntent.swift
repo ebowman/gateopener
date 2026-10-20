@@ -183,7 +183,12 @@ public struct OpenGateIntent: AppIntent {
             reachabilityDetail: reachability.pathDescription,
             pressSource: source,
             pressProcess: process,
-            pressAppVersion: appVersion
+            pressAppVersion: appVersion,
+            // gateopener-pi0.5: after reporting `.opened`, give the client's
+            // background confirmation send up to min(3.4s, remaining
+            // deadline); the flow bounds this itself and never lets it
+            // change the outcome.
+            awaitConfirmation: { await environment.gateClient.waitForPendingConfirmation(upTo: $0) }
         )
 
         // Result notification. Budget: flow deadline 27s + at most

@@ -156,7 +156,7 @@ margin on weak Wi-Fi/cellular for a flat timeout; retrying is safe here since
 the actuator is momentary and the official app itself sends the open command
 twice. The first attempt's timeout must never be shrunk below 3s. Worst case:
 `3 + 5 + 8 = 16s` of requests plus `<= 2s` of bounded backoff sleep = `<= 18s`
-total, comfortably under `OpenGateFlow`'s 25s deadline:
+total, comfortably under `OpenGateFlow`'s 27s deadline:
 
 - **Retried**: any HTTP 5xx, HTTP 429, and transport-level (network) errors.
 - **Not retried**: other 4xx statuses (e.g. 400, 403) — these indicate a
@@ -169,6 +169,8 @@ total, comfortably under `OpenGateFlow`'s 25s deadline:
   resolution, not during the open call itself) are never retried — retrying
   a wrong password against a live account-security-sensitive service is
   actively harmful and could contribute to a lockout.
+
+**Confirmation send** (gateopener-pi0.5): after the first accepted (202/200) primary send, `open` returns immediately (accepted-ness is decided by that first send alone) and a background task owned by `GateClient` waits `confirmationDelay` (400ms, via the same injectable `sleep`) and sends ONE more identical `PUT .../power {"value":true}` with a 3s timeout (`confirmationSends = 1`, `confirmationTimeout`), reusing the same access token. It is journaled as a `confirmation` record and NEVER changes the result: a 500, 401, transport error or timeout on it is journaled only (no retry, no throw), and cancelling the caller of `open` does not stop it. It is not on the press critical path: after reporting `.opened`, `OpenGateFlow` (App Intent) grants it up to `min(3.4s, remaining 27s deadline)` via `GateClient.waitForPendingConfirmation(upTo:)` (bounded, never cancels it, never changes the outcome); in the long-lived macOS app it simply completes in the background. `confirmationSends = 0` disables it.
 
 ### Token endpoints
 
@@ -183,7 +185,7 @@ exactly one retry, after a fixed 500ms delay, on transport failure or HTTP
 `wrong_username_or_password` body regardless of status. The credential-
 submitting `/o-auth-2/auth` POST is never retried under any circumstance.
 Worst case for a token call needing its one retry: `8s + 0.5s + 8s = 16.5s`,
-still comfortably under `OpenGateFlow`'s 25s deadline.
+still comfortably under `OpenGateFlow`'s 27s deadline.
 
 ## Live door-camera video (WebRTC)
 
