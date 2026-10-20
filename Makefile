@@ -1,4 +1,4 @@
-.PHONY: build test run clean release xcodeproj ios-build core-watch-build ios-sim-build ios-sim-run ios-test testflight-archive video-diag
+.PHONY: build test run clean release xcodeproj ios-build watch-build core-watch-build ios-sim-build ios-sim-run ios-test testflight-archive video-diag
 
 build:
 	swift build
@@ -33,6 +33,13 @@ core-watch-build:
 ios-build: xcodeproj
 	xcodebuild -project GateOpener.xcodeproj -scheme GateOpener-iOS \
 		-destination 'generic/platform=iOS Simulator' \
+		-derivedDataPath .build/xcode build CODE_SIGNING_ALLOWED=NO
+
+# Builds the watch app target for the watchOS Simulator, without code
+# signing (bead gateopener-3d7.2).
+watch-build: xcodeproj
+	xcodebuild -project GateOpener.xcodeproj -scheme GateOpener-Watch \
+		-destination 'generic/platform=watchOS Simulator' \
 		-derivedDataPath .build/xcode build CODE_SIGNING_ALLOWED=NO
 
 # Builds the iOS app SIGNED for a concrete simulator device, so the
