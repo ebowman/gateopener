@@ -23,10 +23,11 @@ struct GateOpenerWatchApp: App {
             credentialStore: environment.credentialStore
         ) { [weak controller = environment.controller, tokenManager = environment.tokenManager, appSettings = environment.appSettings] message in
             Task { @MainActor in
-                if case .signedOut = message {
+                if WatchProvisioningReaction.shouldInvalidateCachedToken(for: message) {
                     // Drop the in-memory access token (actor method, hence
-                    // the await) so a signed-out watch can't keep opening
-                    // with a cached one; done before re-evaluating state.
+                    // the await): apply(.provision) deletes stored tokens but
+                    // the cache would keep opening as the old account, and a
+                    // signed-out watch must not keep a cached one either.
                     await tokenManager.invalidate()
                 }
                 controller?.refreshStateFromStores()

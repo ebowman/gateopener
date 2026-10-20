@@ -52,3 +52,17 @@ public struct WatchProvisioningApplier {
         }
     }
 }
+
+/// What the watch app does after a provisioning message is applied.
+public enum WatchProvisioningReaction {
+    /// True for every message kind. `apply(.provision)` deletes the STORED
+    /// tokens (and `.signedOut` clears everything), but `TokenManager` keeps
+    /// an in-memory cached access token; unless it is invalidated too, a
+    /// re-provision with a different account would keep opening the gate
+    /// with the old account's token until it expires.
+    public static func shouldInvalidateCachedToken(for message: WatchProvisioningMessage) -> Bool {
+        switch message {
+        case .provision, .signedOut: return true
+        }
+    }
+}

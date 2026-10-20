@@ -101,4 +101,14 @@ struct WatchProvisioningApplierTests {
         #expect(a.handle(context: ctx) != nil)
         #expect(s.watchProvisioningAppliedAt == t0)
     }
+
+    // REMOVAL: returning false for .provision lets a re-provisioned watch keep the old account's cached token.
+    @Test func provisionInvalidatesCachedToken() {
+        #expect(WatchProvisioningReaction.shouldInvalidateCachedToken(for: provision(t0)))
+    }
+
+    // REMOVAL: returning false for .signedOut lets a signed-out watch keep opening with a cached token.
+    @Test func signedOutInvalidatesCachedToken() {
+        #expect(WatchProvisioningReaction.shouldInvalidateCachedToken(for: .signedOut(issuedAt: t0)))
+    }
 }
