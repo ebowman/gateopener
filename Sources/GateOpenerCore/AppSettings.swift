@@ -31,6 +31,7 @@ public final class AppSettings: @unchecked Sendable {
         static let autoStartDoorVideoOnLaunch = "ie.boboco.GateOpener.autoStartDoorVideoOnLaunch"
         static let cachedCameraEndpointId = "ie.boboco.GateOpener.cachedCameraEndpointId"
         static let notifyOnOpenSuccess = "ie.boboco.GateOpener.notifyOnOpenSuccess"
+        static let watchProvisioningAppliedAt = "ie.boboco.GateOpener.watchProvisioningAppliedAt"
 
         /// All keys owned by `AppSettings`. Used by `reset()` so unrelated
         /// UserDefaults keys (e.g. from other parts of the app, or the test
@@ -39,6 +40,7 @@ public final class AppSettings: @unchecked Sendable {
             aptId, selectedEndpointId, selectedEndpointName, lastDiscoveryDate, shortcutPreference,
             showOpenConfirmationOverlay, autoShowDoorVideoOnOpen, cachedGates, allowOpenWhileLocked,
             autoStartDoorVideoOnLaunch, cachedCameraEndpointId, notifyOnOpenSuccess,
+            watchProvisioningAppliedAt,
         ]
     }
 
@@ -82,6 +84,14 @@ public final class AppSettings: @unchecked Sendable {
     public var lastDiscoveryDate: Date? {
         get { defaults.object(forKey: Keys.lastDiscoveryDate) as? Date }
         set { defaults.set(newValue, forKey: Keys.lastDiscoveryDate) }
+    }
+
+    /// The `issuedAt` of the last Watch provisioning message applied on this
+    /// device (watch side). Guards against stale/out-of-order application
+    /// contexts. NOT a secret.
+    public var watchProvisioningAppliedAt: Date? {
+        get { defaults.object(forKey: Keys.watchProvisioningAppliedAt) as? Date }
+        set { defaults.set(newValue, forKey: Keys.watchProvisioningAppliedAt) }
     }
 
     /// The user's global-hotkey preference: unset (use the default chord),
