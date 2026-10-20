@@ -446,6 +446,24 @@ public final class GateController {
         }
     }
 
+    /// Re-evaluates `.needsSetup` vs `.idle` from the stores. The decision is
+    /// otherwise made only in `init`; call this after something else (e.g. the
+    /// watch provisioning receiver) changed credentials or settings. A no-op
+    /// in every state other than `.needsSetup`/`.idle`, and when the computed
+    /// state equals the current one.
+    public func refreshStateFromStores() {
+        guard state == .needsSetup || state == .idle else { return }
+        let hasCredentials = (try? credentialStore.loadCredentials()) != nil
+        let target: GateState = (hasCredentials && appSettings.isConfigured) ? .idle : .needsSetup
+        guard target != state else { return }
+        // Assigned directly (not via `transition(to:)`): both targets are
+        // resting states, and `transition` arms the auto-reset timer, which
+        // would flip a credential-less `.needsSetup` back to `.idle`. The
+        // `state` didSet still fires `onStateChange`.
+        cancelPendingReset()
+        state = target
+    }
+
     private func resetToIdleIfStillShowing(_ expected: GateState) {
         guard state == expected else { return }
         state = .idle

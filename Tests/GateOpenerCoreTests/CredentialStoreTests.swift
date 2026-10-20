@@ -36,9 +36,13 @@ final class MockCredentialStore: CredentialStoring, @unchecked Sendable {
     /// failure).
     var saveTokensError: Error?
 
+    /// When set, `saveCredentials` throws this error instead of persisting.
+    var saveCredentialsError: Error?
+
     func saveCredentials(username: String, password: String) throws {
         lock.lock()
         defer { lock.unlock() }
+        if let saveCredentialsError { throw saveCredentialsError }
         saveCredentialsCallCount += 1
         _credentials = (username: username, password: password)
     }

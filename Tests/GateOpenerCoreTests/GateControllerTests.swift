@@ -991,3 +991,57 @@ private func waitUntilDeadline(_ predicate: () -> Bool) async {
     #expect(gateOpening.observedPressIds.count == 1)
     #expect(gateOpening.observedPressIds.first! == nil)
 }
+
+// MARK: - refreshStateFromStores (bead gateopener-3d7.6)
+
+// REMOVAL: without the method (or its transition) state stays .needsSetup / onStateChange never fires.
+@Test @MainActor func refreshStateFromStoresMovesNeedsSetupToIdle() throws {
+    let (controller, _, _, store, settings) = makeController(preconfigured: false)
+    #expect(controller.state == .needsSetup)
+    var observed: [GateState] = []
+    controller.onStateChange = { observed.append($0) }
+    try store.saveCredentials(username: "alice", password: "s3cret")
+    settings.selectedEndpointId = sampleEndpointLockGeneric.endpointId
+    controller.refreshStateFromStores()
+    #expect(controller.state == .idle)
+    #expect(observed == [.idle])
+}
+
+// REMOVAL: if only needsSetup->idle were handled, a tombstone would leave a stale .idle.
+@Test @MainActor func refreshStateFromStoresMovesIdleToNeedsSetupAfterCredentialDelete() throws {
+    let (controller, _, _, store, _) = makeController()
+    #expect(controller.state == .idle)
+    try store.deleteCredentials()
+    controller.refreshStateFromStores()
+    #expect(controller.state == .needsSetup)
+}
+
+// REMOVAL: dropping the state guard would clobber an in-flight .opening with .needsSetup.
+@Test @MainActor func refreshStateFromStoresDoesNotTouchOpening() async throws {
+    let gate = MockGateOpening()
+    gate.gateOpenCalls = true
+    let (controller, _, _, store, _) = makeController(gateOpening: gate)
+    let task = Task { await controller.openGate() }
+    while gate.openCallCount == 0 { await Task.yield() }
+    #expect(controller.state == .opening)
+    try store.deleteCredentials()
+    controller.refreshStateFromStores()
+    #expect(controller.state == .opening)
+    gate.releaseOpen()
+    await task.value
+}
+
+// REMOVAL: if the refresh goes through transition(to:), the auto-reset timer flips .needsSetup back to .idle (with no credentials) after autoResetDelay.
+@Test @MainActor func refreshStateFromStoresNeedsSetupSticksAfterAutoResetDelay() async throws {
+    let sleep = GatedSleep()
+    let (controller, _, _, store, _) = makeController(sleepFn: sleep.fn)
+    #expect(controller.state == .idle)
+    try store.deleteCredentials()
+    controller.refreshStateFromStores()
+    #expect(controller.state == .needsSetup)
+    // Give an (incorrectly) armed reset task the chance to start sleeping.
+    for _ in 0..<50 where sleep.waitingCount() == 0 { await Task.yield() }
+    sleep.advance()
+    for _ in 0..<50 { await Task.yield() }
+    #expect(controller.state == .needsSetup)
+}
