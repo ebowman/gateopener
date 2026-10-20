@@ -210,6 +210,9 @@ targets:
     dependencies:
       - package: GateOpenerCore
         product: GateOpenerCore
+      # Smart Stack / complications widget extension (bead gateopener-3d7.9).
+      - target: GateOpenerWatchWidget
+        embed: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: ie.boboco.GateOpener.watchkitapp
@@ -218,6 +221,39 @@ targets:
         CODE_SIGN_ENTITLEMENTS: Watch/App/GateOpenerWatch.entitlements
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        SKIP_INSTALL: YES
+        TARGETED_DEVICE_FAMILY: "4"
+      configs:
+        debug:
+          CODE_SIGN_IDENTITY: "Apple Development"
+
+  # watchOS widget extension (bead gateopener-3d7.9): Smart Stack interactive
+  # Open button + circular/corner/inline complications. Reuses the shared
+  # provider/views from iOS/Shared. Deliberately NOT given
+  # GateControllerObservable/GateOpenerShortcuts or gate-failed.caf: the
+  # extension has no WCSession and reads only app-group defaults + keychain
+  # group. Explicit Info.plist for the same reason as GateOpenerWidget.
+  GateOpenerWatchWidget:
+    type: app-extension
+    platform: watchOS
+    deploymentTarget: "11.0"
+    sources:
+      - path: Watch/Widget
+        excludes:
+          - "*.plist"
+          - "*.entitlements"
+      - path: iOS/Shared
+        excludes:
+          - "README.md"
+    dependencies:
+      - package: GateOpenerCore
+        product: GateOpenerCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ie.boboco.GateOpener.watchkitapp.widget
+        PRODUCT_NAME: GateOpenerWatchWidget
+        INFOPLIST_FILE: Watch/Widget/Info.plist
+        CODE_SIGN_ENTITLEMENTS: Watch/Widget/GateOpenerWatchWidget.entitlements
         SKIP_INSTALL: YES
         TARGETED_DEVICE_FAMILY: "4"
       configs:

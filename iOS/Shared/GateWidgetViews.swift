@@ -101,6 +101,12 @@ public struct GateWidgetEntryView: View {
                 accessoryCircularBody
             case .accessoryRectangular:
                 accessoryRectangularBody
+            #if os(watchOS)
+            case .accessoryCorner:
+                accessoryCornerBody
+            case .accessoryInline:
+                accessoryInlineBody
+            #endif
             case .systemMedium:
                 systemMediumBody
             default:
@@ -223,6 +229,15 @@ public struct GateWidgetEntryView: View {
     // MARK: - accessoryCircular
 
     private var accessoryCircularBody: some View {
+        #if os(watchOS)
+        // Watch complications are non-interactive (bead gateopener-3d7.9);
+        // the whole face tap goes through `.widgetURL` on `body`.
+        Image(systemName: GateSymbol.name)
+            .foregroundStyle(tint)
+            .containerBackground(for: .widget) {
+                Color.clear
+            }
+        #else
         Button(intent: OpenGateIntent()) {
             Image(systemName: GateSymbol.name)
         }
@@ -230,11 +245,32 @@ public struct GateWidgetEntryView: View {
         .containerBackground(for: .widget) {
             Color.clear
         }
+        #endif
     }
 
     // MARK: - accessoryRectangular
 
     private var accessoryRectangularBody: some View {
+        #if os(watchOS)
+        // Smart Stack: the interactive Open button is the primary element
+        // (watchOS 11 interactive widgets, bead gateopener-3d7.9).
+        Button(intent: OpenGateIntent()) {
+            rectangularContent
+        }
+        .buttonStyle(.plain)
+        .disabled(isNeedsSetup)
+        .containerBackground(for: .widget) {
+            Color.clear
+        }
+        #else
+        rectangularContent
+            .containerBackground(for: .widget) {
+                Color.clear
+            }
+        #endif
+    }
+
+    private var rectangularContent: some View {
         HStack(spacing: 6) {
             Image(systemName: GateSymbol.name)
                 .foregroundStyle(tint)
@@ -248,10 +284,27 @@ public struct GateWidgetEntryView: View {
                     .lineLimit(1)
             }
         }
-        .containerBackground(for: .widget) {
-            Color.clear
-        }
     }
+
+    #if os(watchOS)
+    // MARK: - accessoryCorner (watchOS only)
+
+    private var accessoryCornerBody: some View {
+        Image(systemName: GateSymbol.name)
+            .font(.title3)
+            .foregroundStyle(tint)
+            .widgetLabel(gateDisplayName)
+            .containerBackground(for: .widget) {
+                Color.clear
+            }
+    }
+
+    // MARK: - accessoryInline (watchOS only)
+
+    private var accessoryInlineBody: some View {
+        Label(isNeedsSetup ? outcomeText : "\(gateDisplayName): \(outcomeText)", systemImage: GateSymbol.name)
+    }
+    #endif
 }
 
 /// Sample entries covering every phase, for both `#Preview` (in

@@ -52,6 +52,9 @@ struct GateOpenerWatchApp: App {
                 // `init`, so WCSession activation never races App setup.
                 // `start()` is idempotent.
                 .task { receiver.start() }
+                // `gateopener://main` from a complication tap: nothing to do
+                // beyond showing the main view (bead gateopener-3d7.9).
+                .onOpenURL { _ in }
         }
     }
 }
