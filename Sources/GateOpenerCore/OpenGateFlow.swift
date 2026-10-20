@@ -34,6 +34,13 @@ public struct OpenGateFlow: Sendable {
         /// `open()` did not complete before `timeout` elapsed.
         case timedOut
 
+        /// Shared wording for "Comelit's cloud accepted the open command"
+        /// (HTTP 202). There is no read-state endpoint, so nothing can claim
+        /// the gate actually moved. Used for the Siri dialog AND the in-app
+        /// press journal's `.finished(outcome:)` text (which
+        /// `OpenHistoryView.resultBadge` matches).
+        public static let acceptedDialog = "Open command accepted"
+
         /// The user-facing dialog string for this outcome, returned verbatim
         /// by `OpenGateIntent.perform()` as its `IntentDialog`.
         public var dialog: String {
@@ -41,7 +48,7 @@ public struct OpenGateFlow: Sendable {
             case .needsSetup:
                 return "Sign in to GateOpener first"
             case .opened:
-                return "Gate opened"
+                return Self.acceptedDialog
             case .failed(let message):
                 return message
             case .timedOut:

@@ -35,14 +35,14 @@ struct OpenGateButtonLabelTests {
         #expect(MainView.primaryLabel(for: .opening) == "Opening…")
     }
 
-    /// `.succeeded` reads as "Opened" regardless of the associated
+    /// `.succeeded` reads as "Accepted" regardless of the associated
     /// timestamp — the date is surfaced via `statusText`, not this label.
     ///
     /// MUTATION CHECK: if `primaryLabel` accidentally formatted the
     /// associated `Date` into the string, this exact-match `#expect` would
-    /// fail (the label would contain a time, not just "Opened").
-    @Test func succeededLabelIsOpened() {
-        #expect(MainView.primaryLabel(for: .succeeded(at: Date())) == "Opened")
+    /// fail (the label would contain a time, not just "Accepted").
+    @Test func succeededLabelIsAccepted() {
+        #expect(MainView.primaryLabel(for: .succeeded(at: Date())) == "Accepted")
     }
 
     /// `.failed` reads as "Try Again" regardless of the associated error

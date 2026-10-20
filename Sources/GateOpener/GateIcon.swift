@@ -40,7 +40,7 @@ enum GateIcon {
         case .opening, .queued:
             return stillTryingAfterEscalation ? "GateOpener — still trying…" : "GateOpener — opening…"
         case .succeeded:
-            return "GateOpener — gate opened"
+            return "GateOpener — open command accepted"
         case .failed(let message):
             return "GateOpener — \(message)"
         }

@@ -144,6 +144,11 @@ a supported operation for this device class, and GateOpener never sends it.
 Success is HTTP 202 (the documented code) or HTTP 200 (accepted
 defensively, observed occasionally in practice).
 
+A 202 means Comelit's cloud *accepted* the command; it is acceptance, not
+execution. There is no read-state endpoint (a GET on the endpoint is 404), so
+the client can never confirm the gate moved. User-facing text therefore says
+"Open command accepted" / "Accepted", never "Gate opened".
+
 ### Retry behavior
 
 The live API is not perfectly reliable, so `open` retries with bounded

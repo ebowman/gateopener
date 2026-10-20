@@ -252,8 +252,8 @@ public final class AppSettings: @unchecked Sendable {
         set { defaults.set(newValue, forKey: Keys.autoStartDoorVideoOnLaunch) }
     }
 
-    /// Whether a "Gate opened" notification is posted after a successful
-    /// open (iOS result notifications, bead gateopener-6qa.3). Failures are
+    /// Whether an "Open command accepted" notification is posted after the
+    /// cloud accepted an open (iOS result notifications, bead gateopener-6qa.3). Failures are
     /// always announced regardless. Defaults to `true`.
     public var notifyOnOpenSuccess: Bool {
         get {

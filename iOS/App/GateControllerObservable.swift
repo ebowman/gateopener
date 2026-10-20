@@ -190,7 +190,7 @@ final class GateControllerObservable {
         case .succeeded:
             inFlightPress = nil
             emit(
-                .finished(outcome: "Gate opened"),
+                .finished(outcome: OpenGateFlow.Outcome.acceptedDialog),
                 pressId: press.pressId,
                 startedAt: press.startedAt,
                 source: "app"

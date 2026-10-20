@@ -87,7 +87,8 @@ struct OpenGateFlowTests {
         )
 
         #expect(outcome == .opened)
-        #expect(outcome.dialog == "Gate opened")
+        #expect(outcome.dialog == "Open command accepted")
+        #expect(outcome.dialog == OpenGateFlow.Outcome.acceptedDialog)
         #expect(recorder.phases == [.opening, .succeeded])
         #expect(store.read()?.phase == .succeeded)
     }
@@ -299,7 +300,7 @@ struct OpenGateFlowTests {
             .reachability(isReachable: true, detail: ""),
             .openStarted,
             .attempt(number: 1),
-            .finished(outcome: "Gate opened"),
+            .finished(outcome: OpenGateFlow.Outcome.acceptedDialog),
         ])
     }
 
@@ -563,7 +564,7 @@ struct OpenGateFlowTests {
             .waitingForNetwork,
             .openStarted,
             .attempt(number: 1),
-            .finished(outcome: "Gate opened"),
+            .finished(outcome: OpenGateFlow.Outcome.acceptedDialog),
         ])
     }
 

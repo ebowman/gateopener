@@ -145,7 +145,7 @@ public struct GateWidgetEntryView: View {
         case .opening:
             return "Opening…"
         case .succeeded:
-            return "Opened \(Self.timeFormatter.string(from: entry.date))"
+            return "Accepted \(Self.timeFormatter.string(from: entry.date))"
         case .failed:
             return "Failed: \(entry.message ?? "Unknown error")"
         }

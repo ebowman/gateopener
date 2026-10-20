@@ -61,6 +61,9 @@ struct OpenHistoryView: View {
                     description: Text("Opens from the app, widget and Action Button appear here.")
                 )
             } else {
+                Text(Self.acceptedFooter)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
                 ForEach(groups) { group in
                     Section {
                         DisclosureGroup {
@@ -256,12 +259,15 @@ struct OpenHistoryView: View {
         }
     }
 
+    /// One-line footer shown above the history groups.
+    nonisolated static let acceptedFooter = "Accepted means Comelit's cloud took the command; it does not confirm the gate moved."
+
     /// Result badge precedence for a press-backed group: `.finished` beats
     /// `.timedOut` beats "no terminal phase yet" (`Unfinished`) — though in
     /// practice a press only ever emits ONE of `.finished`/`.timedOut`, this
     /// searches for `.finished` first to match the bead's documented
     /// precedence. A legacy (pressId-less) group has no phases at all, so it
-    /// keeps the OLD attempt-outcome-scan logic (Opened if any attempt in
+    /// keeps the OLD attempt-outcome-scan logic (Accepted if any attempt in
     /// the group succeeded, else Failed).
     nonisolated static func resultBadge(for group: Group) -> String {
         guard group.source != nil else {
@@ -270,7 +276,9 @@ struct OpenHistoryView: View {
 
         for entry in group.entries {
             guard case .press(let press) = entry, case .finished(let outcome) = press.phase else { continue }
-            if outcome == "Gate opened" { return "Opened" }
+            // "Gate opened" is the pre-pi0.4 literal still present in
+            // journal lines already on disk.
+            if outcome == OpenGateFlow.Outcome.acceptedDialog || outcome == "Gate opened" { return "Accepted" }
             if outcome == "No network" { return "No network" }
             return "Failed: \(outcome)"
         }
@@ -286,7 +294,7 @@ struct OpenHistoryView: View {
             if case .attempt(let record) = entry { return record }
             return nil
         }
-        return attempts.contains { if case .success = $0.outcome { return true } else { return false } } ? "Opened" : "Failed"
+        return attempts.contains { if case .success = $0.outcome { return true } else { return false } } ? "Accepted" : "Failed"
     }
 
     /// Full phase/attempt timeline for one press group, oldest first, each
@@ -388,13 +396,13 @@ struct OpenHistoryView: View {
         return String(format: "+%.1f s", seconds)
     }
 
-    /// success(s) → "Opened (s)"; httpFailure(s) → "HTTP s"; transportFailure
+    /// success(s) → "Accepted (s)"; httpFailure(s) → "HTTP s"; transportFailure
     /// mapped per common `URLError` codes; tokenFailure(d) → "Sign-in/token
     /// failure (d)".
     nonisolated static func outcomeText(for outcome: OpenAttemptOutcome) -> String {
         switch outcome {
         case .success(let status):
-            return "Opened (\(status))"
+            return "Accepted (\(status))"
         case .httpFailure(let status):
             return "HTTP \(status)"
         case .transportFailure(let code):

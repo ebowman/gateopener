@@ -54,10 +54,10 @@ struct OpenHistoryViewTests {
 
     // MARK: - outcomeText(for:)
 
-    /// MUTATION CHECK: changing `"Opened (\(status))"` to omit the status
-    /// (e.g. just `"Opened"`) makes this fail.
+    /// MUTATION CHECK: changing `"Accepted (\(status))"` to omit the status
+    /// (e.g. just `"Accepted"`) makes this fail.
     @Test func outcomeTextSuccess() {
-        #expect(OpenHistoryView.outcomeText(for: .success(status: 202)) == "Opened (202)")
+        #expect(OpenHistoryView.outcomeText(for: .success(status: 202)) == "Accepted (202)")
     }
 
     /// MUTATION CHECK: swapping `"HTTP \(status)"` for a different prefix
@@ -176,14 +176,14 @@ struct OpenHistoryViewTests {
     @Test func groupsFromSinglePressStartedAndFinished() {
         let pressId = UUID()
         let started = makePress(pressId: pressId, timestamp: baseTime, phase: .started, elapsedMilliseconds: 0)
-        let finished = makePress(pressId: pressId, timestamp: baseTime.addingTimeInterval(2), phase: .finished(outcome: "Gate opened"), elapsedMilliseconds: 2_000)
+        let finished = makePress(pressId: pressId, timestamp: baseTime.addingTimeInterval(2), phase: .finished(outcome: OpenGateFlow.Outcome.acceptedDialog), elapsedMilliseconds: 2_000)
 
         let groups = OpenHistoryView.groups(from: [.press(started), .press(finished)])
         #expect(groups.count == 1)
         #expect(groups[0].id == pressId.uuidString)
         #expect(groups[0].time == baseTime)
         #expect(groups[0].sourceLabel == "Action Button / Control")
-        #expect(groups[0].resultBadge == "Opened")
+        #expect(groups[0].resultBadge == "Accepted")
     }
 
     /// Mixed press phases AND an attempt record sharing the same `pressId`
@@ -193,7 +193,7 @@ struct OpenHistoryViewTests {
         let started = makePress(pressId: pressId, timestamp: baseTime, phase: .started, elapsedMilliseconds: 0)
         let openStarted = makePress(pressId: pressId, timestamp: baseTime.addingTimeInterval(1), phase: .openStarted, elapsedMilliseconds: 1_000)
         let attempt = makeAttempt(attempt: 1, maxAttempts: 3, outcome: .success(status: 202), timestamp: baseTime.addingTimeInterval(1.5), pressId: pressId)
-        let finished = makePress(pressId: pressId, timestamp: baseTime.addingTimeInterval(2), phase: .finished(outcome: "Gate opened"), elapsedMilliseconds: 2_000)
+        let finished = makePress(pressId: pressId, timestamp: baseTime.addingTimeInterval(2), phase: .finished(outcome: OpenGateFlow.Outcome.acceptedDialog), elapsedMilliseconds: 2_000)
 
         let groups = OpenHistoryView.groups(from: [.press(started), .press(openStarted), .attempt(attempt), .press(finished)])
         #expect(groups.count == 1)
@@ -211,12 +211,12 @@ struct OpenHistoryViewTests {
         let pressId = UUID()
         let started = makePress(pressId: pressId, timestamp: baseTime, source: "app", phase: .started, elapsedMilliseconds: 0)
         let attempt = makeAttempt(attempt: 1, maxAttempts: 3, outcome: .success(status: 202), timestamp: baseTime.addingTimeInterval(0.5), pressId: pressId)
-        let finished = makePress(pressId: pressId, timestamp: baseTime.addingTimeInterval(1), source: "app", phase: .finished(outcome: "Gate opened"), elapsedMilliseconds: 1_000)
+        let finished = makePress(pressId: pressId, timestamp: baseTime.addingTimeInterval(1), source: "app", phase: .finished(outcome: OpenGateFlow.Outcome.acceptedDialog), elapsedMilliseconds: 1_000)
 
         let groups = OpenHistoryView.groups(from: [.press(started), .attempt(attempt), .press(finished)])
         #expect(groups.count == 1)
         #expect(groups[0].sourceLabel == "App")
-        #expect(groups[0].resultBadge == "Opened")
+        #expect(groups[0].resultBadge == "Accepted")
         #expect(!groups.contains { $0.sourceLabel == "Unknown (older build)" })
         let lines = OpenHistoryView.timelineLines(for: groups[0])
         #expect(lines.contains { $0.contains("attempt 1/3") })
@@ -246,7 +246,7 @@ struct OpenHistoryViewTests {
         let pressB = UUID()
         let startedA = makePress(pressId: pressA, timestamp: baseTime, phase: .started, elapsedMilliseconds: 0)
         let startedB = makePress(pressId: pressB, timestamp: baseTime.addingTimeInterval(0.1), phase: .started, elapsedMilliseconds: 0)
-        let finishedA = makePress(pressId: pressA, timestamp: baseTime.addingTimeInterval(2), phase: .finished(outcome: "Gate opened"), elapsedMilliseconds: 2_000)
+        let finishedA = makePress(pressId: pressA, timestamp: baseTime.addingTimeInterval(2), phase: .finished(outcome: OpenGateFlow.Outcome.acceptedDialog), elapsedMilliseconds: 2_000)
         let finishedB = makePress(pressId: pressB, timestamp: baseTime.addingTimeInterval(2.2), phase: .finished(outcome: "No network"), elapsedMilliseconds: 2_100)
 
         let entries: [OpenJournalEntry] = [.press(startedA), .press(startedB), .press(finishedA), .press(finishedB)]
@@ -283,7 +283,7 @@ struct OpenHistoryViewTests {
         #expect(groups.count == 1)
         #expect(groups[0].entries.count == 2)
         #expect(groups[0].sourceLabel == "Unknown (older build)")
-        #expect(groups[0].resultBadge == "Opened")
+        #expect(groups[0].resultBadge == "Accepted")
     }
 
     /// Legacy attempts before the first `attempt == 1` record (journal
@@ -333,12 +333,29 @@ struct OpenHistoryViewTests {
 
     // MARK: - resultBadge(for:) — every case
 
-    @Test func resultBadgeFinishedGateOpenedIsOpened() {
+    @Test func resultBadgeFinishedAcceptedConstantIsAccepted() {
+        let pressId = UUID()
+        let started = makePress(pressId: pressId, timestamp: baseTime, phase: .started, elapsedMilliseconds: 0)
+        let finished = makePress(pressId: pressId, timestamp: baseTime.addingTimeInterval(1), phase: .finished(outcome: OpenGateFlow.Outcome.acceptedDialog), elapsedMilliseconds: 1_000)
+        let group = OpenHistoryView.groups(from: [.press(started), .press(finished)])[0]
+        #expect(group.resultBadge == "Accepted")
+    }
+
+    /// Journal lines written before gateopener-pi0.4 say "Gate opened"; they
+    /// must still badge as "Accepted". MUTATION CHECK: dropping the legacy
+    /// literal from `resultBadge(for:)` makes this report "Failed: Gate opened".
+    @Test func resultBadgeFinishedLegacyGateOpenedLiteralIsAccepted() {
         let pressId = UUID()
         let started = makePress(pressId: pressId, timestamp: baseTime, phase: .started, elapsedMilliseconds: 0)
         let finished = makePress(pressId: pressId, timestamp: baseTime.addingTimeInterval(1), phase: .finished(outcome: "Gate opened"), elapsedMilliseconds: 1_000)
         let group = OpenHistoryView.groups(from: [.press(started), .press(finished)])[0]
-        #expect(group.resultBadge == "Opened")
+        #expect(group.resultBadge == "Accepted")
+    }
+
+    /// MUTATION CHECK: reverting the footer text (or dropping the "does not
+    /// confirm the gate moved" caveat) fails this exact match.
+    @Test func acceptedFooterStatesCloudAcceptanceOnly() {
+        #expect(OpenHistoryView.acceptedFooter == "Accepted means Comelit's cloud took the command; it does not confirm the gate moved.")
     }
 
     @Test func resultBadgeFinishedNoNetworkIsNoNetwork() {
@@ -382,16 +399,16 @@ struct OpenHistoryViewTests {
     ///
     /// MUTATION CHECK: reordering `resultBadge(for:)` to scan for `.timedOut`
     /// BEFORE `.finished` makes this fail (it would report "Timed out"
-    /// instead of "Opened") — verified by temporarily swapping the two scan
+    /// instead of "Accepted") — verified by temporarily swapping the two scan
     /// loops in `resultBadge(for:)` and confirming this test fails, then
     /// restoring the original order.
     @Test func resultBadgeFinishedTakesPrecedenceOverTimedOut() {
         let pressId = UUID()
         let started = makePress(pressId: pressId, timestamp: baseTime, phase: .started, elapsedMilliseconds: 0)
         let timedOut = makePress(pressId: pressId, timestamp: baseTime.addingTimeInterval(1), phase: .timedOut, elapsedMilliseconds: 1_000)
-        let finished = makePress(pressId: pressId, timestamp: baseTime.addingTimeInterval(2), phase: .finished(outcome: "Gate opened"), elapsedMilliseconds: 2_000)
+        let finished = makePress(pressId: pressId, timestamp: baseTime.addingTimeInterval(2), phase: .finished(outcome: OpenGateFlow.Outcome.acceptedDialog), elapsedMilliseconds: 2_000)
         let group = OpenHistoryView.groups(from: [.press(started), .press(timedOut), .press(finished)])[0]
-        #expect(group.resultBadge == "Opened")
+        #expect(group.resultBadge == "Accepted")
     }
 
     @Test func resultBadgeLegacyAllFailedIsFailed() {
@@ -401,11 +418,11 @@ struct OpenHistoryViewTests {
         #expect(group.resultBadge == "Failed")
     }
 
-    @Test func resultBadgeLegacyAnySuccessIsOpened() {
+    @Test func resultBadgeLegacyAnySuccessIsAccepted() {
         let first = makeAttempt(attempt: 1, maxAttempts: 2, outcome: .httpFailure(status: 500), timestamp: baseTime, pressId: nil)
         let second = makeAttempt(attempt: 2, maxAttempts: 2, outcome: .success(status: 202), timestamp: baseTime.addingTimeInterval(1), pressId: nil)
         let group = OpenHistoryView.groups(from: [.attempt(first), .attempt(second)])[0]
-        #expect(group.resultBadge == "Opened")
+        #expect(group.resultBadge == "Accepted")
     }
 
     // MARK: - timelineLines(for:)
@@ -481,10 +498,10 @@ struct OpenHistoryViewTests {
     @Test func timelineLinesFinished() {
         let pressId = UUID()
         let started = makePress(pressId: pressId, timestamp: baseTime, phase: .started, elapsedMilliseconds: 0)
-        let finished = makePress(pressId: pressId, timestamp: baseTime.addingTimeInterval(9.3), phase: .finished(outcome: "Gate opened"), elapsedMilliseconds: 9_300)
+        let finished = makePress(pressId: pressId, timestamp: baseTime.addingTimeInterval(9.3), phase: .finished(outcome: OpenGateFlow.Outcome.acceptedDialog), elapsedMilliseconds: 9_300)
         let group = OpenHistoryView.groups(from: [.press(started), .press(finished)])[0]
         let lines = OpenHistoryView.timelineLines(for: group)
-        #expect(lines[1] == "+9.3 s finished: Gate opened")
+        #expect(lines[1] == "+9.3 s finished: Open command accepted")
     }
 
     @Test func timelineLinesTimedOut() {
@@ -524,11 +541,11 @@ struct OpenHistoryViewTests {
         let group = OpenHistoryView.groups(from: [.press(started), .attempt(attemptOne), .attempt(attemptTwo)])[0]
         let lines = OpenHistoryView.timelineLines(for: group)
         #expect(lines[1] == "+4.2 s attempt 1/3 Network: timed out 5.0 s  retrying")
-        #expect(lines[2] == "+9.3 s attempt 2/3 Opened (202) 2.3 s")
+        #expect(lines[2] == "+9.3 s attempt 2/3 Accepted (202) 2.3 s")
     }
 
     /// gateopener-pi0.5. Removing the `.confirmation` branch in `attemptLine`
-    /// makes these render as "attempt 1/1 Opened (202) ..." and fail.
+    /// makes these render as "attempt 1/1 Accepted (202) ..." and fail.
     @Test func timelineLinesConfirmationAcceptedHasConfirmationPrefix() {
         let pressId = UUID()
         let started = makePress(pressId: pressId, timestamp: baseTime, phase: .started, elapsedMilliseconds: 0)
@@ -536,7 +553,7 @@ struct OpenHistoryViewTests {
         let confirm = makeAttempt(outcome: .success(status: 202), elapsedMilliseconds: 400, timestamp: baseTime.addingTimeInterval(1.9), pressId: pressId, kind: .confirmation)
         let group = OpenHistoryView.groups(from: [.press(started), .attempt(primary), .attempt(confirm)])[0]
         let lines = OpenHistoryView.timelineLines(for: group)
-        #expect(lines[1].hasPrefix("+500 ms attempt 1/1 Opened (202)"))
+        #expect(lines[1].hasPrefix("+500 ms attempt 1/1 Accepted (202)"))
         #expect(lines[2] == "+1.9 s confirmation: Accepted (202) 0.4 s")
     }
 
@@ -577,7 +594,7 @@ struct OpenHistoryViewTests {
     @Test func shareTextFormatsPrefixHeaderAndIndentedLines() {
         let pressId = UUID()
         let started = makePress(pressId: pressId, timestamp: baseTime, source: "intent", phase: .started, elapsedMilliseconds: 0)
-        let finished = makePress(pressId: pressId, timestamp: baseTime.addingTimeInterval(2), phase: .finished(outcome: "Gate opened"), elapsedMilliseconds: 2_000)
+        let finished = makePress(pressId: pressId, timestamp: baseTime.addingTimeInterval(2), phase: .finished(outcome: OpenGateFlow.Outcome.acceptedDialog), elapsedMilliseconds: 2_000)
 
         let text = OpenHistoryView.shareText(for: [.press(started), .press(finished)], prefix: "GateOpener 1.0 (10) — Sep 21, 2026")
         let lines = text.components(separatedBy: "\n")
@@ -585,9 +602,9 @@ struct OpenHistoryViewTests {
         #expect(lines[0] == "GateOpener 1.0 (10) — Sep 21, 2026")
         #expect(lines[1] == "")
         #expect(lines[2].contains("Action Button / Control"))
-        #expect(lines[2].contains("Opened"))
+        #expect(lines[2].contains("Accepted"))
         #expect(lines[3] == "  +0 ms started (Action Button / Control, 0.1.9 (11))")
-        #expect(lines[4] == "  +2.0 s finished: Gate opened")
+        #expect(lines[4] == "  +2.0 s finished: Open command accepted")
     }
 
     /// Two presses each produce their own header + indented lines, separated
@@ -628,7 +645,7 @@ struct OpenHistoryViewTests {
     @Test func shareTextOmitsFootnoteForFinishedGroup() {
         let pressId = UUID()
         let started = makePress(pressId: pressId, timestamp: baseTime, phase: .started, elapsedMilliseconds: 0)
-        let finished = makePress(pressId: pressId, timestamp: baseTime.addingTimeInterval(1), phase: .finished(outcome: "Gate opened"), elapsedMilliseconds: 1_000)
+        let finished = makePress(pressId: pressId, timestamp: baseTime.addingTimeInterval(1), phase: .finished(outcome: OpenGateFlow.Outcome.acceptedDialog), elapsedMilliseconds: 1_000)
 
         let text = OpenHistoryView.shareText(for: [.press(started), .press(finished)], prefix: "prefix")
         #expect(!text.contains(OpenHistoryView.unfinishedFootnote))

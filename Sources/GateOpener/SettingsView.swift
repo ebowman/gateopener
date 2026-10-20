@@ -772,7 +772,7 @@ private struct TestSectionView: View {
             isTesting = false
             switch observable.state {
             case .succeeded:
-                resultMessage = "Gate opened successfully."
+                resultMessage = "Open command accepted."
                 resultIsError = false
             case .failed(let message):
                 resultMessage = message

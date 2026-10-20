@@ -67,13 +67,13 @@ struct GateControllerObservableTests {
     }
 
     /// `requestOpen()` while reachable writes `started` (source "app"),
-    /// followed by `finished("Gate opened")` once the underlying
+    /// followed by `finished("Open command accepted")` once the underlying
     /// `GateController` reaches `.succeeded` — both sharing one `pressId`.
     ///
     /// MUTATION CHECK: removing the `emit(.started, ...)` call in
     /// `GateControllerObservable.requestOpen()` collapses `phases` to just
     /// `[finished(...)]`, failing the `phases ==` assertion.
-    @Test func requestOpenSuccessWritesStartedThenFinishedGateOpened() async {
+    @Test func requestOpenSuccessWritesStartedThenFinishedAccepted() async {
         let (defaults, cleanup) = makeInMemoryDefaults()
         defer { cleanup() }
         let (journalURL, cleanupJournal) = makeTempJournalURL()
@@ -99,7 +99,7 @@ struct GateControllerObservableTests {
 
         let records = pressRecords(at: journalURL)
         let phases = records.map(\.phase)
-        #expect(phases == [.started, .finished(outcome: "Gate opened")])
+        #expect(phases == [.started, .finished(outcome: "Open command accepted")])
         #expect(Set(records.map(\.pressId)).count == 1)
         #expect(records.allSatisfy { $0.source == "app" })
     }
@@ -189,7 +189,7 @@ struct GateControllerObservableTests {
             return
         }
         #expect(phases.first == .started)
-        #expect(outcome != "Gate opened")
+        #expect(outcome != OpenGateFlow.Outcome.acceptedDialog)
         #expect(Set(records.map(\.pressId)).count == 1)
     }
 

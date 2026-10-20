@@ -49,7 +49,7 @@ struct OpenGateFlowConfirmationTests {
             .reachability(isReachable: true, detail: ""),
             .openStarted,
             .attempt(number: 1),
-            .finished(outcome: "Gate opened"),
+            .finished(outcome: OpenGateFlow.Outcome.acceptedDialog),
         ])
     }
 
@@ -168,7 +168,7 @@ struct OpenGateFlowConfirmationTests {
         )
         #expect(outcome == .opened)
         #expect(events.items == [
-            "snapshot:opening", "snapshot:succeeded", "finished", "onFinished:Gate opened", "confirm",
+            "snapshot:opening", "snapshot:succeeded", "finished", "onFinished:Open command accepted", "confirm",
         ])
     }
 

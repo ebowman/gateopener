@@ -159,7 +159,7 @@ final class OpenResultNotifier: OpenResultNotifying {
         guard settings.notifyOnOpenSuccess else { return }
         guard await isAuthorized() else { return }
         let content = UNMutableNotificationContent()
-        content.title = "Gate opened"
+        content.title = OpenGateFlow.Outcome.acceptedDialog
         if let gateName { content.subtitle = gateName }
         content.interruptionLevel = .active
         content.sound = .default

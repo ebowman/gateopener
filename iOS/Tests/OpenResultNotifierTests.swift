@@ -99,7 +99,7 @@ private func makeSettings() -> (AppSettings, () -> Void) {
         #expect(center.added[0].identifier == OpenResultNotifier.notificationIdentifier)
         #expect(center.added[1].identifier == OpenResultNotifier.notificationIdentifier)
         let success = center.added[1].content
-        #expect(success.title == "Gate opened")
+        #expect(success.title == "Open command accepted")
         #expect(success.sound == .default)
         #expect(success.categoryIdentifier == "")
         #expect(success.interruptionLevel == .active)

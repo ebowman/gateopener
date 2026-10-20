@@ -85,7 +85,7 @@ struct MainView: View {
         case .opening:
             return "Opening…"
         case .succeeded:
-            return "Opened"
+            return "Accepted"
         case .failed:
             return "Try Again"
         }
@@ -133,7 +133,7 @@ struct MainView: View {
         case .opening:
             return "Opening…"
         case .succeeded(let at):
-            return "Opened \(Self.timeFormatter.string(from: at))"
+            return "Accepted \(Self.timeFormatter.string(from: at))"
         case .failed(let message):
             return message
         }

@@ -233,7 +233,7 @@ struct OpenGateIntentTests {
             .reachability(isReachable: true, detail: ""),
             .openStarted,
             .attempt(number: 1),
-            .finished(outcome: "Gate opened"),
+            .finished(outcome: OpenGateFlow.Outcome.acceptedDialog),
         ])
         #expect(Set(pressRecords.map(\.pressId)).count == 1)
         #expect(pressRecords.allSatisfy { $0.source == "intent" })
@@ -245,7 +245,7 @@ struct OpenGateIntentTests {
 
     /// Failure variant of the test above: `open` returns `.failed(message:)`
     /// directly, so the press sequence still runs start-to-finish, ending in
-    /// `.finished(outcome: <the failure message>)` rather than "Gate opened".
+    /// `.finished(outcome: <the failure message>)` rather than the accepted text.
     @Test func failedOpenWritesFinishedWithFailureMessage() async throws {
         let (defaults, cleanupDefaults) = makeInMemoryDefaults()
         defer { cleanupDefaults() }
