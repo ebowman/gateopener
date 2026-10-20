@@ -145,7 +145,13 @@ final class OpenResultNotifier: OpenResultNotifying {
         content.categoryIdentifier = Self.failureCategoryIdentifier
         content.userInfo = [Self.pressedAtUserInfoKey: pressedAt.timeIntervalSince1970]
         content.interruptionLevel = .active
+        #if os(watchOS)
+        // UNNotificationSound(named:) is unavailable on watchOS (and the
+        // custom .caf is not bundled in the watch app).
+        content.sound = .default
+        #else
         content.sound = UNNotificationSound(named: UNNotificationSoundName(Self.failureSoundName))
+        #endif
         await add(content)
     }
 

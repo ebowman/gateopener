@@ -183,8 +183,8 @@ targets:
   # extension). Explicit Info.plist for the same reason as the iOS target
   # above. Entitlements mirror iOS/App/GateOpener.entitlements so the watch
   # shares the app group and keychain group. SKIP_INSTALL: the watch app is
-  # only shipped embedded in the iOS archive. iOS/Shared is deliberately NOT
-  # a source yet (next bead, gateopener-3d7.3).
+  # only shipped embedded in the iOS archive. iOS/Shared is compiled in
+  # (bead gateopener-3d7.3).
   GateOpener-Watch:
     type: application
     platform: watchOS
@@ -194,6 +194,9 @@ targets:
         excludes:
           - "*.plist"
           - "*.entitlements"
+      - path: iOS/Shared
+        excludes:
+          - "README.md"
       - path: Watch/Resources/Assets.xcassets
     dependencies:
       - package: GateOpenerCore

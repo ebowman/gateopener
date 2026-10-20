@@ -185,7 +185,11 @@ public struct GateWidgetEntryView: View {
         }
         .padding(12)
         .containerBackground(for: .widget) {
+            #if os(watchOS)
+            Color.black
+            #else
             Color(.systemBackground)
+            #endif
         }
     }
 
@@ -208,7 +212,11 @@ public struct GateWidgetEntryView: View {
         }
         .padding(12)
         .containerBackground(for: .widget) {
+            #if os(watchOS)
+            Color.black
+            #else
             Color(.systemBackground)
+            #endif
         }
     }
 
