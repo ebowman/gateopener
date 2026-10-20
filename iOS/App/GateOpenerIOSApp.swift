@@ -123,7 +123,7 @@ struct GateOpenerIOSApp: App {
         let watchSync = WatchSync(
             session: WCSessionAdapter(),
             appSettings: environment.appSettings,
-            credentialStore: environment.credentialStore
+            credentialStoreProvider: { [environment] in environment.credentialStore }
         )
         watchSync.start()
 

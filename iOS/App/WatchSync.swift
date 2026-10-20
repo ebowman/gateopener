@@ -105,7 +105,9 @@ final class WatchSync {
 
     @ObservationIgnored private let session: any WatchSessionProviding
     @ObservationIgnored private let appSettings: AppSettings
-    @ObservationIgnored private let credentialStore: any CredentialStoring
+    /// Read lazily on every push: `AppEnvironment.updateKeychainAccessibility`
+    /// swaps in a new store after launch.
+    @ObservationIgnored private let credentialStoreProvider: () -> any CredentialStoring
     @ObservationIgnored private let now: () -> Date
     @ObservationIgnored private var pendingPush = false
     @ObservationIgnored private var pendingReason = ""
@@ -114,14 +116,24 @@ final class WatchSync {
     init(
         session: any WatchSessionProviding,
         appSettings: AppSettings,
-        credentialStore: any CredentialStoring,
+        credentialStoreProvider: @escaping () -> any CredentialStoring,
         now: @escaping () -> Date = Date.init
     ) {
         self.session = session
         self.appSettings = appSettings
-        self.credentialStore = credentialStore
+        self.credentialStoreProvider = credentialStoreProvider
         self.now = now
         session.onStateChange = { [weak self] in self?.sessionStateDidChange() }
+    }
+
+    /// Fixed-store convenience (tests).
+    convenience init(
+        session: any WatchSessionProviding,
+        appSettings: AppSettings,
+        credentialStore: any CredentialStoring,
+        now: @escaping () -> Date = Date.init
+    ) {
+        self.init(session: session, appSettings: appSettings, credentialStoreProvider: { credentialStore }, now: now)
     }
 
     /// Activates the session once at launch.
@@ -143,7 +155,7 @@ final class WatchSync {
         let message: WatchProvisioningMessage
         do {
             message = try WatchProvisioningMessage.build(
-                settings: appSettings, credentialStore: credentialStore, now: now()
+                settings: appSettings, credentialStore: credentialStoreProvider(), now: now()
             )
         } catch {
             // Never push (least of all .signedOut) because of a keychain error.
@@ -176,6 +188,19 @@ final class WatchSync {
             status = .failed(message: error.localizedDescription)
             log.error("watch push failed (\(reason, privacy: .public)): \(error.localizedDescription, privacy: .public)")
         }
+    }
+
+    /// True once WCSession activation has completed. Read by the Settings row
+    /// to tell "sending" from "waiting for the session".
+    var isSessionActivated: Bool { session.activationState == .activated }
+
+    /// Manual "Send to Watch": activates first if the session is not yet
+    /// activated (the push is then deferred until activation completes).
+    func sendFromSettings() {
+        if session.isSupported, session.activationState != .activated {
+            start()
+        }
+        pushNow(reason: "settings")
     }
 
     private func deferPush(reason: String, kind: String) {

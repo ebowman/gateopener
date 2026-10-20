@@ -96,6 +96,7 @@ struct SettingsView: View {
                 videoSection
                 quickAccessSection
                 lockScreenSection
+                if let watchSync { WatchSyncSection(sync: watchSync) }
                 notificationsSection
                 accountSection
                 videoDiagnosticsSection
@@ -541,3 +542,99 @@ private func shortErrorMessage(for error: Error) -> String {
     }
     return mapped == "Unlock iPhone to open the gate" ? mapped : "Could not update this setting"
 }
+
+
+// MARK: - Apple Watch section (bead gateopener-3d7.10)
+
+/// One status row plus a "Send to Watch" button. Hidden when WatchConnectivity
+/// is unsupported. Never shows credentials.
+struct WatchSyncSection: View {
+    var sync: WatchSync
+
+    private var canSend: Bool {
+        switch sync.status {
+        case .pending, .sent, .failed: return true
+        case .unsupported, .notPaired, .watchAppNotInstalled: return false
+        }
+    }
+
+    var body: some View {
+        if sync.status != .unsupported {
+            Section {
+                HStack {
+                    Text("Status")
+                    Spacer()
+                    statusText
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.trailing)
+                        .accessibilityIdentifier("watchSyncStatus")
+                }
+                Button("Send to Watch") { sync.sendFromSettings() }
+                    .disabled(!canSend)
+                    .accessibilityIdentifier("watchSyncSendButton")
+            } header: {
+                Text("Apple Watch")
+            }
+        }
+    }
+
+    /// Row text for `.pending`: "Sending" only once the session is activated.
+    static func pendingLine(sessionActivated: Bool) -> String {
+        sessionActivated ? "Sending\u{2026}" : "Waiting for your watch\u{2026}"
+    }
+
+    @ViewBuilder
+    private var statusText: some View {
+        switch sync.status {
+        case .unsupported: EmptyView()
+        case .notPaired: Text("Not paired")
+        case .watchAppNotInstalled: Text("Install GateOpener on your watch")
+        case .pending: Text(Self.pendingLine(sessionActivated: sync.isSessionActivated))
+        case .sent(let at): Text("Sent \(at, style: .relative) ago")
+        case .failed(let message): Text("Failed: \(message)")
+        }
+    }
+}
+
+#if DEBUG
+@MainActor
+private final class PreviewWatchSession: WatchSessionProviding {
+    var isSupported = true
+    var isPaired = true
+    var isWatchAppInstalled = true
+    var activationState: WatchSessionActivation = .activated
+    var onStateChange: (@MainActor () -> Void)?
+    var fail = false
+    struct PushError: LocalizedError { var errorDescription: String? { "Watch unreachable" } }
+    func activate() {}
+    func updateApplicationContext(_ context: [String: Any]) throws { if fail { throw PushError() } }
+}
+
+private final class PreviewCredentialStore: CredentialStoring, @unchecked Sendable {
+    func saveCredentials(username: String, password: String) throws {}
+    func loadCredentials() throws -> (username: String, password: String)? { ("preview", "preview") }
+    func deleteCredentials() throws {}
+    func saveTokens(_ tokens: TokenSet) throws {}
+    func loadTokens() throws -> TokenSet? { nil }
+    func deleteTokens() throws {}
+}
+
+@MainActor
+private func previewSync(_ configure: (PreviewWatchSession) -> Void) -> WatchSync {
+    let session = PreviewWatchSession()
+    configure(session)
+    let defaults = UserDefaults(suiteName: "WatchSyncPreview")!
+    let store = PreviewCredentialStore()
+    let sync = WatchSync(session: session, appSettings: AppSettings(defaults: defaults), credentialStore: store)
+    sync.pushNow(reason: "preview")
+    return sync
+}
+
+#Preview("Not paired") { Form { WatchSyncSection(sync: previewSync { $0.isPaired = false }) } }
+#Preview("App not installed") { Form { WatchSyncSection(sync: previewSync { $0.isWatchAppInstalled = false }) } }
+#Preview("Pending") { Form { WatchSyncSection(sync: previewSync { $0.activationState = .notActivated }) } }
+#Preview("Waiting for session") { Form { WatchSyncSection(sync: previewSync { $0.activationState = .inactive }) } }
+#Preview("Sent") { Form { WatchSyncSection(sync: previewSync { _ in }) } }
+#Preview("Failed") { Form { WatchSyncSection(sync: previewSync { $0.fail = true }) } }
+#Preview("Unsupported (hidden)") { Form { WatchSyncSection(sync: previewSync { $0.isSupported = false }) } }
+#endif

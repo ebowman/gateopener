@@ -138,4 +138,127 @@ struct WatchSyncTests {
         makeSync(session: session).start()
         #expect(session.activateCallCount == 1)
     }
+
+    // Fails if sessionStateDidChange stops moving a non-activated session to .pending.
+    @Test func stateChangeWhileInactiveSetsPending() {
+        let session = FakeWatchSession()
+        let sync = makeSync(session: session)
+        sync.pushNow(reason: "test")
+        #expect(sync.status != .pending)
+        session.activationState = .inactive
+        session.fireStateChange()
+        #expect(sync.status == .pending)
+        #expect(session.contexts.count == 1)
+    }
+
+    // Fails if sessionStateDidChange ignores the isSupported guard.
+    @Test func stateChangeUnsupportedSetsUnsupported() {
+        let session = FakeWatchSession()
+        let sync = makeSync(session: session)
+        session.isSupported = false
+        session.fireStateChange()
+        #expect(sync.status == .unsupported)
+        #expect(session.contexts.isEmpty)
+    }
+
+    // Fails if a state change does not re-evaluate pairing (unpaired -> paired sends).
+    @Test func stateChangePairingMovesNotPairedToSent() {
+        let session = FakeWatchSession()
+        session.isPaired = false
+        let sync = makeSync(session: session)
+        session.fireStateChange()
+        #expect(sync.status == .notPaired)
+        session.isPaired = true
+        session.fireStateChange()
+        guard case .sent = sync.status else {
+            Issue.record("expected .sent, got \(sync.status)")
+            return
+        }
+        #expect(session.contexts.count == 1)
+    }
+
+    // Fails if a lagging isWatchAppInstalled is not re-evaluated on state change.
+    @Test func installLagResolvesOnStateChange() {
+        let session = FakeWatchSession()
+        session.isWatchAppInstalled = false
+        let sync = makeSync(session: session)
+        session.fireStateChange()
+        #expect(sync.status == .watchAppNotInstalled)
+        session.isWatchAppInstalled = true
+        session.fireStateChange()
+        guard case .sent = sync.status else {
+            Issue.record("expected .sent, got \(sync.status)")
+            return
+        }
+    }
+
+    // Fails if a successful retry leaves the stale .failed status.
+    @Test func failedThenSuccessfulPushBecomesSent() {
+        let session = FakeWatchSession()
+        session.updateError = FakeWatchSession.PushError()
+        let sync = makeSync(session: session)
+        sync.pushNow(reason: "test")
+        guard case .failed = sync.status else {
+            Issue.record("expected .failed before retry, got \(sync.status)")
+            return
+        }
+        session.updateError = nil
+        sync.pushNow(reason: "settings")
+        guard case .sent = sync.status else {
+            Issue.record("expected .sent, got \(sync.status)")
+            return
+        }
+    }
+
+    // Fails if the store is captured at init instead of read on each push.
+    @Test func credentialStoreIsReadLazilyOnEachPush() throws {
+        final class Box { var store: any CredentialStoring; init(store: any CredentialStoring) { self.store = store } }
+        let first = InMemoryCredentialStore()
+        try first.saveCredentials(username: "alice", password: "secret")
+        let second = InMemoryCredentialStore()
+        try second.saveCredentials(username: "bob", password: "pw")
+        let box = Box(store: first)
+        let session = FakeWatchSession()
+        let defaults = UserDefaults(suiteName: "WatchSyncTests-\(UUID().uuidString)")!
+        let sync = WatchSync(session: session, appSettings: AppSettings(defaults: defaults), credentialStoreProvider: { box.store })
+        sync.pushNow(reason: "a")
+        box.store = second
+        sync.pushNow(reason: "b")
+        #expect(session.contexts.map { $0["username"] as? String } == ["alice", "bob"])
+    }
+
+    // Fails if sendFromSettings skips start() or the deferred push is lost on activation.
+    @Test func sendFromSettingsActivatesWhenNotActivatedThenPushesOnActivation() {
+        let session = FakeWatchSession()
+        session.activationState = .notActivated
+        let sync = makeSync(session: session)
+        sync.sendFromSettings()
+        #expect(session.activateCallCount == 1)
+        #expect(session.contexts.isEmpty)
+        #expect(sync.status == .pending)
+        session.activationState = .activated
+        session.fireStateChange()
+        #expect(session.contexts.count == 1)
+        #expect(session.contexts.first?["kind"] as? String == "provision")
+    }
+
+    // Fails if sendFromSettings activates needlessly or does not push immediately.
+    @Test func sendFromSettingsWhenActivatedPushesImmediately() {
+        let session = FakeWatchSession()
+        let sync = makeSync(session: session)
+        sync.sendFromSettings()
+        #expect(session.activateCallCount == 0)
+        #expect(session.contexts.count == 1)
+    }
+
+    // Fails if the pending wording ignores session activation.
+    @Test func pendingLineDistinguishesWaitingFromSending() {
+        let session = FakeWatchSession()
+        session.activationState = .notActivated
+        let sync = makeSync(session: session)
+        #expect(!sync.isSessionActivated)
+        #expect(WatchSyncSection.pendingLine(sessionActivated: sync.isSessionActivated) == "Waiting for your watch\u{2026}")
+        session.activationState = .activated
+        #expect(WatchSyncSection.pendingLine(sessionActivated: sync.isSessionActivated) == "Sending\u{2026}")
+    }
 }
