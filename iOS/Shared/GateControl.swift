@@ -1,3 +1,4 @@
+#if os(iOS) || os(watchOS)
 import AppIntents
 import SwiftUI
 import WidgetKit
@@ -16,15 +17,17 @@ import WidgetKit
 /// dialog surface there); Siri/the Action Button read `OpenGateIntent`'s
 /// `IntentDialog` aloud, which is why that intent's dialog strings must
 /// stay short — see `OpenGateFlow.Outcome.dialog` and its call sites.
+@available(iOS 18.0, watchOS 26.0, *)
 struct GateControl: ControlWidget {
     var body: some ControlWidgetConfiguration {
         StaticControlConfiguration(kind: "ie.boboco.GateOpener.control") {
             ControlWidgetButton(action: OpenGateIntent()) {
                 Label("Open Gate", systemImage: GateSymbol.name)
             }
-            .tint(.accentColor)
+            .tint(GateSymbol.controlTint)
         }
         .displayName("Open Gate")
         .description("Opens your Comelit gate")
     }
 }
+#endif

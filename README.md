@@ -35,7 +35,7 @@ to the same public cloud API that Comelit's own mobile app uses. See
 ## Apple Watch
 
 The watch app is standalone (it holds its own copy of your credentials,
-provisioned from the paired iPhone). It offers three ways to open the gate:
+provisioned from the paired iPhone). It offers four ways to open the gate:
 
 1. **Watch app button** — a large Open button in the app. _Coming in a later
    build._
@@ -47,6 +47,11 @@ provisioned from the paired iPhone). It offers three ways to open the gate:
    the gate with GateOpener", run it from the Shortcuts app, or bind it to
    the Apple Watch Ultra Action Button: on the watch, **Settings → Action
    Button → Shortcut → Open Gate**.
+4. **Control Center control (watchOS 26+)** — press the side button, scroll
+   to Edit, and add **Open Gate**. It runs on the watch itself, so it works
+   without the iPhone nearby. watchOS 26 also lists the iPhone's controls
+   under "From Your iPhone"; that copy works too but is routed through the
+   phone, so prefer the native one.
 
 ## Install
 

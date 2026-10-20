@@ -6,5 +6,8 @@ import WidgetKit
 struct GateOpenerWatchWidgetBundle: WidgetBundle {
     var body: some Widget {
         GateWatchWidget()
+        if #available(watchOS 26.0, *) {
+            GateControl()
+        }
     }
 }
