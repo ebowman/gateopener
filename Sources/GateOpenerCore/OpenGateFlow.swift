@@ -200,6 +200,11 @@ public struct OpenGateFlow: Sendable {
         if currentState == .needsSetup {
             write(.needsSetup, gateName: gateName, snapshot: snapshot, reloadTimelines: reloadTimelines, now: now)
             emit(.finished(outcome: Outcome.needsSetup.dialog))
+            // gateopener-pi0.2: report needs-setup too (bounded like every
+            // other outcome) so the Control/Action Button surface can notify.
+            if let onFinished {
+                await Self.boundedAwait(bound: notificationBound, sleep: sleep) { await onFinished(.needsSetup) }
+            }
             return .needsSetup
         }
 
@@ -325,9 +330,9 @@ public struct OpenGateFlow: Sendable {
         // gateopener-pi0.9: report the result (notification / dialog data)
         // BEFORE the confirmation wait so it is not delayed by up to 3.4s.
         // Bounded via the injected `sleep`: worst case deadline +
-        // `notificationBound` (27s + 2s = 29s). `.needsSetup` returned early
-        // above (posts nothing); a `.needsSetup` from `open()` is skipped too.
-        if let onFinished, outcome != .needsSetup {
+        // `notificationBound` (27s + 2s = 29s). Also fires for `.needsSetup`
+        // (gateopener-pi0.2), here and at the entry guard above.
+        if let onFinished {
             await Self.boundedAwait(bound: notificationBound, sleep: sleep) { await onFinished(outcome) }
         }
 

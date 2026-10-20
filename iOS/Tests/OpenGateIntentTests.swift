@@ -336,11 +336,12 @@ struct OpenGateIntentTests {
             timelineReloader: {},
             gateClient: fakeGateClient,
             tokenResolver: FakeTokenResolving(),
-            openAttemptJournalURL: journalURL
+            openAttemptJournalURL: journalURL,
+            controllerCredentialStore: InMemoryCredentialStore()
         )
         #expect(environment.controller.state == .needsSetup)
 
-        let outcome = await OpenGateIntent.runFlow(environment: environment)
+        let outcome = await OpenGateIntent.runFlow(environment: environment, notifier: FakeNotifier())
         #expect(outcome == .needsSetup)
         #expect(outcome.dialog == "Sign in to GateOpener first")
         #expect(fakeGateClient.openCallCount == 0)
@@ -466,7 +467,8 @@ struct OpenGateIntentTests {
                 reachability: FakeReachabilityProviding(isReachable: true),
                 timelineReloader: {},
                 gateClient: gate,
-                tokenResolver: FakeTokenResolving()
+                tokenResolver: FakeTokenResolving(),
+                controllerCredentialStore: InMemoryCredentialStore()
             )
         }
         return await OpenGateIntent.runFlow(environment: environment, deadline: deadline, notifier: notifier)
@@ -530,10 +532,93 @@ struct OpenGateIntentTests {
         #expect(pressedAt <= Date())
     }
 
-    @Test func needsSetupPostsNothing() async throws {
+    /// Removing the runFlow post leaves events empty; wrong reason mapping fails the case.
+    @Test func needsSetupSignedOutPostsSignInReasonForIntent() async throws {
         let notifier = FakeNotifier()
         let outcome = try await runWithNotifier(
             gate: FakeGateOpening(), deadline: .seconds(5), notifier: notifier, signedIn: false)
+        #expect(outcome == .needsSetup)
+        #expect(notifier.events.count == 1)
+        guard case .needsSetup(let reason) = notifier.events.first else {
+            Issue.record("expected needsSetup post, got \(notifier.events)"); return
+        }
+        #expect(reason == .signedOut)
+    }
+
+    private func runNeedsSetup(
+        store: any CredentialStoring, selectGate: Bool, source: String, notifier: FakeNotifier
+    ) async -> (OpenGateFlow.Outcome, [OpenPressPhase]) {
+        let (defaults, cleanup) = makeInMemoryDefaults()
+        defer { cleanup() }
+        let (journalURL, cleanupJournal) = makeTempJournalURL()
+        defer { cleanupJournal() }
+        OpenGateIntent.journalURLOverride = .some(journalURL)
+        defer { OpenGateIntent.journalURLOverride = nil }
+        if selectGate {
+            let settings = AppSettings(defaults: defaults)
+            settings.selectedEndpointId = "mock"
+            settings.selectedEndpointName = "Mock Gate"
+        }
+        let environment = AppEnvironment.make(
+            defaults: defaults,
+            reachability: FakeReachabilityProviding(isReachable: true),
+            timelineReloader: {},
+            gateClient: FakeGateOpening(),
+            tokenResolver: FakeTokenResolving(),
+            openAttemptJournalURL: journalURL,
+            controllerCredentialStore: store
+        )
+        let outcome = await OpenGateIntent.runFlow(
+            environment: environment, deadline: .seconds(5), notifier: notifier, source: source)
+        let phases: [OpenPressPhase] = OpenAttemptJournal(fileURL: journalURL).journalEntries().compactMap {
+            if case .press(let record) = $0 { return record.phase }
+            return nil
+        }
+        return (outcome, phases)
+    }
+
+    /// Removing the emit (or the make-time error capture) drops the phase / wrong body.
+    @Test func unreadableKeychainJournalsStatusAndPostsUnlockBody() async {
+        let notifier = FakeNotifier()
+        let (outcome, phases) = await runNeedsSetup(
+            store: ThrowingLoadStore(error: KeychainError.loadFailed(status: -25308)),
+            selectGate: true, source: "intent", notifier: notifier)
+        #expect(outcome == .needsSetup)
+        #expect(phases.contains(.credentialsUnreadable(status: -25308)))
+        guard case .needsSetup(let reason) = notifier.events.first else {
+            Issue.record("expected needsSetup post"); return
+        }
+        #expect(reason == .credentialsUnreadable)
+    }
+
+    /// A non-Keychain error has no OSStatus: journals the documented -1.
+    @Test func nonKeychainLoadErrorJournalsUnknownStatus() async {
+        struct Other: Error {}
+        let (_, phases) = await runNeedsSetup(
+            store: ThrowingLoadStore(error: Other()), selectGate: true, source: "intent", notifier: FakeNotifier())
+        #expect(phases.contains(.credentialsUnreadable(status: -1)))
+    }
+
+    /// Credentials fine but no gate: "finish setup" reason, and NO unreadable phase.
+    @Test func noGateSelectedPostsFinishSetupReason() async throws {
+        let store = InMemoryCredentialStore()
+        try store.saveCredentials(username: "u", password: "p")
+        let notifier = FakeNotifier()
+        let (outcome, phases) = await runNeedsSetup(
+            store: store, selectGate: false, source: "intent", notifier: notifier)
+        #expect(outcome == .needsSetup)
+        guard case .needsSetup(let reason) = notifier.events.first else {
+            Issue.record("expected needsSetup post"); return
+        }
+        #expect(reason == .noGateSelected)
+        #expect(!phases.contains { if case .credentialsUnreadable = $0 { return true } else { return false } })
+    }
+
+    /// Removing the `source == "intent"` gate makes the in-app press post too.
+    @Test func needsSetupDoesNotPostForAppSource() async {
+        let notifier = FakeNotifier()
+        let (outcome, _) = await runNeedsSetup(
+            store: InMemoryCredentialStore(), selectGate: false, source: "app", notifier: notifier)
         #expect(outcome == .needsSetup)
         #expect(notifier.events.isEmpty)
     }
@@ -568,6 +653,7 @@ final class FakeNotifier: OpenResultNotifying, @unchecked Sendable {
         case success(gateName: String?)
         case failure(gateName: String?, message: String, pressedAt: Date)
         case unconfirmed(gateName: String?, pressedAt: Date)
+        case needsSetup(NeedsSetupReason)
     }
     private let lock = NSLock()
     private var _events: [Event] = []
@@ -592,6 +678,10 @@ final class FakeNotifier: OpenResultNotifying, @unchecked Sendable {
         lock.withLock { _events.append(.unconfirmed(gateName: gateName, pressedAt: pressedAt)) }
         if hang { try? await Task.sleep(for: .seconds(60)) }
     }
+    func postNeedsSetup(reason: NeedsSetupReason) async {
+        onPost?()
+        lock.withLock { _events.append(.needsSetup(reason)) }
+    }
     func postSuccess(gateName: String?) async {
         onPost?()
         lock.withLock { _events.append(.success(gateName: gateName)) }
@@ -604,4 +694,16 @@ final class EventLog: @unchecked Sendable {
     private var _items: [String] = []
     func add(_ item: String) { lock.lock(); _items.append(item); lock.unlock() }
     var items: [String] { lock.lock(); defer { lock.unlock() }; return _items }
+}
+
+/// Credential store whose `loadCredentials` throws the given error.
+private final class ThrowingLoadStore: CredentialStoring, @unchecked Sendable {
+    let error: Error
+    init(error: Error) { self.error = error }
+    func saveCredentials(username: String, password: String) throws {}
+    func loadCredentials() throws -> (username: String, password: String)? { throw error }
+    func deleteCredentials() throws {}
+    func saveTokens(_ tokens: TokenSet) throws {}
+    func loadTokens() throws -> TokenSet? { nil }
+    func deleteTokens() throws {}
 }

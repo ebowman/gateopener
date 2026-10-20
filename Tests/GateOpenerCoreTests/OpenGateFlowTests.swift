@@ -682,6 +682,9 @@ struct OpenGateFlowTests {
         }
         let attempt = #"{"kind":"attempt","number":2}"#.data(using: .utf8)!
         #expect(try JSONDecoder().decode(OpenPressPhase.self, from: attempt) == .attempt(number: 2))
+        // gateopener-pi0.2: removing the codec branch makes decode throw.
+        let unreadable = OpenPressPhase.credentialsUnreadable(status: -25308)
+        #expect(try JSONDecoder().decode(OpenPressPhase.self, from: JSONEncoder().encode(unreadable)) == unreadable)
     }
 
     // MARK: - TaskLocal pressId propagation into open() (gateopener-41m.22)

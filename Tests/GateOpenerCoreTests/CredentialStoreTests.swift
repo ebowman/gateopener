@@ -39,6 +39,9 @@ final class MockCredentialStore: CredentialStoring, @unchecked Sendable {
     /// When set, `saveCredentials` throws this error instead of persisting.
     var saveCredentialsError: Error?
 
+    /// When set, `loadCredentials` throws this error (e.g. a locked keychain).
+    var loadCredentialsError: Error?
+
     func saveCredentials(username: String, password: String) throws {
         lock.lock()
         defer { lock.unlock() }
@@ -51,6 +54,7 @@ final class MockCredentialStore: CredentialStoring, @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         loadCredentialsCallCount += 1
+        if let loadCredentialsError { throw loadCredentialsError }
         return _credentials
     }
 

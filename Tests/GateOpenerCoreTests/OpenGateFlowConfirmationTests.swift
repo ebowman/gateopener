@@ -195,9 +195,10 @@ struct OpenGateFlowConfirmationTests {
         #expect(seen.items == [failed, timedOut])
     }
 
-    /// onFinished is NOT called for `.needsSetup` (entry guard AND an
-    /// `open()` that reports needsSetup). Breaks if the guard is removed.
-    @Test func onFinishedNotCalledForNeedsSetup() async {
+    /// onFinished IS called with `.needsSetup` on both the entry-guard path and
+    /// the `open()`-returns-needsSetup path. Breaks if either call (or the
+    /// outcome pass-through) is removed.
+    @Test func onFinishedCalledForNeedsSetupOnBothPaths() async {
         let (store, cleanup) = makeStore(); defer { cleanup() }
         let seen = Box<OpenGateFlow.Outcome>()
         let early = await OpenGateFlow().run(
@@ -214,7 +215,36 @@ struct OpenGateFlowConfirmationTests {
         )
         #expect(early == .needsSetup)
         #expect(late == .needsSetup)
-        #expect(seen.items.isEmpty)
+        #expect(seen.items == [.needsSetup, .needsSetup])
+    }
+
+    /// A hung onFinished on either needsSetup path is cut off at the 2s
+    /// notification bound via the injected sleep. Breaks if either call is
+    /// unbounded (the test would take 30s) or uses a different bound.
+    @Test func hungOnFinishedOnNeedsSetupPathsIsBounded() async {
+        let (store, cleanup) = makeStore(); defer { cleanup() }
+        let sleeps = Box<Duration>()
+        let started = ContinuousClock.now
+        let early = await OpenGateFlow().run(
+            currentState: .needsSetup, gateName: "G", isReachable: true,
+            open: { .succeeded(at: Date()) },
+            snapshot: store, reloadTimelines: {},
+            sleep: { sleeps.add($0) },
+            onFinished: { _ in try? await Task.sleep(for: .seconds(30)) }
+        )
+        let late = await OpenGateFlow().run(
+            currentState: .idle, gateName: "G", isReachable: true,
+            open: { .needsSetup },
+            snapshot: store, reloadTimelines: {},
+            sleep: { sleeps.add($0) },
+            now: { fixedNow },
+            pressStartedAt: fixedNow,
+            awaitConfirmation: { _ in },
+            onFinished: { _ in try? await Task.sleep(for: .seconds(30)) }
+        )
+        #expect(early == .needsSetup && late == .needsSetup)
+        #expect(sleeps.items.filter { $0 == .seconds(2) }.count == 2)
+        #expect(ContinuousClock.now - started < .seconds(5))
     }
 
     /// A never-returning onFinished is cut off by the injected sleep at the

@@ -486,6 +486,16 @@ struct OpenHistoryViewTests {
         #expect(lines[1] == "+1.9 s token failed: server(500)")
     }
 
+    /// Removing the `phaseLine` case (or its format) changes/omits this line.
+    @Test func timelineLinesCredentialsUnreadable() {
+        let pressId = UUID()
+        let started = makePress(pressId: pressId, timestamp: baseTime, phase: .started, elapsedMilliseconds: 0)
+        let unreadable = makePress(pressId: pressId, timestamp: baseTime.addingTimeInterval(0.4), phase: .credentialsUnreadable(status: -25308), elapsedMilliseconds: 400)
+        let group = OpenHistoryView.groups(from: [.press(started), .press(unreadable)])[0]
+        let lines = OpenHistoryView.timelineLines(for: group)
+        #expect(lines[1] == "+400 ms Credentials unreadable (OSStatus -25308)")
+    }
+
     @Test func timelineLinesOpenStarted() {
         let pressId = UUID()
         let started = makePress(pressId: pressId, timestamp: baseTime, phase: .started, elapsedMilliseconds: 0)

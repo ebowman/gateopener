@@ -145,6 +145,14 @@ public struct OpenGateIntent: AppIntent {
 
         emit(.environmentReady)
 
+        // gateopener-pi0.2: if the controller's one-time credential load
+        // THREW, journal why the press will end `.needsSetup`. Status is the
+        // KeychainError's OSStatus, or -1 (`unknownCredentialStatus`) for any
+        // other error type.
+        if let credentialError = environment.credentialLoadError {
+            emit(.credentialsUnreadable(status: Self.osStatus(of: credentialError)))
+        }
+
         // Reachability: a fresh `NWPathMonitorReachability` is optimistic
         // (`true`) until its first path update arrives, so the initial
         // `isReachable` read below may be stale. That is harmless now:
@@ -168,10 +176,12 @@ public struct OpenGateIntent: AppIntent {
         // snapshot + `.finished` journal entry and BEFORE the confirmation
         // wait (gateopener-pi0.9). The flow bounds it (2s) via its sleep seam:
         // worst case 27s deadline + 2s = 29s, under iOS's ~30s intent limit.
-        // `.needsSetup` posts nothing (the dialog already says sign in); the
-        // flow does not call `onFinished` for it.
+        // `onFinished` also fires for `.needsSetup` (gateopener-pi0.2).
         let notifier = notifier ?? OpenResultNotifier(settings: environment.appSettings)
         notifier.registerCategories()
+        let credentialLoadFailed = environment.credentialLoadError != nil
+        let hasStoredCredentials = environment.hasStoredCredentials
+        let isConfigured = environment.appSettings.isConfigured
         let onFinished: @Sendable (OpenGateFlow.Outcome) async -> Void = { outcome in
             switch outcome {
             case .opened:
@@ -181,7 +191,21 @@ public struct OpenGateIntent: AppIntent {
             case .timedOut:
                 await notifier.postUnconfirmed(gateName: gateName, pressedAt: pressStartedAt)
             case .needsSetup:
-                break
+                // gateopener-pi0.2: the Control Center / Action Button surface
+                // has no dialog, so a `.needsSetup` press there would
+                // otherwise be silent. The in-app surface shows its own UI,
+                // so only source "intent" posts. Runs under the flow's 2s
+                // bound like every other outcome.
+                guard source == "intent" else { return }
+                let reason: NeedsSetupReason
+                if credentialLoadFailed {
+                    reason = .credentialsUnreadable
+                } else if hasStoredCredentials, !isConfigured {
+                    reason = .noGateSelected
+                } else {
+                    reason = .signedOut
+                }
+                await notifier.postNeedsSetup(reason: reason)
             }
         }
 
@@ -214,5 +238,16 @@ public struct OpenGateIntent: AppIntent {
         )
 
         return outcome
+    }
+
+    /// `OSStatus` carried by a `KeychainError`, else
+    /// `OpenPressPhase.unknownCredentialStatus`.
+    nonisolated static func osStatus(of error: Error) -> Int32 {
+        switch error as? KeychainError {
+        case .loadFailed(let status), .saveFailed(let status), .deleteFailed(let status):
+            return status
+        default:
+            return OpenPressPhase.unknownCredentialStatus
+        }
     }
 }

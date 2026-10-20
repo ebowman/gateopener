@@ -225,6 +225,8 @@ struct OpenHistoryView: View {
             return "\(offset) Attempt \(number)"
         case .waitingForNetwork:
             return "\(offset) Waiting for network"
+        case .credentialsUnreadable(let status):
+            return "\(offset) Credentials unreadable (OSStatus \(status))"
         }
     }
 

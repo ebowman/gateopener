@@ -78,8 +78,8 @@ private func makeSettings() -> (AppSettings, () -> Void) {
         let center = FakeCenter()
         OpenResultNotifier(settings: settings, center: center).registerCategories()
 
-        #expect(center.categories.count == 1)
-        let category = center.categories.first!
+        #expect(center.categories.count == 2)
+        let category = center.categories.first { $0.identifier == OpenResultNotifier.failureCategoryIdentifier }!
         #expect(category.identifier == "ie.boboco.GateOpener.openFailed")
         #expect(category.actions.count == 1)
         #expect(category.actions[0].identifier == "ie.boboco.GateOpener.retryOpen")
@@ -143,5 +143,52 @@ private func makeSettings() -> (AppSettings, () -> Void) {
         center.status = .notDetermined
         await notifier.requestAuthorizationIfNeeded()
         #expect(center.requested == [[.alert, .sound]])
+    }
+
+    /// Dropping the per-reason body (or using one wording) fails one of the three.
+    @Test func needsSetupBodiesPerReason() async {
+        let expected: [(NeedsSetupReason, String)] = [
+            (.credentialsUnreadable, "Unlock your iPhone and try again"),
+            (.noGateSelected, "Open GateOpener to finish setup"),
+            (.signedOut, "Open GateOpener and sign in"),
+        ]
+        for (reason, body) in expected {
+            let (settings, cleanup) = makeSettings(); defer { cleanup() }
+            let center = FakeCenter()
+            let notifier = OpenResultNotifier(settings: settings, center: center)
+            await notifier.postNeedsSetup(reason: reason)
+            #expect(center.added.count == 1)
+            #expect(center.added[0].identifier == OpenResultNotifier.notificationIdentifier)
+            #expect(center.added[0].content.title == "GateOpener couldn't open the gate")
+            #expect(center.added[0].content.body == body)
+            #expect(center.added[0].content.categoryIdentifier == OpenResultNotifier.needsSetupCategoryIdentifier)
+        }
+    }
+
+    /// Reusing the failure category would add Retry; this fails then.
+    @Test func needsSetupCategoryHasNoRetryAction() {
+        let category = OpenResultNotifier.makeNeedsSetupCategory()
+        #expect(category.actions.isEmpty)
+        #expect(!category.actions.contains { $0.identifier == OpenResultNotifier.retryActionIdentifier })
+        // And the failure category still has Retry (guards the vacuous case).
+        #expect(OpenResultNotifier.makeFailureCategory().actions.map(\.identifier) == [OpenResultNotifier.retryActionIdentifier])
+    }
+
+    /// Without registering the needs-setup category the system drops it.
+    @Test func registerCategoriesIncludesNeedsSetupCategory() {
+        let (settings, cleanup) = makeSettings(); defer { cleanup() }
+        let center = FakeCenter()
+        OpenResultNotifier(settings: settings, center: center).registerCategories()
+        #expect(center.categories.map(\.identifier).sorted() == [
+            OpenResultNotifier.failureCategoryIdentifier, OpenResultNotifier.needsSetupCategoryIdentifier,
+        ].sorted())
+    }
+
+    @Test func needsSetupIsNoOpWhenUnauthorized() async {
+        let (settings, cleanup) = makeSettings(); defer { cleanup() }
+        let center = FakeCenter()
+        center.status = .denied
+        await OpenResultNotifier(settings: settings, center: center).postNeedsSetup(reason: .signedOut)
+        #expect(center.added.isEmpty)
     }
 }

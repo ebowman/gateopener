@@ -199,12 +199,7 @@ public final class GateController {
         // already captures "has a selected gate"; credential presence is
         // checked separately since AppSettings deliberately holds no
         // secrets.
-        let hasCredentials = (try? credentialStore.loadCredentials()) != nil
-        if hasCredentials, appSettings.isConfigured {
-            self.state = .idle
-        } else {
-            self.state = .needsSetup
-        }
+        self.state = Self.initialState(credentialStore: credentialStore, appSettings: appSettings).state
 
         // Registered once, here, for the controller's lifetime (per the
         // bead's "registered once" requirement). The handler hops to the
@@ -444,6 +439,28 @@ public final class GateController {
             }
             self.resetToIdleIfStillShowing(newState)
         }
+    }
+
+    /// The state `init` starts in: `.idle` when credentials load AND a gate is
+    /// selected, else `.needsSetup`. Unlike the old inline `try?`, a THROWN
+    /// credential load (e.g. a locked keychain) is returned as
+    /// `credentialError` so callers can journal/notify why; a load that
+    /// succeeds with no credentials has a `nil` error. `hasCredentials` is
+    /// true only when the load succeeded and returned credentials (lets
+    /// callers tell "signed out" from "signed in, no gate selected" without
+    /// a second keychain read).
+    public static func initialState(
+        credentialStore: any CredentialStoring,
+        appSettings: AppSettings
+    ) -> (state: GateState, credentialError: Error?, hasCredentials: Bool) {
+        let credentials: (username: String, password: String)?
+        do {
+            credentials = try credentialStore.loadCredentials()
+        } catch {
+            return (.needsSetup, error, false)
+        }
+        let hasCredentials = credentials != nil
+        return ((hasCredentials && appSettings.isConfigured) ? .idle : .needsSetup, nil, hasCredentials)
     }
 
     /// Re-evaluates `.needsSetup` vs `.idle` from the stores. The decision is

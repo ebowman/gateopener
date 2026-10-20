@@ -16,6 +16,24 @@ protocol NotificationCentering: Sendable {
     func add(_ request: UNNotificationRequest) async throws
 }
 
+/// Why a press ended `.needsSetup`; selects the notification body.
+enum NeedsSetupReason: Sendable, Equatable {
+    /// Loading the stored credentials threw (e.g. keychain locked).
+    case credentialsUnreadable
+    /// Credentials load fine but no gate is selected.
+    case noGateSelected
+    /// No stored credentials (or any other setup gap).
+    case signedOut
+
+    var body: String {
+        switch self {
+        case .credentialsUnreadable: return "Unlock your iPhone and try again"
+        case .noGateSelected: return "Open GateOpener to finish setup"
+        case .signedOut: return "Open GateOpener and sign in"
+        }
+    }
+}
+
 /// What `OpenGateIntent` (bead 6qa.4) talks to.
 protocol OpenResultNotifying: Sendable {
     func registerCategories()
@@ -26,6 +44,9 @@ protocol OpenResultNotifying: Sendable {
     func postUnconfirmed(gateName: String?, pressedAt: Date) async
     func postSuccess(gateName: String?) async
     func postRetryExpired() async
+    /// `.needsSetup` outcome from a non-app surface (Control/Action Button):
+    /// no Retry action, since retrying would hit the same wall.
+    func postNeedsSetup(reason: NeedsSetupReason) async
 }
 
 /// Production adapter. Resolves `UNUserNotificationCenter.current()`
@@ -69,6 +90,8 @@ struct SystemNotificationCenter: NotificationCentering {
 /// - If not authorized, `post*` are silent no-ops. Never throws.
 final class OpenResultNotifier: OpenResultNotifying {
     static let failureCategoryIdentifier = "ie.boboco.GateOpener.openFailed"
+    /// Category for needs-setup notifications: deliberately NO actions.
+    static let needsSetupCategoryIdentifier = "ie.boboco.GateOpener.needsSetup"
     static let retryActionIdentifier = "ie.boboco.GateOpener.retryOpen"
     static let notificationIdentifier = "ie.boboco.GateOpener.openResult"
     /// userInfo key holding the press time (seconds since 1970, Double).
@@ -103,8 +126,17 @@ final class OpenResultNotifier: OpenResultNotifying {
         )
     }
 
+    static func makeNeedsSetupCategory() -> UNNotificationCategory {
+        UNNotificationCategory(
+            identifier: needsSetupCategoryIdentifier,
+            actions: [],
+            intentIdentifiers: [],
+            options: []
+        )
+    }
+
     func registerCategories() {
-        center.setNotificationCategories([Self.makeFailureCategory()])
+        center.setNotificationCategories([Self.makeFailureCategory(), Self.makeNeedsSetupCategory()])
     }
 
     /// Prompts only when status is `.notDetermined`. App-only; never call
@@ -172,6 +204,19 @@ final class OpenResultNotifier: OpenResultNotifying {
         guard await isAuthorized() else { return }
         let content = UNMutableNotificationContent()
         content.title = "Retry expired — open GateOpener to try again"
+        content.interruptionLevel = .active
+        content.sound = .default
+        await add(content)
+    }
+
+    /// Same single identifier (replaces any previous result). Never includes
+    /// the username.
+    func postNeedsSetup(reason: NeedsSetupReason) async {
+        guard await isAuthorized() else { return }
+        let content = UNMutableNotificationContent()
+        content.title = "GateOpener couldn't open the gate"
+        content.body = reason.body
+        content.categoryIdentifier = Self.needsSetupCategoryIdentifier
         content.interruptionLevel = .active
         content.sound = .default
         await add(content)

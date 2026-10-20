@@ -154,6 +154,10 @@ public protocol OpenAttemptObserving: Sendable {
 /// `{"kind":"reachability","isReachable":true,"detail":""}` or
 /// `{"kind":"openStarted"}`.
 public enum OpenPressPhase: Sendable, Equatable {
+    /// `credentialsUnreadable.status` used when the credential-load error is
+    /// not a `KeychainError` (so has no `OSStatus`).
+    public static let unknownCredentialStatus: Int32 = -1
+
     /// The intent/press began. `elapsedMilliseconds` is always 0 for this
     /// case (it defines the press's own start).
     case started
@@ -183,6 +187,12 @@ public enum OpenPressPhase: Sendable, Equatable {
     /// The persistent retry loop is about to start open attempt `number`
     /// (1-based; attempt 1 included).
     case attempt(number: Int)
+    /// Loading the stored credentials THREW while the press determined its
+    /// starting state (so the press ends `.needsSetup`), e.g. a locked
+    /// keychain. `status` is the `OSStatus` of the `KeychainError`, or
+    /// `OpenPressPhase.unknownCredentialStatus` (-1) when the thrown error
+    /// carries none. Never carries the username or any secret.
+    case credentialsUnreadable(status: Int32)
     /// The device was not reachable and the loop entered a bounded wait for
     /// connectivity.
     case waitingForNetwork
@@ -198,6 +208,7 @@ public enum OpenPressPhase: Sendable, Equatable {
         case timedOut
         case attempt
         case waitingForNetwork
+        case credentialsUnreadable
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -208,6 +219,7 @@ public enum OpenPressPhase: Sendable, Equatable {
         case tokenKind
         case description
         case outcome
+        case status
     }
 }
 
@@ -242,6 +254,9 @@ extension OpenPressPhase: Codable {
             self = .attempt(number: number)
         case .waitingForNetwork:
             self = .waitingForNetwork
+        case .credentialsUnreadable:
+            let status = try container.decode(Int32.self, forKey: .status)
+            self = .credentialsUnreadable(status: status)
         }
     }
 
@@ -274,6 +289,9 @@ extension OpenPressPhase: Codable {
             try container.encode(number, forKey: .number)
         case .waitingForNetwork:
             try container.encode(Kind.waitingForNetwork, forKey: .kind)
+        case .credentialsUnreadable(let status):
+            try container.encode(Kind.credentialsUnreadable, forKey: .kind)
+            try container.encode(status, forKey: .status)
         }
     }
 }

@@ -1045,3 +1045,32 @@ private func waitUntilDeadline(_ predicate: () -> Bool) async {
     for _ in 0..<50 { await Task.yield() }
     #expect(controller.state == .needsSetup)
 }
+
+// MARK: - initialState (bead gateopener-pi0.2)
+
+// REMOVAL: if the thrown error were swallowed again (try?), credentialError would be nil.
+@Test @MainActor func initialStateSurfacesThrownCredentialLoadError() throws {
+    let store = MockCredentialStore()
+    store.loadCredentialsError = KeychainError.loadFailed(status: -25308)
+    let defaults = UserDefaults(suiteName: "initialState-\(UUID().uuidString)")!
+    let settings = AppSettings(defaults: defaults)
+    settings.selectedEndpointId = sampleEndpointLockGeneric.endpointId
+    let result = GateController.initialState(credentialStore: store, appSettings: settings)
+    #expect(result.state == .needsSetup)
+    #expect(result.credentialError as? KeychainError == .loadFailed(status: -25308))
+    #expect(result.hasCredentials == false)
+}
+
+// REMOVAL: if a clean load were reported as an error (or not .idle), this fails.
+@Test @MainActor func initialStateIsIdleWithNoErrorWhenSignedInAndConfigured() throws {
+    let store = MockCredentialStore()
+    try store.saveCredentials(username: "alice", password: "s3cret")
+    let defaults = UserDefaults(suiteName: "initialState-\(UUID().uuidString)")!
+    let settings = AppSettings(defaults: defaults)
+    settings.selectedEndpointId = sampleEndpointLockGeneric.endpointId
+    settings.selectedEndpointName = sampleEndpointLockGeneric.friendlyName
+    let result = GateController.initialState(credentialStore: store, appSettings: settings)
+    #expect(result.state == .idle)
+    #expect(result.credentialError == nil)
+    #expect(result.hasCredentials == true)
+}

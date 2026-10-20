@@ -59,6 +59,14 @@ public final class AppEnvironment {
     /// doc comment) — in the mock case there is no real `GateClient` for a
     /// journal to observe anyway.
     public let openAttemptJournal: OpenAttemptJournal?
+    /// The error thrown by the controller's credential load when it chose
+    /// its initial state (e.g. a locked keychain), or `nil` if the load did
+    /// not throw. Computed ONCE in `make()` via `GateController
+    /// .initialState`; never re-read from the keychain. `OpenGateIntent`
+    /// journals it and picks the notification wording from it.
+    public let credentialLoadError: Error?
+    /// True when that same single load succeeded and found credentials.
+    public let hasStoredCredentials: Bool
 
     /// Reloads widget timelines. Stored (rather than only closed over by the
     /// `controller.onStateChange` handler installed in `make()`) so
@@ -274,13 +282,18 @@ public final class AppEnvironment {
 
         let resolvedTokenResolver: any TokenResolving = tokenResolver ?? tokenManager
 
+        // TEST SEAM: `controllerCredentialStore` (an in-memory fake) lets
+        // tests build a signed-in `.idle` controller without the real
+        // Keychain. `nil` in production.
+        let controllerStore: any CredentialStoring = controllerCredentialStore ?? credentialStore
+        let initial = GateController.initialState(
+            credentialStore: controllerStore, appSettings: appSettings
+        )
+
         let controller = GateController(
             gateClient: resolvedGateClient,
             tokenManager: resolvedTokenResolver,
-            // TEST SEAM: `controllerCredentialStore` (an in-memory fake) lets
-            // tests build a signed-in `.idle` controller without the real
-            // Keychain. `nil` in production.
-            credentialStore: controllerCredentialStore ?? credentialStore,
+            credentialStore: controllerStore,
             appSettings: appSettings,
             reachability: resolvedReachability
         )
@@ -297,6 +310,8 @@ public final class AppEnvironment {
             controller: controller,
             snapshotStore: snapshotStore,
             openAttemptJournal: resolvedOpenAttemptJournal,
+            credentialLoadError: initial.credentialError,
+            hasStoredCredentials: initial.hasCredentials,
             timelineReloader: timelineReloader
         )
 
@@ -333,6 +348,8 @@ public final class AppEnvironment {
         controller: GateController,
         snapshotStore: WidgetSnapshotStore,
         openAttemptJournal: OpenAttemptJournal?,
+        credentialLoadError: Error?,
+        hasStoredCredentials: Bool,
         timelineReloader: @escaping @Sendable () -> Void
     ) {
         self.defaults = defaults
@@ -344,6 +361,8 @@ public final class AppEnvironment {
         self.controller = controller
         self.snapshotStore = snapshotStore
         self.openAttemptJournal = openAttemptJournal
+        self.credentialLoadError = credentialLoadError
+        self.hasStoredCredentials = hasStoredCredentials
         self.timelineReloader = timelineReloader
     }
 
