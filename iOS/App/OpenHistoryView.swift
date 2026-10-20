@@ -21,7 +21,11 @@ struct OpenHistoryView: View {
     /// entries yet" (an empty, non-nil journal): see `body`.
     var journal: OpenAttemptJournal?
 
+    /// Transfers sent from the watch (bead gateopener-3d7.17); injectable for tests.
+    var watchHistory: WatchHistoryStore? = SharedContainer.watchHistoryURL().map(WatchHistoryStore.init(url:))
+
     @State private var entries: [OpenJournalEntry] = []
+    @State private var watchTransfers: [WatchHistoryStore.Transfer] = []
     @State private var isConfirmingClear = false
 
     private var appVersion: String {
@@ -37,14 +41,14 @@ struct OpenHistoryView: View {
         return formatter
     }()
 
-    private var groups: [Group] {
-        Self.groups(from: entries)
+    private var groups: [OpenPressGroup] {
+        OpenHistoryText.groups(from: entries)
     }
 
     private var shareText: String? {
-        guard !entries.isEmpty else { return nil }
+        guard !entries.isEmpty || !watchTransfers.isEmpty else { return nil }
         let prefix = "GateOpener \(appVersion) — \(Self.shareDateFormatter.string(from: Date()))"
-        return Self.shareText(for: entries, prefix: prefix)
+        return OpenHistoryText.shareText(for: entries, prefix: prefix, watchTransfers: watchTransfers)
     }
 
     var body: some View {
@@ -54,33 +58,33 @@ struct OpenHistoryView: View {
                     "History unavailable",
                     systemImage: "clock.badge.exclamationmark"
                 )
-            } else if entries.isEmpty {
+            } else if entries.isEmpty && watchTransfers.isEmpty {
                 ContentUnavailableView(
                     "No opens recorded yet",
                     systemImage: "clock",
                     description: Text("Opens from the app, widget and Action Button appear here.")
                 )
             } else {
-                Text(Self.acceptedFooter)
+                Text(OpenHistoryText.acceptedFooter)
                     .font(.footnote)
                     .foregroundStyle(.secondary)
                 ForEach(groups) { group in
                     Section {
                         DisclosureGroup {
-                            ForEach(Array(Self.timelineLines(for: group).enumerated()), id: \.offset) { _, line in
+                            ForEach(Array(OpenHistoryText.timelineLines(for: group).enumerated()), id: \.offset) { _, line in
                                 Text(line)
                                     .font(.footnote.monospacedDigit())
                                     .foregroundStyle(.secondary)
                             }
                             if group.resultBadge == "Unfinished" {
-                                Text(Self.unfinishedFootnote)
+                                Text(OpenHistoryText.unfinishedFootnote)
                                     .font(.footnote)
                                     .foregroundStyle(.secondary)
                             }
                         } label: {
                             HStack {
                                 VStack(alignment: .leading, spacing: 2) {
-                                    Text(Self.makeGroupHeaderDateFormatter().string(from: group.time))
+                                    Text(OpenHistoryText.makeGroupHeaderDateFormatter().string(from: group.time))
                                     Text(group.sourceLabel)
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
@@ -88,6 +92,18 @@ struct OpenHistoryView: View {
                                 Spacer()
                                 Text(group.resultBadge)
                             }
+                        }
+                    }
+                }
+            }
+            if journal != nil, !watchTransfers.isEmpty {
+                Section {
+                    DisclosureGroup("From watch") {
+                        ForEach(watchTransfers, id: \.sentAt) { transfer in
+                            Text(transfer.text)
+                                .font(.footnote.monospaced())
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
                         }
                     }
                 }
@@ -127,205 +143,6 @@ struct OpenHistoryView: View {
 
     private func reload() {
         entries = journal?.journalEntries() ?? []
-    }
-
-    // MARK: - Pure, unit-testable helpers
-
-    /// Grouping lives in core (`OpenPressGroup`, bead gateopener-pi0.3) so the
-    /// main-screen banner shares it; these are thin wrappers.
-    typealias Group = OpenPressGroup
-
-    /// "Action Button / Control" for "intent", "App" for "app", the raw
-    /// value for anything else.
-    nonisolated static func sourceLabel(for source: String) -> String {
-        OpenPressGroup.sourceLabel(for: source)
-    }
-
-    nonisolated static let unfinishedFootnote =
-        "This press started but never reported a result — iOS may have stopped the extension before it finished."
-
-    nonisolated static func groups(from entries: [OpenJournalEntry]) -> [Group] {
-        OpenPressGroup.groups(from: entries)
-    }
-
-    /// One-line footer shown above the history groups.
-    nonisolated static let acceptedFooter = "Accepted means Comelit's cloud took the command; it does not confirm the gate moved."
-
-    nonisolated static func resultBadge(for group: Group) -> String {
-        OpenPressGroup.resultBadge(for: group)
-    }
-
-    /// Full phase/attempt timeline for one press group, oldest first, each
-    /// line prefixed with its "+offset" from the press's `.started` phase.
-    /// Press lines use the press record's own `elapsedMilliseconds`; attempt
-    /// lines compute their offset as `attempt.timestamp - startedTimestamp`,
-    /// clamped to >= 0 (an attempt's wall-clock timestamp could in principle
-    /// race slightly behind the press-relative elapsed clock).
-    ///
-    /// A legacy (pressId-less) group has no phase lines at all — this
-    /// returns one line per attempt, mirroring the pre-gateopener-41m.24
-    /// share-line format (no offset prefix, since there is no press start to
-    /// offset from).
-    nonisolated static func timelineLines(for group: Group) -> [String] {
-        guard group.source != nil else {
-            return legacyTimelineLines(for: group.entries)
-        }
-
-        let startedTimestamp = group.entries.compactMap { entry -> Date? in
-            if case .press(let press) = entry, case .started = press.phase { return press.timestamp }
-            return nil
-        }.first ?? group.time
-
-        return group.entries.map { entry in
-            switch entry {
-            case .press(let press):
-                return pressLine(for: press)
-            case .attempt(let attempt):
-                let offsetMilliseconds = max(0, Int(attempt.timestamp.timeIntervalSince(startedTimestamp) * 1000))
-                return attemptLine(for: attempt, offsetMilliseconds: offsetMilliseconds)
-            }
-        }
-    }
-
-    private nonisolated static func legacyTimelineLines(for entries: [OpenJournalEntry]) -> [String] {
-        entries.compactMap { entry -> String? in
-            guard case .attempt(let record) = entry else { return nil }
-            if record.kind == .confirmation {
-                return "\(confirmationText(for: record.outcome)) \(elapsedText(forMilliseconds: record.elapsedMilliseconds))"
-            }
-            let outcome = outcomeText(for: record.outcome)
-            let retry = record.willRetry ? "  retrying" : ""
-            return "attempt \(record.attempt)/\(record.maxAttempts) \(outcome) \(elapsedText(forMilliseconds: record.elapsedMilliseconds))\(retry)"
-        }
-    }
-
-    private nonisolated static func pressLine(for press: OpenPressRecord) -> String {
-        let offset = offsetText(forMilliseconds: press.elapsedMilliseconds)
-        switch press.phase {
-        case .started:
-            return "\(offset) started (\(sourceLabel(for: press.source)), \(press.appVersion))"
-        case .environmentReady:
-            return "\(offset) environment ready"
-        case .reachability(let isReachable, let detail):
-            if isReachable {
-                return "\(offset) network: \(detail)"
-            }
-            return "\(offset) network: unreachable — \(detail)"
-        case .tokenResolved(let kind):
-            return "\(offset) token: \(kind)"
-        case .tokenFailed(let description):
-            return "\(offset) token failed: \(description)"
-        case .openStarted:
-            return "\(offset) open started"
-        case .finished(let outcome):
-            return "\(offset) finished: \(outcome)"
-        case .timedOut:
-            return "\(offset) timed out"
-        case .attempt(let number):
-            return "\(offset) Attempt \(number)"
-        case .waitingForNetwork:
-            return "\(offset) Waiting for network"
-        case .credentialsUnreadable(let status):
-            return "\(offset) Credentials unreadable (OSStatus \(status))"
-        }
-    }
-
-    private nonisolated static func attemptLine(for attempt: OpenAttemptRecord, offsetMilliseconds: Int) -> String {
-        let offset = offsetText(forMilliseconds: offsetMilliseconds)
-        if attempt.kind == .confirmation {
-            return "\(offset) \(confirmationText(for: attempt.outcome)) \(elapsedText(forMilliseconds: attempt.elapsedMilliseconds))"
-        }
-        let outcome = outcomeText(for: attempt.outcome)
-        let retry = attempt.willRetry ? "  retrying" : ""
-        return "\(offset) attempt \(attempt.attempt)/\(attempt.maxAttempts) \(outcome) \(elapsedText(forMilliseconds: attempt.elapsedMilliseconds))\(retry)"
-    }
-
-    /// The post-accept confirmation send (gateopener-pi0.5): "confirmation:
-    /// Accepted (202)" on 202/200, otherwise "confirmation: " + the usual
-    /// outcome text (e.g. "confirmation: HTTP 500").
-    nonisolated static func confirmationText(for outcome: OpenAttemptOutcome) -> String {
-        if case .success(let status) = outcome { return "confirmation: Accepted (\(status))" }
-        return "confirmation: \(outcomeText(for: outcome))"
-    }
-
-    /// "+0 ms" / "+412 ms" for offsets under 1000 ms; "+1.9 s" / "+25.0 s"
-    /// (one decimal place) for offsets >= 1000 ms.
-    nonisolated static func offsetText(forMilliseconds milliseconds: Int) -> String {
-        guard milliseconds >= 1_000 else { return "+\(milliseconds) ms" }
-        let seconds = Double(milliseconds) / 1000.0
-        return String(format: "+%.1f s", seconds)
-    }
-
-    /// success(s) → "Accepted (s)"; httpFailure(s) → "HTTP s"; transportFailure
-    /// mapped per common `URLError` codes; tokenFailure(d) → "Sign-in/token
-    /// failure (d)".
-    nonisolated static func outcomeText(for outcome: OpenAttemptOutcome) -> String {
-        switch outcome {
-        case .success(let status):
-            return "Accepted (\(status))"
-        case .httpFailure(let status):
-            return "HTTP \(status)"
-        case .transportFailure(let code):
-            switch code {
-            case -1001:
-                return "Network: timed out"
-            case -1009:
-                return "Network: offline"
-            case -1005:
-                return "Network: connection lost"
-            case -1003, -1004:
-                return "Network: cannot reach host"
-            case -1:
-                return "Network error"
-            default:
-                return "Network error \(code)"
-            }
-        case .tokenFailure(let description):
-            return "Sign-in/token failure (\(description))"
-        }
-    }
-
-    /// "2.9 s" — one decimal place.
-    nonisolated static func elapsedText(forMilliseconds milliseconds: Int) -> String {
-        let seconds = Double(milliseconds) / 1000.0
-        return String(format: "%.1f s", seconds)
-    }
-
-    /// One block per press: a header line (time + source + badge), then the
-    /// press's `timelineLines(for:)`, each indented two spaces, then a blank
-    /// separator line before the next press's block. Prefixed with the
-    /// caller-supplied `prefix` line (e.g. "GateOpener 1.0 (10) — Sep 21,
-    /// 2026 at 9:00 AM").
-    nonisolated static func shareText(for entries: [OpenJournalEntry], prefix: String) -> String {
-        let dateFormatter = makeGroupHeaderDateFormatter()
-        var lines = [prefix, ""]
-        for group in groups(from: entries) {
-            lines.append("\(dateFormatter.string(from: group.time)) — \(group.sourceLabel) — \(resultBadge(for: group))")
-            for line in timelineLines(for: group) {
-                lines.append("  \(line)")
-            }
-            if group.resultBadge == "Unfinished" {
-                lines.append("  \(unfinishedFootnote)")
-            }
-            lines.append("")
-        }
-        // Drop the single trailing blank separator line after the last
-        // press, so the text doesn't end with an extra empty line.
-        if lines.last == "" {
-            lines.removeLast()
-        }
-        return lines.joined(separator: "\n")
-    }
-
-    /// Builds a fresh `DateFormatter` per call: `DateFormatter` is not
-    /// `Sendable`, so a single shared instance can't safely be read from a
-    /// `nonisolated` context (like `shareText(for:prefix:)`) as well as the
-    /// `@MainActor`-isolated view body. Constructing one per call is cheap at
-    /// the volume of history entries this view deals with.
-    nonisolated static func makeGroupHeaderDateFormatter() -> DateFormatter {
-        let formatter = DateFormatter()
-        formatter.dateStyle = .medium
-        formatter.timeStyle = .short
-        return formatter
+        watchTransfers = watchHistory?.transfers() ?? []
     }
 }

@@ -54,4 +54,14 @@ public enum SharedContainer {
         }
         return container.appendingPathComponent("open-attempts.jsonl")
     }
+
+    /// File in the App Group holding the last few open-history transfers sent
+    /// from the watch (bead gateopener-3d7.17). `nil` when the container is
+    /// unavailable.
+    public static func watchHistoryURL() -> URL? {
+        guard let container = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroupId) else {
+            return nil
+        }
+        return container.appendingPathComponent("watch-history.json")
+    }
 }

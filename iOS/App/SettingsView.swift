@@ -604,6 +604,7 @@ private final class PreviewWatchSession: WatchSessionProviding {
     var isWatchAppInstalled = true
     var activationState: WatchSessionActivation = .activated
     var onStateChange: (@MainActor () -> Void)?
+    var onUserInfo: (@MainActor ([String: Any]) -> Void)?
     var fail = false
     struct PushError: LocalizedError { var errorDescription: String? { "Watch unreachable" } }
     func activate() {}

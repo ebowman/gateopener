@@ -27,6 +27,8 @@ protocol WatchSessionProviding: AnyObject {
     /// Called (on the main actor) when activation completes or the paired
     /// watch's state (paired / app installed) changes.
     var onStateChange: (@MainActor () -> Void)? { get set }
+    /// Called (on the main actor) with a received `transferUserInfo` payload.
+    var onUserInfo: (@MainActor ([String: Any]) -> Void)? { get set }
     func activate()
     func updateApplicationContext(_ context: [String: Any]) throws
 }
@@ -40,6 +42,7 @@ final class WCSessionAdapter: NSObject, WatchSessionProviding, WCSessionDelegate
     }
 
     var onStateChange: (@MainActor () -> Void)?
+    var onUserInfo: (@MainActor ([String: Any]) -> Void)?
 
     var isSupported: Bool { WCSession.isSupported() }
     var isPaired: Bool { session?.isPaired ?? false }
@@ -82,6 +85,11 @@ final class WCSessionAdapter: NSObject, WatchSessionProviding, WCSessionDelegate
         Task { @MainActor in self.onStateChange?() }
     }
 
+    nonisolated func session(_ session: WCSession, didReceiveUserInfo userInfo: [String: Any] = [:]) {
+        nonisolated(unsafe) let box = userInfo
+        Task { @MainActor in self.onUserInfo?(box) }
+    }
+
     nonisolated func sessionWatchStateDidChange(_ session: WCSession) {
         Task { @MainActor in self.onStateChange?() }
     }
@@ -109,6 +117,7 @@ final class WatchSync {
     /// swaps in a new store after launch.
     @ObservationIgnored private let credentialStoreProvider: () -> any CredentialStoring
     @ObservationIgnored private let now: () -> Date
+    @ObservationIgnored private let watchHistoryStore: WatchHistoryStore?
     @ObservationIgnored private var pendingPush = false
     @ObservationIgnored private var pendingReason = ""
     @ObservationIgnored private let log = Logger(subsystem: "ie.boboco.GateOpener", category: "watch-sync")
@@ -117,13 +126,29 @@ final class WatchSync {
         session: any WatchSessionProviding,
         appSettings: AppSettings,
         credentialStoreProvider: @escaping () -> any CredentialStoring,
-        now: @escaping () -> Date = Date.init
+        now: @escaping () -> Date = Date.init,
+        watchHistoryStore: WatchHistoryStore? = SharedContainer.watchHistoryURL().map(WatchHistoryStore.init(url:))
     ) {
         self.session = session
         self.appSettings = appSettings
         self.credentialStoreProvider = credentialStoreProvider
         self.now = now
+        self.watchHistoryStore = watchHistoryStore
         session.onStateChange = { [weak self] in self?.sessionStateDidChange() }
+        session.onUserInfo = { [weak self] info in self?.onWatchHistoryReceived(info) }
+    }
+
+    /// A `transferUserInfo` payload arrived from the watch (bead
+    /// gateopener-3d7.17). Anything but a well-formed `watchHistory` transfer
+    /// is ignored. Logs only the size, never the text.
+    func onWatchHistoryReceived(_ userInfo: [String: Any]) {
+        guard let transfer = WatchHistoryStore.parse(userInfo: userInfo) else { return }
+        guard let watchHistoryStore else {
+            log.error("watch history dropped: no App Group container")
+            return
+        }
+        let ok = watchHistoryStore.append(text: transfer.text, sentAt: transfer.sentAt)
+        log.info("watch history received: \(transfer.text.count, privacy: .public) chars, stored=\(ok, privacy: .public)")
     }
 
     /// Fixed-store convenience (tests).
@@ -131,9 +156,13 @@ final class WatchSync {
         session: any WatchSessionProviding,
         appSettings: AppSettings,
         credentialStore: any CredentialStoring,
-        now: @escaping () -> Date = Date.init
+        now: @escaping () -> Date = Date.init,
+        watchHistoryStore: WatchHistoryStore? = SharedContainer.watchHistoryURL().map(WatchHistoryStore.init(url:))
     ) {
-        self.init(session: session, appSettings: appSettings, credentialStoreProvider: { credentialStore }, now: now)
+        self.init(
+            session: session, appSettings: appSettings, credentialStoreProvider: { credentialStore },
+            now: now, watchHistoryStore: watchHistoryStore
+        )
     }
 
     /// Activates the session once at launch.

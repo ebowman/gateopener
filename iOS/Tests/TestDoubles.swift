@@ -229,6 +229,7 @@ final class FakeWatchSession: WatchSessionProviding {
     var isWatchAppInstalled = true
     var activationState: WatchSessionActivation = .activated
     var onStateChange: (@MainActor () -> Void)?
+    var onUserInfo: (@MainActor ([String: Any]) -> Void)?
     var updateError: Error?
     private(set) var activateCallCount = 0
     private(set) var contexts: [[String: Any]] = []
@@ -242,4 +243,7 @@ final class FakeWatchSession: WatchSessionProviding {
 
     /// Simulates the system finishing activation / a watch-state change.
     func fireStateChange() { onStateChange?() }
+
+    /// Simulates the system delivering a `transferUserInfo` payload.
+    func deliver(userInfo: [String: Any]) { onUserInfo?(userInfo) }
 }

@@ -24,9 +24,28 @@ struct WatchMainView: View {
     }
 
     var body: some View {
+        NavigationStack {
+            content
+        }
+    }
+
+    /// History entry point (bead gateopener-3d7.17): a `.topBarTrailing`
+    /// toolbar clock button, not a button under the big one, so it takes no
+    /// vertical space from the Open Gate button at 42 mm.
+    private var content: some View {
         WatchMainContent(state: observable.state) {
             WKInterfaceDevice.current().play(.click)
             observable.requestOpen()
+        }
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                NavigationLink {
+                    WatchHistoryView(journal: environment.openAttemptJournal)
+                } label: {
+                    Image(systemName: "clock.arrow.circlepath")
+                }
+                .accessibilityLabel("History")
+            }
         }
         .onChange(of: observable.state) { old, new in
             guard old != new else { return }

@@ -261,4 +261,49 @@ struct WatchSyncTests {
         session.activationState = .activated
         #expect(WatchSyncSection.pendingLine(sessionActivated: sync.isSessionActivated) == "Sending\u{2026}")
     }
+
+    private func makeStore() -> WatchHistoryStore {
+        WatchHistoryStore(url: FileManager.default.temporaryDirectory
+            .appendingPathComponent("watch-sync-\(UUID().uuidString).json"))
+    }
+
+    private func makeSync(session: FakeWatchSession, history: WatchHistoryStore) -> WatchSync {
+        let defaults = UserDefaults(suiteName: "WatchSyncTests-\(UUID().uuidString)")!
+        return WatchSync(
+            session: session, appSettings: AppSettings(defaults: defaults),
+            credentialStore: InMemoryCredentialStore(), watchHistoryStore: history
+        )
+    }
+
+    // Fails if the session's onUserInfo is not wired to the store (nothing written).
+    @Test func watchHistoryUserInfoIsWrittenToStore() {
+        let session = FakeWatchSession()
+        let history = makeStore()
+        let sync = makeSync(session: session, history: history)
+        session.deliver(userInfo: ["kind": "watchHistory", "text": "press log", "sentAt": Date()])
+        #expect(history.transfers().map(\.text) == ["press log"])
+        _ = sync
+    }
+
+    // Fails if the cap of 5 or newest-first ordering is dropped.
+    @Test func watchHistoryKeepsFiveNewestFirst() {
+        let session = FakeWatchSession()
+        let history = makeStore()
+        let sync = makeSync(session: session, history: history)
+        for i in 1...6 {
+            session.deliver(userInfo: ["kind": "watchHistory", "text": "t\(i)", "sentAt": Date(timeIntervalSince1970: Double(i))])
+        }
+        #expect(history.transfers().map(\.text) == ["t6", "t5", "t4", "t3", "t2"])
+        _ = sync
+    }
+
+    // Fails if the kind check is removed (unrelated userInfo would be stored).
+    @Test func unrelatedUserInfoIsIgnored() {
+        let session = FakeWatchSession()
+        let history = makeStore()
+        let sync = makeSync(session: session, history: history)
+        session.deliver(userInfo: ["kind": "something", "text": "nope"])
+        #expect(history.transfers().isEmpty)
+        _ = sync
+    }
 }

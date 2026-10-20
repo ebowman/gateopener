@@ -182,6 +182,17 @@ final class GateControllerObservable {
             let startedAt = Date()
             inFlightPress = (pressId, startedAt, false)
             emit(.started, pressId: pressId, startedAt: startedAt, source: "app")
+            #if os(watchOS)
+            // gateopener-3d7.17: the watch never gates on the path monitor, so
+            // the `.queued`-only reachability phase never fires. Record it
+            // explicitly so app-button presses read like intent presses.
+            emit(
+                .reachability(isReachable: true, detail: reachabilityDetail()),
+                pressId: pressId,
+                startedAt: startedAt,
+                source: "app"
+            )
+            #endif
             forwardedPressId = pressId
         }
         #if os(iOS)
